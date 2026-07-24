@@ -165,6 +165,9 @@ export interface Booth {
   gpsLng: number | null;
   /** Catégorie du LIEU où est posée la Kiosk (bar, musée, festival…). Propre à la Kiosk. */
   venueType: string | null;
+  /** Numéro physique de la borne (2ᵉ id, ÉDITABLE — distinct de l'UUID `id` qui, lui, est stable
+   * et ancre l'historique). Modifiable par le global_admin uniquement. Texte libre, non unique. */
+  serial: string | null;
   notes: string;
   /** Machine signée (DRM) : epoch ms de signature du device, `null` si non signée. */
   readonly signedAt?: number | null;

@@ -215,6 +215,7 @@ export function openBoothForm(store: FleetStore, existing: Booth | null): void {
       gpsLat: null,
       gpsLng: null,
       venueType: null,
+      serial: null,
       notes: "",
     } satisfies Booth);
 
@@ -248,6 +249,8 @@ export function openBoothForm(store: FleetStore, existing: Booth | null): void {
   ) as HTMLSelectElement;
   // CIN-016 : la version = réalité remontée par la borne (heartbeat), jamais saisie à la main.
   const versionInput = el("input", { class: "form-control", type: "text", value: b.softwareVersion, readonly: "true", placeholder: "en attente du premier contact" });
+  // 2ᵉ id : numéro physique ÉDITABLE — mais réservé au global_admin (attribution de flotte).
+  const serialInput = el("input", { class: "form-control", type: "text", value: b.serial ?? "", placeholder: "ex. KIO-0007", ...(store.isGlobalAdmin ? {} : { readonly: "true" }) }) as HTMLInputElement;
   const notesInput = el("textarea", { class: "form-control", rows: "2" }, [b.notes]) as HTMLTextAreaElement;
 
   const form = el("form", {}, [
@@ -263,6 +266,10 @@ export function openBoothForm(store: FleetStore, existing: Booth | null): void {
     field("Version logicielle (remontée par la borne — lecture seule)", el("div", {}, [
       versionInput,
       el("div", { class: "form-hint" }, ["Renseignée automatiquement par la Kiosk à chaque contact ; non modifiable ici."]),
+    ])),
+    field("Numéro physique de la borne", el("div", {}, [
+      serialInput,
+      el("div", { class: "form-hint" }, [store.isGlobalAdmin ? "Identifiant matériel éditable (distinct de l'identité interne, qui reste stable)." : "Attribué par Kioskoscope."]),
     ])),
     field("Notes d'accès (où exactement, comment brancher, contact sur place…)", notesInput),
   ]);
@@ -347,6 +354,7 @@ export function openBoothForm(store: FleetStore, existing: Booth | null): void {
       gpsLat: pickedLat,
       gpsLng: pickedLng,
       venueType: venueSelect.value || null,
+      serial: serialInput.value.trim() || null, // readonly si non global_admin → valeur inchangée
     };
     store.upsertBooth(updated);
     modal.hide();
