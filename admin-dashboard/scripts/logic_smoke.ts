@@ -15,6 +15,12 @@ import type { SortKey, SortState } from "../src/ui/components";
 import { boothToRow, rowToBooth } from "../src/data/mappers";
 import { formatMoney, relativeTime } from "../src/ui/dom";
 import { allHealthStatuses, connectionMeta, healthMeta } from "../src/domain/status";
+import { setLang } from "../src/i18n";
+
+// DÉTERMINISME : ce test vérifie des libellés FRANÇAIS (relativeTime, healthMeta…). La langue par
+// défaut est DÉTECTÉE (localStorage/navigator) → dépend de l'environnement (mac FR en local, en-US
+// sur le runner CI → échecs). On force donc le français, quel que soit l'environnement.
+setLang("fr");
 
 // ── Micro-harnais d'assertions ───────────────────────────────────────────────
 let passed = 0;
