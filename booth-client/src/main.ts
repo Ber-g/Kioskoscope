@@ -244,4 +244,10 @@ async function main(): Promise<void> {
   operator.attachRevealGesture(document.body);
 }
 
-void main();
+// Résilience au DÉMARRAGE : si une exception survient AVANT que le filet d'erreur runtime ne soit posé
+// (ex. hoquet réseau pendant l'init), la borne resterait sur un écran blanc. On journalise et on
+// retente par rechargement après un court délai (le serveur local ressert l'app → nouvelle chance).
+void main().catch((e) => {
+  console.error("[booth] échec de démarrage — rechargement dans 5 s :", e);
+  window.setTimeout(() => location.reload(), 5000);
+});
