@@ -146,6 +146,22 @@ async function main(): Promise<void> {
 
   app.start();
 
+  // Filet de sécurité kiosque (F4) : une erreur JS non gérée ne doit JAMAIS laisser la borne sur un
+  // écran mort. On journalise, on ramène à l'accueil ; en cas d'ORAGE d'erreurs (≥3 en 10 s, ex. la
+  // récupération elle-même échoue) on recharge — le serveur local ressert l'app → retour propre.
+  let errWindowStart = 0;
+  let errCount = 0;
+  const onFatal = (label: string, detail: unknown): void => {
+    console.error(`[booth] erreur non gérée (${label}) :`, detail);
+    const now = Date.now();
+    if (now - errWindowStart > 10_000) { errWindowStart = now; errCount = 0; }
+    errCount += 1;
+    if (errCount >= 3) { console.error("[booth] orage d'erreurs → rechargement"); location.reload(); return; }
+    app.recover();
+  };
+  window.addEventListener("error", (e) => onFatal("error", e.error ?? e.message));
+  window.addEventListener("unhandledrejection", (e) => onFatal("rejection", e.reason));
+
   // ── Menu opérateur Kiosk (F17 volet A, CIN-070/073) ──────────────────────────
   // Surface de service par-dessus le parcours, gardée par une auth OFFLINE (PIN).
   // Wi-Fi/réglages/redémarrage = hooks (stubs en dev ; services locaux réels différés

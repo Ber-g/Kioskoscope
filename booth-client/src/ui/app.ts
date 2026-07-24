@@ -59,6 +59,20 @@ export class App {
     this.goIdle();
   }
 
+  /**
+   * Filet de sécurité kiosque : ramène le parcours à l'accueil après une erreur non gérée — une borne
+   * publique ne doit JAMAIS rester sur un écran mort. N'enregistre RIEN (l'état peut être corrompu) ;
+   * annule un déverrouillage en cours. Le menu opérateur (couche séparée) n'est pas affecté.
+   */
+  recover(): void {
+    try {
+      this.unlockController?.abort();
+    } catch {
+      // annulation best-effort — ne jamais faire échouer la récupération.
+    }
+    this.goIdle();
+  }
+
   // ── Montage d'écran ────────────────────────────────────────────────────────
   private mount(result: ScreenResult): void {
     this.currentDispose?.();
