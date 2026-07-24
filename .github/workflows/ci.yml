@@ -46,6 +46,14 @@ jobs:
       - name: Test booth-client (focus_smoke)
         run: npm run -w booth-client test
 
+      # Logique cœur cabine : recommandation + gestion de séance (DOM-free).
+      - name: Test booth-client (logic_smoke — reco + session)
+        run: npm run -w booth-client test:logic
+
+      # Logique pure back-office : tri/KPI/distribution/mappers/formatage (DOM-free, stubs sans réseau).
+      - name: Test admin-dashboard (logic_smoke — store/KPI)
+        run: npm run -w admin-dashboard test
+
       # Les scripts de test Supabase ne tournent pas ici (secrets requis) : on vérifie AU MOINS
       # qu'ils restent syntaxiquement valides (pas de rot au fil des migrations).
       - name: Syntax-check des scripts de test Supabase
