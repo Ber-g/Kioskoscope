@@ -369,6 +369,54 @@ h2 {
   background: rgba(6, 6, 8, 0.45);
 }
 
+/* Barre de volume : apparaît brièvement au changement (F14 volume ±), puis s'estompe. */
+.player__volume {
+  position: fixed;
+  top: 1.5rem;
+  right: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity var(--motion-med) var(--ease), transform var(--motion-med) var(--ease);
+  pointer-events: none;
+}
+
+.player__volume.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+.player__volume-track {
+  width: 140px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-line);
+  overflow: hidden;
+}
+
+.player__volume-fill {
+  height: 100%;
+  width: 70%;
+  background: var(--color-accent);
+  transition: width var(--motion-fast) var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .player__volume {
+    transition: opacity var(--motion-fast) linear;
+    transform: none;
+  }
+}
+
 .player__stage {
   display: flex;
   flex-direction: column;

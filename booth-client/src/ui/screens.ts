@@ -347,10 +347,28 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
     ]);
   }
 
+  // Retour visuel du VOLUME : une barre apparaît brièvement à chaque changement (avant : le volume
+  // bougeait sans aucun feedback). Ne concerne que la vraie vidéo (le mode démo n'a pas de son).
+  const volumeFill = el("div", { class: "player__volume-fill" }, []);
+  const volume = el("div", { class: "player__volume", "aria-hidden": "true" }, [
+    el("span", { class: "player__volume-label" }, ["Volume"]),
+    el("div", { class: "player__volume-track" }, [volumeFill]),
+  ]);
+  let volumeTimer: number | undefined;
+  const adjustVolume = (delta: number): void => {
+    if (!videoEl) return;
+    videoEl.volume = Math.min(1, Math.max(0, videoEl.volume + delta));
+    volumeFill.style.width = `${Math.round(videoEl.volume * 100)}%`;
+    volume.classList.add("is-visible");
+    if (volumeTimer !== undefined) clearTimeout(volumeTimer);
+    volumeTimer = window.setTimeout(() => volume.classList.remove("is-visible"), 1500);
+  };
+
   const node = screen("player", [
     stage,
     progress,
     skip,
+    volume,
   ]);
 
   // Contrôles média en intentions (F14) : le lecteur expose play/pause/stop/volume
@@ -370,10 +388,10 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
           finishOnce();
           break;
         case "volumeUp":
-          if (videoEl) videoEl.volume = Math.min(1, videoEl.volume + 0.1);
+          adjustVolume(0.1);
           break;
         case "volumeDown":
-          if (videoEl) videoEl.volume = Math.max(0, videoEl.volume - 0.1);
+          adjustVolume(-0.1);
           break;
         default:
           ring.handle(intent);
@@ -387,6 +405,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
     dispose: () => {
       disposed = true;
       if (intervalId !== undefined) clearInterval(intervalId);
+      if (volumeTimer !== undefined) clearTimeout(volumeTimer);
       if (videoEl) {
         videoEl.pause();
         videoEl.removeAttribute("src");
