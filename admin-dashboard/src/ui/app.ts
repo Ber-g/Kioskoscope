@@ -80,7 +80,7 @@ export class App {
         : this.view === "revenue"
           ? revenuePage(this.store, (id) => this.openDrawer(id))
           : this.view === "rights"
-            ? (this.store.activeHasModule("rights") ? rightsPage(this.store, () => this.render()) : this.overview())
+            ? (this.store.activeHasModule("rights") ? rightsPage(this.store, () => this.render(), (id) => this.openDrawer(id)) : this.overview())
             : this.view === "sessions"
               ? sessionsPage(this.store, (id) => this.openDrawer(id))
               : this.view === "maintenance"

@@ -1,6 +1,7 @@
 import { Modal } from "bootstrap";
 import type { FleetStore, RightsReport, RightsRow, RoyaltyModel } from "../data/store";
 import { el, formatMoney, icon } from "./dom";
+import { boothLabelEl } from "./components";
 import { t } from "../i18n";
 
 // Menu Droits & redevances (F9) : journal de vision (`plays`) confronté aux licences.
@@ -35,14 +36,14 @@ function kpiTile(label: string, value: string, hue: string, iconPath: string): H
   ]);
 }
 
-export function rightsPage(store: FleetStore, onChanged: () => void): HTMLElement {
+export function rightsPage(store: FleetStore, onChanged: () => void, onOpenBooth?: (id: string) => void): HTMLElement {
   const container = el("div", {}, [el("div", { class: "text-secondary p-3" }, ["Chargement des droits…"])]);
-  const reload = (): void => void store.rightsReport().then((rep) => container.replaceChildren(render(store, rep, () => { reload(); onChanged(); })));
+  const reload = (): void => void store.rightsReport().then((rep) => container.replaceChildren(render(store, rep, () => { reload(); onChanged(); }, onOpenBooth)));
   reload();
   return container;
 }
 
-function render(store: FleetStore, rep: RightsReport, reload: () => void): HTMLElement {
+function render(store: FleetStore, rep: RightsReport, reload: () => void, onOpenBooth?: (id: string) => void): HTMLElement {
   const cur = rep.currency;
   const filmRows = rep.rows.map((r) => {
     const st = STATUS[r.status];
@@ -52,7 +53,10 @@ function render(store: FleetStore, rep: RightsReport, reload: () => void): HTMLE
       : el("span", {}, []);
     // Détail par Kiosk (si scope par machine ou plusieurs Kiosks).
     const perBooth = r.perBooth.length > 0 && (r.capScope === "per_booth" || r.perBooth.length > 1)
-      ? el("div", { class: "text-secondary small mt-1" }, r.perBooth.map((pb) => el("div", {}, [`${pb.boothLabel} : ${pb.used}${pb.cap != null ? ` / ${pb.cap}` : ""}`])))
+      ? el("div", { class: "text-secondary small mt-1" }, r.perBooth.map((pb) => el("div", {}, [
+          boothLabelEl(pb.boothLabel, onOpenBooth ? () => onOpenBooth(pb.boothId) : undefined),
+          ` : ${pb.used}${pb.cap != null ? ` / ${pb.cap}` : ""}`,
+        ])))
       : el("span", {}, []);
 
     const editBtn = el("button", { class: "btn btn-sm", type: "button" }, ["Licence"]);

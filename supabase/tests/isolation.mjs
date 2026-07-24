@@ -328,12 +328,68 @@ async function main() {
   await runTenantSuite("User A", clientA, ORG_A, ORG_B);
   await runTenantSuite("User B", clientB, ORG_B, ORG_A);
 
+  await runDeviceSuite(url, anon);
+
   console.log(`\n── Résultat : ${checks - failures}/${checks} vérifications OK ──`);
   if (failures > 0) {
     console.error(`✖ ISOLATION COMPROMISE : ${failures} vérification(s) en échec.`);
     process.exit(1);
   }
   console.log("✓ ISOLATION PROUVÉE : aucune fuite cross-org (lecture ni écriture).");
+}
+
+// ── Suite DEVICE ───────────────────────────────────────────────────────────────
+// Prouve qu'un COMPTE BORNE (device) ne voit/écrit que SON org — le scénario que la suite
+// tenant (comptes super_user) ne couvre pas, et exactement le risque du compte partagé multi-org.
+// Optionnelle : fournir ISO_DEVICE_EMAIL / ISO_DEVICE_PASSWORD d'un compte borne « nu » relié à une
+// borne. On DÉDUIT son org depuis le catalogue qu'il lit (pas d'hypothèse a1/a2). Skip si absent.
+async function runDeviceSuite(url, anon) {
+  const email = process.env.ISO_DEVICE_EMAIL;
+  const password = process.env.ISO_DEVICE_PASSWORD;
+  console.log(`\n▸ Device (compte borne « nu »)`);
+  if (!email || !password) {
+    assert(true, `bloc device ignoré (ISO_DEVICE_EMAIL / ISO_DEVICE_PASSWORD non fournis)`);
+    return;
+  }
+  const client = createClient(url, anon, { auth: { persistSession: false, autoRefreshToken: false } });
+  const { error: signErr } = await client.auth.signInWithPassword({ email, password });
+  if (signErr) {
+    assert(false, `connexion device (${email}) échouée : ${signErr.message}`);
+    return;
+  }
+  // Garde-fou : un device global_admin bypasserait la RLS → test invalide.
+  const who = await client.from("users").select("is_global_admin").limit(1);
+  assert(!who.data?.[0]?.is_global_admin, `le compte borne n'est PAS global_admin (sinon bypass RLS)`);
+
+  // Lecture : le device ne voit QUE le catalogue de SON org. On déduit son org des lignes lues.
+  const media = await client.from("media").select("organization_id");
+  assert(!media.error, `device : lecture catalogue sans erreur (${media.error?.message ?? "ok"})`);
+  const rows = media.data ?? [];
+  const orgs = [...new Set(rows.map((r) => r.organization_id))];
+  assert(orgs.length <= 1, `device : catalogue d'UNE SEULE org (${orgs.length} org(s) vue(s))`);
+  const deviceOrg = orgs[0] ?? ORG_A; // repli si catalogue vide
+  const adverseOrg = deviceOrg === ORG_A ? ORG_B : ORG_A;
+
+  // Aucune fuite d'une AUTRE org (sonde directe).
+  const probeMedia = await client.from("media").select("id").eq("organization_id", adverseOrg);
+  assert((probeMedia.data ?? []).length === 0, `device : sonde catalogue org adverse → 0 ligne`);
+  const probeStyle = await client.from("org_styles").select("organization_id").eq("organization_id", adverseOrg);
+  assert(((probeStyle.data ?? []).length === 0), `device : sonde org_styles org adverse → 0 ligne`);
+  const probeOp = await client.from("operator_access").select("id").eq("organization_id", adverseOrg);
+  assert((probeOp.data ?? []).length === 0, `device : sonde operator_access org adverse → 0 ligne`);
+
+  // Écriture : le device ne peut pas fabriquer une séance rattachée à l'org adverse (RLS with-check
+  // booth_id = current_device_booth() + org scoping). booth_id inexistant → refusé de toute façon.
+  const fakeBooth = "00000000-0000-0000-0000-0000dead0000";
+  const ins = await client.from("sessions").insert({
+    organization_id: adverseOrg,
+    booth_id: fakeBooth,
+    share_token: `ISO-DEV-${Date.now()}`,
+    unlock_method: "free",
+  }).select();
+  const inserted = (ins.data ?? []).length;
+  assert(ins.error != null || inserted === 0, `device : INSERT séance dans l'org adverse → refusé (${ins.error ? "refusé" : inserted + " inséré(s)"})`);
+  if (inserted > 0) await client.from("sessions").delete().eq("id", ins.data[0].id);
 }
 
 main().catch((e) => {
