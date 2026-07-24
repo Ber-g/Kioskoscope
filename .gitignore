@@ -11,6 +11,11 @@ kiosk/pki/certs/
 *.p12
 *.pem
 
+# Secrets DEVICE de la flotte (mots de passe des comptes borne) — JAMAIS committer.
+kiosk/devices.json
+kiosk/**/devices.json
+**/device.json
+
 # Documents internes de conception (non publics) — gardés en local uniquement.
 # Contiennent la stratégie produit/technique/QA et ne doivent pas être publiés.
 /ARCHITECTURE.md
