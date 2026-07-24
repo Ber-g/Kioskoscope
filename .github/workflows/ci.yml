@@ -38,6 +38,10 @@ jobs:
       - name: Build booth-client
         run: npm run -w booth-client build
 
+      # Logique CRITIQUE du domaine : contraste WCAG (F19) + auth opérateur PBKDF2 (CIN-073).
+      - name: Test @kioskoscope/domain (domain_smoke)
+        run: npm run -w @kioskoscope/domain test
+
       # Invariants F14 (anneau de focus / intentions) — test DOM-free, sans réseau.
       - name: Test booth-client (focus_smoke)
         run: npm run -w booth-client test
