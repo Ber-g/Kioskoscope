@@ -1,4 +1,4 @@
-import type { OrgStyle } from "@kioskoscope/domain";
+import type { OrgStyle, Subtitle } from "@kioskoscope/domain";
 import type { Film, Play, Session } from "../domain/types";
 import type { AccessLogEntry } from "../setup/accessCache";
 import type { AccessEntry, AccessTable, OperatorRole } from "../setup/auth";
@@ -33,7 +33,7 @@ function readDevConfig(): BoothConfig | null {
 }
 
 /** Ligne `media` (snake_case) → `Film` (= `Media`, camelCase). */
-function rowToFilm(row: Record<string, unknown>): Film {
+function rowToFilm(row: Record<string, unknown>, subs: readonly Subtitle[] = []): Film {
   const arr = (v: unknown): string[] => (Array.isArray(v) ? (v as string[]) : []);
   return {
     id: String(row.id),
@@ -51,7 +51,7 @@ function rowToFilm(row: Record<string, unknown>): Film {
     tags: arr(row.tags),
     audienceTags: arr(row.audience_tags),
     language: String(row.language ?? "fr"),
-    subtitles: [],
+    subtitles: subs,
     director: String(row.director ?? ""),
     synopsis: String(row.synopsis ?? ""),
     stills: arr(row.stills),
@@ -183,7 +183,7 @@ export class BoothBackend {
     }
   }
 
-  /** Catalogue réel de l'org (médias actifs, scoping RLS). */
+  /** Catalogue réel de l'org (médias actifs, scoping RLS) + sous-titres VÉRIFIÉS (F12). */
   async loadCatalog(): Promise<Film[]> {
     if (!supabase) return [];
     const { data, error } = await supabase.from("media").select("*").eq("active", true);
@@ -191,7 +191,34 @@ export class BoothBackend {
       console.error("[booth] chargement catalogue :", error.message);
       return [];
     }
-    return (data ?? []).map((r) => rowToFilm(r as Record<string, unknown>));
+    // F12 : sous-titres — UNIQUEMENT format VTT (natif navigateur, pas de conversion SRT côté borne)
+    // et workflow_status = 'verified' (jamais un brouillon 'todo'/'rework' sur une borne publique).
+    // Nécessite la policy device sur `subtitles` (migration 0021). Échec silencieux → catalogue sans subs.
+    const subsByMedia = new Map<string, Subtitle[]>();
+    const { data: subRows, error: subErr } = await supabase
+      .from("subtitles")
+      .select("media_id,lang,format,url,workflow_status")
+      .eq("format", "vtt")
+      .eq("workflow_status", "verified");
+    if (subErr) {
+      console.warn("[booth] sous-titres non chargés :", subErr.message);
+    } else {
+      for (const r of (subRows ?? []) as Array<Record<string, unknown>>) {
+        const mid = String(r.media_id);
+        const list = subsByMedia.get(mid) ?? [];
+        list.push({
+          lang: String(r.lang),
+          format: "vtt",
+          url: String(r.url),
+          workflowStatus: "verified",
+        });
+        subsByMedia.set(mid, list);
+      }
+    }
+    return (data ?? []).map((r) => {
+      const row = r as Record<string, unknown>;
+      return rowToFilm(row, subsByMedia.get(String(row.id)) ?? []);
+    });
   }
 
   /**

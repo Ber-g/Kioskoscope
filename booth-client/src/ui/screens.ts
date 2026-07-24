@@ -302,6 +302,21 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
       if (v && v.duration > 0) bar.style.width = `${Math.min(100, (v.currentTime / v.duration) * 100)}%`;
     });
 
+    // F12 — sous-titres : pistes VTT (déjà filtrées « vérifiées » par le backend). La borne n'a pas
+    // de contrôles natifs → on AFFICHE la première piste automatiquement (accessibilité) ; les autres
+    // restent disponibles pour un futur sélecteur opérateur.
+    film.subtitles.forEach((sub, i) => {
+      videoEl!.appendChild(
+        el("track", { kind: "subtitles", src: sub.url, srclang: sub.lang, label: sub.lang, ...(i === 0 ? { default: "true" } : {}) }),
+      );
+    });
+    if (film.subtitles.length > 0) {
+      videoEl.addEventListener("loadedmetadata", () => {
+        const tt = videoEl?.textTracks?.[0];
+        if (tt) tt.mode = "showing"; // certains navigateurs n'activent pas `default` seul sans contrôles
+      });
+    }
+
     // Overlay : spinner pendant le buffering, et repli « Toucher pour lancer » si l'AUTOPLAY est
     // refusé (dans ce cas AUCUN `error` n'est émis → sans ça, écran noir figé jusqu'à « Passer »).
     const spinner = el("div", { class: "spinner", "aria-hidden": "true" }, []);
