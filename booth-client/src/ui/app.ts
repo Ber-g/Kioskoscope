@@ -29,6 +29,9 @@ export interface AppConfig {
   /** Inactivité max sur les écrans de CHOIX (sélection/reco) avant retour à l'accueil (ms). Évite
    *  qu'une borne reste bloquée sur le choix si un visiteur abandonne après avoir déverrouillé. */
   readonly parcoursInactivityMs: number;
+  /** Hook appelé À CHAQUE retour à l'accueil (entre deux visiteurs) — sert à rafraîchir le catalogue/
+   *  style depuis le back-office sans reboot. Fire-and-forget ; jamais pendant une séance. Optionnel. */
+  readonly onIdle?: () => void;
 }
 
 /**
@@ -117,6 +120,13 @@ export class App {
   // ── États ──────────────────────────────────────────────────────────────────
   private goIdle(): void {
     resetMoodTheme(); // retour à la palette neutre entre deux visiteurs
+    // Rafraîchissement back-office ENTRE deux visiteurs (jamais en séance) : catalogue/style à jour
+    // sans reboot. Fire-and-forget, débounce côté hook. Erreur avalée (ne casse pas le retour accueil).
+    try {
+      this.config.onIdle?.();
+    } catch {
+      // hook défaillant : on ne compromet jamais l'affichage de l'accueil.
+    }
     // Catalogue vide (org sans média jouable) → écran d'attente SANS démarrage : jamais de
     // déverrouillage/paiement pour du vide. La borne reste vivante (menu opérateur inchangé).
     const hasFilms = activeCatalog().length > 0;

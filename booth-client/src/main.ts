@@ -131,6 +131,35 @@ async function main(): Promise<void> {
   const shareBaseUrl =
     (import.meta.env.VITE_SHARE_BASE_URL as string | undefined) ?? "https://my.kioskoscope.com";
 
+  // Rafraîchissement back-office ENTRE deux visiteurs (appelé par App.goIdle) : catalogue + droits +
+  // style/marque à jour sans reboot. Débounce (≤ 1×/5 min) + online only + fire-and-forget. On part
+  // avec `lastRefresh=maintenant` → le 1er retour accueil juste après le boot ne re-fetch pas inutilement.
+  let lastRefresh = Date.now();
+  const REFRESH_MIN_MS = 5 * 60_000;
+  const refreshFromBackOffice = (): void => {
+    if (!online || Date.now() - lastRefresh < REFRESH_MIN_MS) return;
+    lastRefresh = Date.now();
+    void (async () => {
+      try {
+        const films = await backend.loadCatalog();
+        const blk = await backend.loadBlockedMedia();
+        setCatalog(films.filter((f) => !blk.has(f.id)));
+        const style = await backend.loadOrgStyle();
+        applyOrgStyle(style ?? undefined);
+        if (style) {
+          setBrand({
+            ...(style.title ? { title: style.title } : {}),
+            idleImageUrl: style.assets?.idleImage ?? null,
+            logoUrl: style.assets?.logoDark ?? style.assets?.logoLight ?? null,
+          });
+        }
+        console.info("[booth] catalogue/style rafraîchis (back-office)");
+      } catch (e) {
+        console.warn("[booth] rafraîchissement back-office échoué :", e);
+      }
+    })();
+  };
+
   const app = new App(
     root,
     new MockUnlockAdapter(), // mock : simule succès ET échecs
@@ -142,6 +171,7 @@ async function main(): Promise<void> {
       endAutoReturnMs: 45_000,
       afterFilmCountdownSeconds: 60, // 1 min max pour choisir après un film
       parcoursInactivityMs: 90_000, // abandon au choix → retour accueil (borne jamais bloquée)
+      onIdle: refreshFromBackOffice, // catalogue/style à jour sans reboot
     },
   );
 
