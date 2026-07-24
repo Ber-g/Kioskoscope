@@ -75,7 +75,10 @@ export class App {
   // ── États ──────────────────────────────────────────────────────────────────
   private goIdle(): void {
     resetMoodTheme(); // retour à la palette neutre entre deux visiteurs
-    this.mount(idleScreen(() => this.beginUnlock()));
+    // Catalogue vide (org sans média jouable) → écran d'attente SANS démarrage : jamais de
+    // déverrouillage/paiement pour du vide. La borne reste vivante (menu opérateur inchangé).
+    const hasFilms = activeCatalog().length > 0;
+    this.mount(idleScreen(() => this.beginUnlock(), hasFilms));
   }
 
   private beginUnlock(): void {

@@ -64,7 +64,10 @@ async function main(): Promise<void> {
     const films = await backend.loadCatalog();
     const blocked = await backend.loadBlockedMedia(); // droits F15 : exclure expiré / au plafond
     const playable = films.filter((f) => !blocked.has(f.id));
-    if (playable.length > 0) setCatalog(playable);
+    // En ligne, le catalogue = la RÉALITÉ de l'org, même VIDE. On ne retombe JAMAIS sur les films
+    // de démo pour une vraie org sans média (sinon on montrerait du faux contenu / on ferait payer
+    // pour rien). L'écran d'attente affiche un état « aucune séance » si vide (cf. app.ts goIdle).
+    setCatalog(playable);
     // F19 : style de l'org (Mes styles). La palette/les fontes → tokens CSS (applyOrgStyle) ;
     // le titre + les assets → contenu de marque (setBrand, lu par l'écran d'attente). Absent =
     // maître (déjà appliqué au boot).

@@ -83,11 +83,16 @@ function learnMoreQr(url: string): HTMLElement {
 }
 
 // ── Écran d'accueil (idle / attract loop) ───────────────────────────────────
-export function idleScreen(onStart: () => void): ScreenResult {
+// `hasFilms=false` (org sans média jouable) → PAS de bouton de démarrage : le visiteur ne peut
+// pas déverrouiller (donc jamais payer) pour un catalogue vide ; message humain à la place.
+export function idleScreen(onStart: () => void, hasFilms = true): ScreenResult {
   const start = el("button", { class: "btn btn--primary btn--xl", type: "button" }, [
     "Toucher pour commencer",
   ]);
   start.addEventListener("click", onStart);
+  const unavailable = el("p", { class: "muted idle-unavailable" }, [
+    "Aucune séance disponible pour le moment. Revenez bientôt.",
+  ]);
   // F19 : titre/accroche viennent de la marque de l'org (repli maître). Logo v2 = si présent,
   // il remplace le titre typographique ; sinon le titre reste. « powered by » non supprimable.
   const brand = getBrand();
@@ -97,14 +102,14 @@ export function idleScreen(onStart: () => void): ScreenResult {
   const brandChildren = [heading, el("p", { class: "brand__tagline" }, [brand.tagline])];
   // Mention non supprimable, uniquement sur une marque d'org (redondante si marque = maître).
   if (isCustomBrand()) brandChildren.push(el("p", { class: "brand__powered" }, ["propulsé par Kioskoscope"]));
-  const node = screen("idle", [el("div", { class: "brand" }, brandChildren), start]);
+  const node = screen("idle", [el("div", { class: "brand" }, brandChildren), hasFilms ? start : unavailable]);
   // F19 v2 : image d'attente de l'org en fond (assets). Un voile sombre (via .has-idle-image)
   // garde le titre/bouton lisibles quelle que soit l'image. Absente → fond de marque par défaut.
   if (brand.idleImageUrl) {
     node.classList.add("has-idle-image");
     node.style.setProperty("--idle-image", `url("${cssUrl(brand.idleImageUrl)}")`);
   }
-  return { node, handler: new FocusRing({ items: [start] }) };
+  return { node, handler: new FocusRing({ items: hasFilms ? [start] : [] }) };
 }
 
 // ── Déverrouillage en cours ──────────────────────────────────────────────────
