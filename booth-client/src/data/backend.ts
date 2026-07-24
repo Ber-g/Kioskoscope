@@ -321,16 +321,21 @@ export class BoothBackend {
   }
 
   /** Remonte une séance close + ses lectures. Fire-and-forget (n'interrompt pas le parcours). */
-  async saveSession(snapshot: { session: Session; plays: readonly Play[] }): Promise<void> {
-    if (!supabase || !this.cfg) return;
+  /**
+   * Remonte une séance + ses lectures. Renvoie `true` si TOUT est remonté, `false` sinon (réseau/erreur)
+   * → l'appelant met alors la séance en JOURNAL offline pour la rejouer (F9, résilience, aucun paiement perdu).
+   * `sessionId` optionnel = id STABLE réutilisé au rejeu → UPSERT idempotent (jamais de double-comptage).
+   */
+  async saveSession(snapshot: { session: Session; plays: readonly Play[] }, sessionId?: string): Promise<boolean> {
+    if (!supabase || !this.cfg) return false;
     const s = snapshot.session;
-    // Id généré CÔTÉ BORNE : on n'a pas besoin de relire la ligne (RETURNING), ce qui
-    // évite d'exiger une policy SELECT sur `sessions` pour le device (droits minimaux, CIN-002).
-    const sessionId = crypto.randomUUID();
+    // Id généré CÔTÉ BORNE (pas de RETURNING → pas besoin de policy SELECT device, CIN-002). Upsert
+    // « do nothing » sur l'id → rejouer une séance déjà insérée ne la duplique pas.
+    const id = sessionId ?? crypto.randomUUID();
     const { error } = await supabase
       .from("sessions")
-      .insert({
-        id: sessionId,
+      .upsert({
+        id,
         organization_id: this.cfg.orgId,
         booth_id: this.cfg.boothId,
         started_at: new Date(s.startedAt).toISOString(),
@@ -339,15 +344,15 @@ export class BoothBackend {
         unlock_method: s.unlockMethod,
         amount_cents: s.amount != null ? Math.round(s.amount) : null,
         payment_provider_ref: s.paymentProviderRef,
-      });
+      }, { onConflict: "id", ignoreDuplicates: true });
     if (error) {
-      console.error("[booth] remontée séance :", error.message);
-      return;
+      console.error("[booth] remontée séance (bufferisée) :", error.message);
+      return false;
     }
     if (snapshot.plays.length > 0) {
       const rows = snapshot.plays.map((p) => ({
         organization_id: this.cfg!.orgId,
-        session_id: sessionId,
+        session_id: id,
         media_id: p.filmId,
         position: p.position,
         started_at: new Date(p.startedAt).toISOString(),
@@ -355,7 +360,12 @@ export class BoothBackend {
         source: p.source,
       }));
       const { error: pe } = await supabase.from("plays").insert(rows);
-      if (pe) console.error("[booth] remontée lectures :", pe.message);
+      if (pe) {
+        // Séance OK mais lectures KO : on rejouera (session upsert = no-op, plays réinsérés).
+        console.error("[booth] remontée lectures (bufferisée) :", pe.message);
+        return false;
+      }
     }
+    return true;
   }
 }

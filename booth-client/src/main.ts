@@ -6,6 +6,7 @@ import { RuleBasedRecommender } from "./reco/RuleBasedRecommender";
 import { SessionManager } from "./session/SessionManager";
 import { MockUnlockAdapter } from "./unlock/MockUnlockAdapter";
 import { BoothBackend } from "./data/backend";
+import { SessionJournal } from "./data/sessionJournal";
 import { setCatalog } from "./domain/catalog";
 import type { Play, Session } from "./domain/types";
 import { App } from "./ui/app";
@@ -54,6 +55,9 @@ async function main(): Promise<void> {
   let organizationId = FALLBACK_ORG_ID;
   let online = false;
   let sink: ((s: { session: Session; plays: readonly Play[] }) => void) | undefined;
+  // F9 résilience : sur une VRAIE borne (creds présents), on ne perd JAMAIS une séance/paiement même
+  // hors ligne — on bufferise en localStorage et on rejoue à la reconnexion. Absent en dev/mock.
+  const sessionJournal = backend.isConfigured ? new SessionJournal() : undefined;
 
   if (backend.isConfigured && (await backend.init())) {
     online = true;
@@ -80,13 +84,37 @@ async function main(): Promise<void> {
         logoUrl: orgStyle.assets?.logoDark ?? orgStyle.assets?.logoLight ?? null,
       });
     }
-    sink = (snapshot) => void backend.saveSession(snapshot);
+    // Drain des séances bufferisées hors ligne (rejeu idempotent par id stable) : on ne retire du
+    // journal que ce qui est effectivement remonté → zéro perte, zéro double-comptage.
+    if (sessionJournal) {
+      const pending = sessionJournal.peek();
+      let drained = 0;
+      for (const p of pending) {
+        if (await backend.saveSession({ session: p.session, plays: p.plays }, p.id)) {
+          sessionJournal.remove(p.id);
+          drained += 1;
+        }
+      }
+      if (pending.length > 0) console.info(`[booth] séances hors-ligne rejouées : ${drained}/${pending.length}`);
+    }
     console.info(
       `[booth] branché Supabase · org ${organizationId} · ${playable.length} film(s)` +
         (blocked.size > 0 ? ` (${blocked.size} exclu(s) : droits/plafond)` : ""),
     );
   } else {
     console.info("[booth] mode hors ligne (catalogue factice, sessions en mémoire)");
+  }
+
+  // Sink de fin de séance. VRAIE borne : on tente la remontée ; en cas d'échec (réseau coupé, ou
+  // borne bootée hors ligne), on BUFFERISE la séance (+ paiement) → rejouée à la prochaine
+  // reconnexion. Dev/mock (pas de creds) : pas de sink (sessions en mémoire).
+  if (sessionJournal) {
+    sink = (snapshot) => {
+      const id = crypto.randomUUID();
+      void backend.saveSession(snapshot, id).then((ok) => {
+        if (!ok) sessionJournal.append({ id, session: snapshot.session, plays: snapshot.plays });
+      });
+    };
   }
 
   // CIN-014 : heartbeat RÉGULIER (pas seulement au boot) → la flotte repère vite une borne
