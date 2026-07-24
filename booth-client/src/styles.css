@@ -369,6 +369,29 @@ h2 {
   background: rgba(6, 6, 8, 0.45);
 }
 
+/* Sélecteur de langue des sous-titres — accessible au PUBLIC (visiteur). Chips + « Sans ». */
+.player__subs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.player__subs-label {
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-text-muted);
+}
+
+.player__subs .chip {
+  min-height: 44px;
+  font-size: 0.95rem;
+  padding: 0 1rem;
+}
+
 /* Barre de volume : apparaît brièvement au changement (F14 volume ±), puis s'estompe. */
 .player__volume {
   position: fixed;

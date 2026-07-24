@@ -290,6 +290,8 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
   let intervalId: number | undefined;
   let videoEl: HTMLVideoElement | undefined;
   let stage: HTMLElement;
+  let subtitleControls: HTMLElement | undefined;
+  const subtitleChips: HTMLElement[] = []; // chips de langue (F14 : ajoutées à l'anneau)
 
   if (film.storageUrl) {
     // Lecture réelle.
@@ -302,19 +304,34 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
       if (v && v.duration > 0) bar.style.width = `${Math.min(100, (v.currentTime / v.duration) * 100)}%`;
     });
 
-    // F12 — sous-titres : pistes VTT (déjà filtrées « vérifiées » par le backend). La borne n'a pas
-    // de contrôles natifs → on AFFICHE la première piste automatiquement (accessibilité) ; les autres
-    // restent disponibles pour un futur sélecteur opérateur.
-    film.subtitles.forEach((sub, i) => {
-      videoEl!.appendChild(
-        el("track", { kind: "subtitles", src: sub.url, srclang: sub.lang, label: sub.lang, ...(i === 0 ? { default: "true" } : {}) }),
-      );
+    // F12 — sous-titres : pistes VTT (déjà « vérifiées » côté backend). La SÉLECTION DE LANGUE revient
+    // au PUBLIC (visiteur) : la borne n'ayant pas de contrôles natifs, on rend nos propres chips de
+    // langue (navigables au F14, cf. anneau plus bas) + un choix « Sans ».
+    film.subtitles.forEach((sub) => {
+      videoEl!.appendChild(el("track", { kind: "subtitles", src: sub.url, srclang: sub.lang, label: sub.lang }));
     });
     if (film.subtitles.length > 0) {
-      videoEl.addEventListener("loadedmetadata", () => {
-        const tt = videoEl?.textTracks?.[0];
-        if (tt) tt.mode = "showing"; // certains navigateurs n'activent pas `default` seul sans contrôles
+      const setTrack = (idx: number): void => {
+        const tracks = videoEl!.textTracks;
+        for (let i = 0; i < tracks.length; i++) tracks[i].mode = i === idx ? "showing" : "disabled";
+      };
+      const highlight = (active: HTMLElement): void =>
+        subtitleChips.forEach((c) => c.classList.toggle("chip--on", c === active));
+      film.subtitles.forEach((sub, i) => {
+        const chip = el("button", { class: "chip", type: "button" }, [sub.lang.toUpperCase()]);
+        chip.addEventListener("click", () => { setTrack(i); highlight(chip); });
+        subtitleChips.push(chip);
       });
+      const offChip = el("button", { class: "chip", type: "button" }, ["Sans"]);
+      offChip.addEventListener("click", () => { setTrack(-1); highlight(offChip); });
+      subtitleChips.push(offChip);
+      subtitleControls = el("div", { class: "player__subs" }, [
+        el("span", { class: "player__subs-label" }, ["Sous-titres"]),
+        ...subtitleChips,
+      ]);
+      // Défaut : première langue affichée (accessibilité) dès que les pistes sont prêtes.
+      videoEl.addEventListener("loadedmetadata", () => setTrack(0));
+      subtitleChips[0]?.classList.add("chip--on");
     }
 
     // Overlay : spinner pendant le buffering, et repli « Toucher pour lancer » si l'AUTOPLAY est
@@ -366,6 +383,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
 
   const node = screen("player", [
     stage,
+    ...(subtitleControls ? [subtitleControls] : []),
     progress,
     skip,
     volume,
@@ -374,7 +392,9 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
   // Contrôles média en intentions (F14) : le lecteur expose play/pause/stop/volume
   // en actions de premier plan (avant : « passer » uniquement). Navigation/confirm
   // délégués à l'anneau (le bouton « Passer »).
-  const ring = new FocusRing({ items: [skip], onBack: finishOnce });
+  // Anneau F14 : les chips de langue (si présentes) + « Passer » sont navigables/validables au clavier
+  // ou aux boutons physiques — la sélection de langue reste donc pilotable sans écran tactile.
+  const ring = new FocusRing({ items: [...subtitleChips, skip], onBack: finishOnce });
   const handler: IntentHandler = {
     handle(intent: Intent): void {
       switch (intent) {
