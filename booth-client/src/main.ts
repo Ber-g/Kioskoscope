@@ -141,6 +141,7 @@ async function main(): Promise<void> {
       shareBaseUrl,
       endAutoReturnMs: 45_000,
       afterFilmCountdownSeconds: 60, // 1 min max pour choisir après un film
+      parcoursInactivityMs: 90_000, // abandon au choix → retour accueil (borne jamais bloquée)
     },
   );
 

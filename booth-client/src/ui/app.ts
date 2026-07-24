@@ -26,6 +26,9 @@ export interface AppConfig {
   readonly endAutoReturnMs: number;
   /** Temps laissé au public pour choisir après un film, avant la page de fin (s). */
   readonly afterFilmCountdownSeconds: number;
+  /** Inactivité max sur les écrans de CHOIX (sélection/reco) avant retour à l'accueil (ms). Évite
+   *  qu'une borne reste bloquée sur le choix si un visiteur abandonne après avoir déverrouillé. */
+  readonly parcoursInactivityMs: number;
 }
 
 /**
@@ -39,6 +42,8 @@ export class App {
   private lastQuery: MoodDurationQuery = { mood: null, maxDurationSeconds: null };
   private unlockController: AbortController | undefined;
   private endTimer: number | undefined;
+  private inactivityTimer: number | undefined;
+  private inactivityMs = 0; // >0 seulement sur les écrans de choix (sélection/reco)
   // F14 : une seule instance pour toute la session. Les sources d'entrée (clavier
   // maintenant, boutons physiques plus tard) sont attachées une fois ; chaque écran
   // monté devient le handler actif via mount().
@@ -53,6 +58,25 @@ export class App {
   ) {
     this.root = root;
     this.input = new InputController([new KeyboardInputSource()]);
+    // Toute interaction ré-arme le minuteur d'inactivité (no-op hors écrans de choix).
+    this.root.addEventListener("pointerdown", () => this.armInactivity());
+    window.addEventListener("keydown", () => this.armInactivity());
+  }
+
+  /** (Ré)arme le minuteur d'inactivité des écrans de choix ; à expiration → abandon → accueil. */
+  private armInactivity(): void {
+    if (this.inactivityTimer !== undefined) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = undefined;
+    }
+    if (this.inactivityMs > 0) this.inactivityTimer = window.setTimeout(() => this.abandonToIdle(), this.inactivityMs);
+  }
+
+  /** Abandon en cours de choix : on TERMINE la séance déjà payée (enregistrée, 0 film → pas de perte
+   *  de revenu) puis on revient à l'accueil pour le visiteur suivant. */
+  private abandonToIdle(): void {
+    if (this.sessions.current) this.sessions.end();
+    this.goIdle();
   }
 
   start(): void {
@@ -74,7 +98,7 @@ export class App {
   }
 
   // ── Montage d'écran ────────────────────────────────────────────────────────
-  private mount(result: ScreenResult): void {
+  private mount(result: ScreenResult, inactivityMs = 0): void {
     this.currentDispose?.();
     if (this.endTimer !== undefined) {
       clearTimeout(this.endTimer);
@@ -84,6 +108,10 @@ export class App {
     this.currentDispose = result.dispose;
     // L'écran monté devient le seul récepteur d'intentions (undefined = personne).
     this.input.setHandler(result.handler);
+    // Minuteur d'inactivité : armé seulement sur les écrans de choix (inactivityMs>0), sinon annulé
+    // (jamais pendant la lecture d'un film — l'absence d'interaction y est normale).
+    this.inactivityMs = inactivityMs;
+    this.armInactivity();
   }
 
   // ── États ──────────────────────────────────────────────────────────────────
@@ -120,6 +148,7 @@ export class App {
         applyMoodTheme(choice.mood); // la couleur suit l'humeur choisie
         this.goReco();
       }),
+      this.config.parcoursInactivityMs, // abandon au choix → retour accueil (séance payée enregistrée)
     );
   }
 
@@ -134,6 +163,7 @@ export class App {
         onPlayChosen: (film) => this.playFilm(film, "user_choice"),
         onNoneEndSession: () => this.goEnd(),
       }),
+      this.config.parcoursInactivityMs, // abandon au choix → retour accueil (séance payée enregistrée)
     );
   }
 
