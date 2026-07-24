@@ -350,6 +350,23 @@ h2 {
   max-height: 70vh;
   border-radius: var(--radius);
   background: #000;
+  display: block;
+}
+
+/* Scène vidéo : conteneur relatif pour poser l'overlay (spinner / « toucher pour lancer »). */
+.player__videostage {
+  position: relative;
+  display: inline-block;
+  line-height: 0; /* évite un liseré sous la vidéo inline */
+}
+
+.player__overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius);
+  background: rgba(6, 6, 8, 0.45);
 }
 
 .player__stage {

@@ -289,6 +289,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
 
   let intervalId: number | undefined;
   let videoEl: HTMLVideoElement | undefined;
+  let stage: HTMLElement;
 
   if (film.storageUrl) {
     // Lecture réelle.
@@ -300,9 +301,21 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
       const v = videoEl;
       if (v && v.duration > 0) bar.style.width = `${Math.min(100, (v.currentTime / v.duration) * 100)}%`;
     });
-    // Autoplay peut être refusé (chaîne de gestes rompue) : on avale le rejet du play() pour éviter
-    // une promesse non gérée. `error`/`ended` couvrent l'échec dur ; le repli UI reste à faire (#2).
-    void videoEl.play?.().catch(() => undefined);
+
+    // Overlay : spinner pendant le buffering, et repli « Toucher pour lancer » si l'AUTOPLAY est
+    // refusé (dans ce cas AUCUN `error` n'est émis → sans ça, écran noir figé jusqu'à « Passer »).
+    const spinner = el("div", { class: "spinner", "aria-hidden": "true" }, []);
+    const tapToPlay = el("button", { class: "btn btn--primary btn--lg", type: "button" }, ["Toucher pour lancer"]);
+    const overlay = el("div", { class: "player__overlay" }, [spinner]);
+    const hideOverlay = (): void => { overlay.style.display = "none"; };
+    const showOverlay = (child: HTMLElement): void => { overlay.style.display = ""; overlay.replaceChildren(child); };
+    const tryPlay = (): void => void videoEl!.play().then(hideOverlay).catch(() => showOverlay(tapToPlay));
+    tapToPlay.addEventListener("click", tryPlay);
+    videoEl.addEventListener("playing", hideOverlay);
+    videoEl.addEventListener("waiting", () => showOverlay(spinner)); // re-buffering
+    tryPlay();
+
+    stage = el("div", { class: "player__videostage" }, [videoEl, overlay]);
   } else {
     // Lecture SIMULÉE : progression accélérée (~12 s) pour tester le parcours.
     const SIM_MS = 12000;
@@ -312,16 +325,15 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
       bar.style.width = `${ratio * 100}%`;
       if (ratio >= 1) finishOnce();
     }, 100);
+    stage = el("div", { class: "player__stage" }, [
+      el("span", { class: "sim-badge" }, ["DÉMO · lecture simulée"]),
+      title,
+      el("p", { class: "muted" }, [`${formatDuration(film.durationSeconds)} · ${film.year}`]),
+    ]);
   }
 
-  const badge = film.storageUrl
-    ? el("span", {}, [])
-    : el("span", { class: "sim-badge" }, ["DÉMO · lecture simulée"]);
-
   const node = screen("player", [
-    videoEl ?? el("div", { class: "player__stage" }, [badge, title, el("p", { class: "muted" }, [
-      `${formatDuration(film.durationSeconds)} · ${film.year}`,
-    ])]),
+    stage,
     progress,
     skip,
   ]);
