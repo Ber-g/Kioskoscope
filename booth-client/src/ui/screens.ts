@@ -295,6 +295,14 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
     videoEl = el("video", { class: "player__video", src: film.storageUrl, autoplay: true, playsinline: true });
     videoEl.addEventListener("ended", finishOnce);
     videoEl.addEventListener("error", finishOnce); // jamais bloquer sur un fichier absent/corrompu
+    // Barre de progression RÉELLE (avant : figée à 0 % pour une vraie vidéo, animée seulement en démo).
+    videoEl.addEventListener("timeupdate", () => {
+      const v = videoEl;
+      if (v && v.duration > 0) bar.style.width = `${Math.min(100, (v.currentTime / v.duration) * 100)}%`;
+    });
+    // Autoplay peut être refusé (chaîne de gestes rompue) : on avale le rejet du play() pour éviter
+    // une promesse non gérée. `error`/`ended` couvrent l'échec dur ; le repli UI reste à faire (#2).
+    void videoEl.play?.().catch(() => undefined);
   } else {
     // Lecture SIMULÉE : progression accélérée (~12 s) pour tester le parcours.
     const SIM_MS = 12000;
