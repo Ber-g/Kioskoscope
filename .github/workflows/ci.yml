@@ -1,0 +1,77 @@
+name: CI
+
+# Garde-fou du dev asynchrone (plusieurs agents en //). Sans AUCUN secret : ne teste que ce qui
+# n'exige pas d'accès Supabase → toujours vert, jamais flaky. La PREUVE d'isolation (isolation.mjs)
+# a besoin des clés + comptes de test : la lancer en local ou dans un job dédié à secrets (voir bas).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Annule les runs obsolètes d'une même branche/PR (économie de minutes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Typecheck · Build · Tests (sans secret)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Installe tous les workspaces (packages/domain résolu sur src, admin-dashboard, booth-client).
+      - name: Install
+        run: npm ci
+
+      # `build` inclut déjà `tsc --noEmit` (typecheck strict) puis `vite build` pour chaque app.
+      - name: Build admin-dashboard
+        run: npm run -w admin-dashboard build
+
+      - name: Build booth-client
+        run: npm run -w booth-client build
+
+      # Invariants F14 (anneau de focus / intentions) — test DOM-free, sans réseau.
+      - name: Test booth-client (focus_smoke)
+        run: npm run -w booth-client test
+
+      # Les scripts de test Supabase ne tournent pas ici (secrets requis) : on vérifie AU MOINS
+      # qu'ils restent syntaxiquement valides (pas de rot au fil des migrations).
+      - name: Syntax-check des scripts de test Supabase
+        run: |
+          for f in supabase/tests/*.mjs; do
+            echo "node --check $f"
+            node --check "$f"
+          done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POUR PLUS TARD — job « isolation » (preuve RLS multi-org), à activer quand les secrets sont posés
+# dans Settings → Secrets → Actions : VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, ISO_A_EMAIL,
+# ISO_A_PASSWORD, ISO_B_EMAIL, ISO_B_PASSWORD (+ ISO_DEVICE_EMAIL/PASSWORD pour la suite device).
+#
+#   isolation:
+#     runs-on: ubuntu-latest
+#     if: ${{ github.repository_owner == 'Ber-g' }}   # ne tente pas sur les forks
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-node@v4
+#         with: { node-version: 22, cache: npm }
+#       - run: npm ci
+#       - name: Preuve d'isolation RLS
+#         env:
+#           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+#           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+#           ISO_A_EMAIL: ${{ secrets.ISO_A_EMAIL }}
+#           ISO_A_PASSWORD: ${{ secrets.ISO_A_PASSWORD }}
+#           ISO_B_EMAIL: ${{ secrets.ISO_B_EMAIL }}
+#           ISO_B_PASSWORD: ${{ secrets.ISO_B_PASSWORD }}
+#           ISO_DEVICE_EMAIL: ${{ secrets.ISO_DEVICE_EMAIL }}
+#           ISO_DEVICE_PASSWORD: ${{ secrets.ISO_DEVICE_PASSWORD }}
+#         run: node supabase/tests/isolation.mjs   # Node 22+ : plus besoin de --experimental-websocket
