@@ -630,6 +630,46 @@ export class FleetStore {
     return { ok: true };
   }
 
+  // ── Actions par lot — super-admin flotte (CIN-084) ──────────────────────────
+  // Réservées au global_admin (imposé par la RLS 0011/0018, jamais par l'app). Écrivent TOUTES
+  // les lignes puis rechargent UNE fois (même patron que `sendMediaToBooths`) — évite N reloads.
+
+  /**
+   * Applique une souscription + un jeu de modules à PLUSIEURS orgs d'un coup. Un champ omis du
+   * patch préserve la valeur courante de CHAQUE org (fusion par org, comme la version unitaire).
+   */
+  async saveEntitlementsBatch(
+    orgIds: readonly string[],
+    patch: { subscriptionType?: string; enabledModules?: string[] },
+  ): Promise<{ ok: boolean; updated: number; error?: string }> {
+    if (!supabase) return { ok: false, updated: 0, error: "hors ligne" };
+    if (orgIds.length === 0) return { ok: true, updated: 0 };
+    const now = new Date().toISOString();
+    const rows = orgIds.map((orgId) => {
+      const current = this.entitlements.get(orgId);
+      return {
+        organization_id: orgId,
+        subscription_type: patch.subscriptionType ?? current?.subscriptionType ?? "demo",
+        enabled_modules: patch.enabledModules ?? current?.enabledModules ?? [],
+        updated_at: now,
+      };
+    });
+    const { error } = await supabase.from("org_entitlements").upsert(rows, { onConflict: "organization_id" });
+    if (error) return { ok: false, updated: 0, error: error.message };
+    await this.loadFromSupabase();
+    return { ok: true, updated: rows.length };
+  }
+
+  /** Réinitialise PLUSIEURS orgs au style maître (supprime leurs lignes `org_styles`). */
+  async resetOrgStylesBatch(orgIds: readonly string[]): Promise<{ ok: boolean; error?: string }> {
+    if (!supabase) return { ok: false, error: "hors ligne" };
+    if (orgIds.length === 0) return { ok: true };
+    const { error } = await supabase.from("org_styles").delete().in("organization_id", [...orgIds]);
+    if (error) return { ok: false, error: error.message };
+    await this.loadFromSupabase();
+    return { ok: true };
+  }
+
   // ── Assets de marque (F19 v2, bucket PUBLIC `org-assets`, migration 0019) ─────
   // Chemin storage : `{orgId}/{kind}.webp`. Écriture RLS = super_user de l'org ; lecture
   // publique (getPublicUrl). Le blob reçu est DÉJÀ recadré + compressé WebP côté UI. On stocke

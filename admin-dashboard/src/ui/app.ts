@@ -13,6 +13,7 @@ import { maintenancePage } from "./maintenance";
 import { rightsPage } from "./rights";
 import { sessionsPage } from "./sessions";
 import { settingsPage } from "./settings";
+import { fleetPage } from "./fleet";
 import { boothHubPage, type HubTab } from "./boothHub";
 import { mapPage, mountFleetMap } from "./mapView";
 import { t, getLang, setLang, LANGS, onLangChange } from "../i18n";
@@ -32,7 +33,7 @@ export class App {
   private editing = false;
   private filter: FilterState | null = null;
   private sort: SortState = { key: "health", dir: "asc" };
-  private view: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings" | "booth" = "overview";
+  private view: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings" | "fleet" | "booth" = "overview";
   // CIN-045 : hub de gestion d'une cabine (vue dédiée, scopée à une borne).
   private selectedBoothId: string | null = null;
   private boothTab: HubTab = "synthese";
@@ -87,7 +88,9 @@ export class App {
                 ? maintenancePage(this.store, () => this.render(), (id) => this.openDrawer(id))
                 : this.view === "settings"
                   ? settingsPage(this.store, () => this.render())
-                  : this.view === "booth" && this.selectedBoothId
+                  : this.view === "fleet"
+                    ? (this.store.isGlobalAdmin ? fleetPage(this.store, (id) => this.openBoothHub(id)) : this.overview())
+                    : this.view === "booth" && this.selectedBoothId
                     ? boothHubPage(this.store, this.selectedBoothId, () => this.setView("overview"), () => this.render(), this.boothTab, (tab) => { this.boothTab = tab; }, () => this.setView("media"))
                     : this.overview();
     this.root.replaceChildren(
@@ -105,7 +108,7 @@ export class App {
     }
   }
 
-  private setView(v: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings"): void {
+  private setView(v: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings" | "fleet"): void {
     this.view = v;
     this.render();
   }
@@ -161,6 +164,11 @@ export class App {
             navItem(t("nav.sessions"), "M8 4v16M16 4v16M4 8h16M4 16h16", this.view === "sessions", () => this.setView("sessions")),
             navItem(t("nav.maintenance"), "M12 3l1.5 3.5l3.5 1.5l-3.5 1.5l-1.5 3.5l-1.5 -3.5l-3.5 -1.5l3.5 -1.5zM6 14l.7 1.8l1.8 .7l-1.8 .7l-.7 1.8l-.7 -1.8l-1.8 -.7l1.8 -.7z", this.view === "maintenance", () => this.setView("maintenance")),
             navItem(t("nav.organization"), "M3 21h18M9 8h1M9 12h1M9 16h1M14 8h1M14 12h1M14 16h1M5 21V5a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v16", this.view === "settings", () => this.setView("settings")),
+            // Flotte (CIN-084) : pilotage plateforme multi-org — réservé au global_admin (un client
+            // ne voit jamais cette entrée). La RLS refuse en plus toute écriture non-admin (défense).
+            ...(this.store.isGlobalAdmin
+              ? [navItem(t("nav.fleet"), "M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8", this.view === "fleet", () => this.setView("fleet"))]
+              : []),
           ]),
         ]),
       ]),
