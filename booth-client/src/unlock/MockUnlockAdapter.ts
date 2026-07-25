@@ -20,6 +20,9 @@ const DEFAULT_WEIGHTS: ReadonlyArray<readonly [UnlockStatus, number]> = [
   ["abandoned", 0.05],
 ];
 
+/** Prix simulé d'une séance, en centimes (5,00 €). Le vrai montant viendra de l'adaptateur `card`. */
+const MOCK_AMOUNT_CENTS = 500;
+
 function weightedPick(): UnlockStatus {
   const r = Math.random();
   let acc = 0;
@@ -58,7 +61,12 @@ export class MockUnlockAdapter implements UnlockAdapter {
   }
 
   private result(status: UnlockStatus): UnlockResult {
-    // Le mock est gratuit : aucun montant, aucune référence fournisseur.
-    return { status, method: this.method, amount: null, paymentProviderRef: null };
+    // Un déverrouillage RÉUSSI porte un montant (en centimes) : sans lui, la séance remonte
+    // avec `amount_cents = null`, aucune transaction n'est créée et le menu Revenus reste
+    // vide — la boucle « le visiteur paie → le revenu remonte » n'était donc jamais prouvée
+    // (SPEC F9 : « Revenus fonctionne dès maintenant avec les sessions en mode mock »).
+    // Un échec ne prélève rien (cohérent avec l'écran de repli « aucun montant prélevé »).
+    if (status !== "success") return { status, method: this.method, amount: null, paymentProviderRef: null };
+    return { status, method: this.method, amount: MOCK_AMOUNT_CENTS, paymentProviderRef: `mock_${Date.now().toString(36)}` };
   }
 }
