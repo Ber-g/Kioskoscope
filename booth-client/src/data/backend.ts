@@ -183,7 +183,12 @@ export class BoothBackend {
     }
   }
 
-  /** Catalogue réel de l'org (médias actifs, scoping RLS) + sous-titres VÉRIFIÉS (F12). */
+  /**
+   * Catalogue réel de l'org (médias actifs, scoping RLS) + sous-titres VÉRIFIÉS (F12).
+   * Le bucket `media` étant PRIVÉ, les chemins storage (vidéo ET sous-titres) sont résolus ici en
+   * **URLs signées** — la borne (device) y a accès via la policy `media_read_device` (0022). Un
+   * chemin non signable (fichier absent) retombe à `null` (vidéo → lecture simulée ; sous-titre → retiré).
+   */
   async loadCatalog(): Promise<Film[]> {
     if (!supabase) return [];
     const { data, error } = await supabase.from("media").select("*").eq("active", true);
@@ -191,34 +196,61 @@ export class BoothBackend {
       console.error("[booth] chargement catalogue :", error.message);
       return [];
     }
+    const mediaRows = (data ?? []) as Array<Record<string, unknown>>;
+
     // F12 : sous-titres — UNIQUEMENT format VTT (natif navigateur, pas de conversion SRT côté borne)
     // et workflow_status = 'verified' (jamais un brouillon 'todo'/'rework' sur une borne publique).
     // Nécessite la policy device sur `subtitles` (migration 0021). Échec silencieux → catalogue sans subs.
-    const subsByMedia = new Map<string, Subtitle[]>();
     const { data: subRows, error: subErr } = await supabase
       .from("subtitles")
       .select("media_id,lang,format,url,workflow_status")
       .eq("format", "vtt")
       .eq("workflow_status", "verified");
-    if (subErr) {
-      console.warn("[booth] sous-titres non chargés :", subErr.message);
-    } else {
-      for (const r of (subRows ?? []) as Array<Record<string, unknown>>) {
-        const mid = String(r.media_id);
-        const list = subsByMedia.get(mid) ?? [];
-        list.push({
-          lang: String(r.lang),
-          format: "vtt",
-          url: String(r.url),
-          workflowStatus: "verified",
-        });
-        subsByMedia.set(mid, list);
-      }
+    if (subErr) console.warn("[booth] sous-titres non chargés :", subErr.message);
+    const subRowsArr = (subRows ?? []) as Array<Record<string, unknown>>;
+
+    // Chemins storage à signer EN LOT (vidéos + sous-titres, même bucket `media`).
+    const paths = new Set<string>();
+    for (const r of mediaRows) if (r.storage_url) paths.add(String(r.storage_url));
+    for (const r of subRowsArr) if (r.url) paths.add(String(r.url));
+    const signed = await this.signMediaPaths([...paths]);
+
+    // Sous-titres résolus (URL signée) par média ; on retire ceux non signables.
+    const subsByMedia = new Map<string, Subtitle[]>();
+    for (const r of subRowsArr) {
+      const url = signed.get(String(r.url));
+      if (!url) continue;
+      const mid = String(r.media_id);
+      const list = subsByMedia.get(mid) ?? [];
+      list.push({ lang: String(r.lang), format: "vtt", url, workflowStatus: "verified" });
+      subsByMedia.set(mid, list);
     }
-    return (data ?? []).map((r) => {
-      const row = r as Record<string, unknown>;
-      return rowToFilm(row, subsByMedia.get(String(row.id)) ?? []);
+
+    return mediaRows.map((row) => {
+      const film = rowToFilm(row, subsByMedia.get(String(row.id)) ?? []);
+      // Chemin storage privé → URL signée (ou null → lecture simulée, jamais de crash).
+      return { ...film, storageUrl: film.storageUrl ? (signed.get(film.storageUrl) ?? null) : null };
     });
+  }
+
+  /**
+   * Signe EN LOT des chemins du bucket privé `media` (vidéos + sous-titres). TTL large : le
+   * catalogue est un snapshot rafraîchi entre deux visiteurs (`refreshFromBackOffice` re-signe à
+   * chaque idle), donc jamais périmé en usage réel. Renvoie chemin → URL signée (absent = échec).
+   */
+  private async signMediaPaths(paths: readonly string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (!supabase || paths.length === 0) return out;
+    const TTL_SECONDS = 12 * 3600;
+    const { data, error } = await supabase.storage.from("media").createSignedUrls([...paths], TTL_SECONDS);
+    if (error) {
+      console.error("[booth] signature des URLs média :", error.message);
+      return out;
+    }
+    for (const r of (data ?? []) as Array<{ path: string | null; signedUrl: string | null }>) {
+      if (r.path && r.signedUrl) out.set(r.path, r.signedUrl);
+    }
+    return out;
   }
 
   /**

@@ -1,0 +1,23 @@
+WEBVTT
+
+NOTE Demo subtitles (English) — Kioskoscope media POC.
+Upload this file as the "en" track for your test film (dashboard → media preview → import .vtt).
+Timings below assume a clip of at least ~30 s; adjust to your own clip if needed.
+
+00:00:00.000 --> 00:00:04.000
+Welcome to the Kioskoscope booth.
+
+00:00:04.000 --> 00:00:08.000
+This is a demonstration subtitle track.
+
+00:00:08.000 --> 00:00:12.000
+The audience can pick a language: FR, EN, or Off.
+
+00:00:12.000 --> 00:00:18.000
+Pick "FR" to switch to French.
+
+00:00:18.000 --> 00:00:24.000
+Pick "Off" to hide subtitles.
+
+00:00:24.000 --> 00:00:30.000
+Enjoy the film.

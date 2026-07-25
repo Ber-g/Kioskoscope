@@ -1,0 +1,23 @@
+WEBVTT
+
+NOTE Sous-titres de DÉMO (français) — Kioskoscope POC média.
+Téléverse ce fichier comme piste « fr » sur ton film de test (dashboard → aperçu média → importer .vtt).
+Les temps ci-dessous supposent un film d'au moins ~30 s ; adapte-les à ton clip si besoin.
+
+00:00:00.000 --> 00:00:04.000
+Bienvenue dans la cabine Kioskoscope.
+
+00:00:04.000 --> 00:00:08.000
+Ceci est une piste de sous-titres de démonstration.
+
+00:00:08.000 --> 00:00:12.000
+Le public peut choisir sa langue : FR, EN, ou Sans.
+
+00:00:12.000 --> 00:00:18.000
+Choisissez « EN » pour basculer sur l'anglais.
+
+00:00:18.000 --> 00:00:24.000
+Choisissez « Sans » pour masquer les sous-titres.
+
+00:00:24.000 --> 00:00:30.000
+Bon visionnage.

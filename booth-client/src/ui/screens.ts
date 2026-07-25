@@ -295,7 +295,9 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
 
   if (film.storageUrl) {
     // Lecture réelle.
-    videoEl = el("video", { class: "player__video", src: film.storageUrl, autoplay: true, playsinline: true });
+    // crossorigin="anonymous" est REQUIS pour que les pistes <track> servies cross-origin (URLs
+    // signées supabase, autre domaine) se chargent ; sans lui, les sous-titres échouent en silence.
+    videoEl = el("video", { class: "player__video", src: film.storageUrl, crossorigin: "anonymous", autoplay: true, playsinline: true });
     videoEl.addEventListener("ended", finishOnce);
     videoEl.addEventListener("error", finishOnce); // jamais bloquer sur un fichier absent/corrompu
     // Barre de progression RÉELLE (avant : figée à 0 % pour une vraie vidéo, animée seulement en démo).
