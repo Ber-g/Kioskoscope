@@ -14,6 +14,8 @@ import {
   verifyOperator,
   normalizeIdentifier,
   PBKDF2_ITERATIONS,
+  fileExtension,
+  isBrowserPlayableVideo,
   type AccessEntry,
   type AccessTable,
 } from "../src/index";
@@ -102,6 +104,16 @@ async function main(): Promise<void> {
   // (l'état n'est divulgué qu'après un PIN correct) → doit répondre « invalid ».
   const revokedWrongPin = await verifyOperator(table, "PERCHOIR-CAB001-REV", "000000");
   assert(revokedWrongPin.ok === false && revokedWrongPin.reason === "invalid", "révoqué + PIN faux → invalid (anti-énumération)");
+
+  // ── Codecs vidéo lisibles navigateur (fondation CIN-022) ──
+  assert(fileExtension("demo.MP4") === "mp4", "fileExtension : minuscules");
+  assert(fileExtension("no-ext") === "", "fileExtension : absente → \"\"");
+  assert(fileExtension("a/b/clip.webm") === "webm", "fileExtension : ignore le chemin");
+  assert(isBrowserPlayableVideo("film.mp4") === true, "mp4 → lisible navigateur");
+  assert(isBrowserPlayableVideo("film.webm") === true, "webm → lisible navigateur");
+  assert(isBrowserPlayableVideo("film.mkv") === false, "mkv → à transcoder");
+  assert(isBrowserPlayableVideo("film.mov") === false, "mov → à transcoder (heuristique)");
+  assert(isBrowserPlayableVideo("film.xyz") === null, "extension inconnue → indéterminé");
 
   console.log(`\n—— ${passed}/${passed + failed} assertions OK ——`);
   if (failed > 0) {
