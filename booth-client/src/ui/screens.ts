@@ -275,8 +275,9 @@ export function recoScreen(recommended: readonly Film[], cb: RecoCallbacks): Scr
 // ── Lecture (réelle si storageUrl, sinon simulée) ────────────────────────────
 export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
   const title = el("div", { class: "player__title" }, [film.title]);
-  const bar = el("div", { class: "progress__bar" }, []);
-  const progress = el("div", { class: "progress" }, [bar]);
+  // Barre d'avancement : montée UNIQUEMENT en lecture simulée (outil de dev). Sur une VRAIE vidéo, on
+  // n'affiche pas le temps restant — c'est une séance de cinéma, pas un lecteur : on ne « spoile » pas la fin.
+  let progress: HTMLElement | undefined;
   const skip = el("button", { class: "btn btn--ghost btn--corner", type: "button" }, ["Passer (démo)"]);
 
   let disposed = false;
@@ -295,14 +296,11 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
 
   if (film.storageUrl) {
     // Lecture réelle.
-    videoEl = el("video", { class: "player__video", src: film.storageUrl, autoplay: true, playsinline: true });
+    // crossorigin="anonymous" est REQUIS pour que les pistes <track> servies cross-origin (URLs
+    // signées supabase, autre domaine) se chargent ; sans lui, les sous-titres échouent en silence.
+    videoEl = el("video", { class: "player__video", src: film.storageUrl, crossorigin: "anonymous", autoplay: true, playsinline: true });
     videoEl.addEventListener("ended", finishOnce);
     videoEl.addEventListener("error", finishOnce); // jamais bloquer sur un fichier absent/corrompu
-    // Barre de progression RÉELLE (avant : figée à 0 % pour une vraie vidéo, animée seulement en démo).
-    videoEl.addEventListener("timeupdate", () => {
-      const v = videoEl;
-      if (v && v.duration > 0) bar.style.width = `${Math.min(100, (v.currentTime / v.duration) * 100)}%`;
-    });
 
     // F12 — sous-titres : pistes VTT (déjà « vérifiées » côté backend). La SÉLECTION DE LANGUE revient
     // au PUBLIC (visiteur) : la borne n'ayant pas de contrôles natifs, on rend nos propres chips de
@@ -349,8 +347,11 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
 
     stage = el("div", { class: "player__videostage" }, [videoEl, overlay]);
   } else {
-    // Lecture SIMULÉE : progression accélérée (~12 s) pour tester le parcours.
+    // Lecture SIMULÉE : progression accélérée (~12 s) pour tester le parcours. La barre n'existe QUE
+    // dans ce mode (repère de dev) — jamais sur une vraie vidéo.
     const SIM_MS = 12000;
+    const bar = el("div", { class: "progress__bar" }, []);
+    progress = el("div", { class: "progress" }, [bar]);
     const started = performance.now();
     intervalId = window.setInterval(() => {
       const ratio = Math.min(1, (performance.now() - started) / SIM_MS);
@@ -384,7 +385,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
   const node = screen("player", [
     stage,
     ...(subtitleControls ? [subtitleControls] : []),
-    progress,
+    ...(progress ? [progress] : []),
     skip,
     volume,
   ]);
