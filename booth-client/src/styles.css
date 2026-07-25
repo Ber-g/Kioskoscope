@@ -136,6 +136,24 @@ h2 {
 /* ── Image d'attente d'org (F19 v2) ──────────────────────────────────────────
    Image plein cadre en fond de l'écran d'accueil + voile sombre pour garder titre/bouton
    lisibles quelle que soit l'image (contraste jamais laissé au hasard). */
+/* Lueur interne de l'écran d'attente : les bords s'assombrissent (vignette) et une chaleur
+   ambre affleure, comme la lumière qui déborde d'une fenêtre de projection. Purement optique,
+   posé en surcouche → n'intercepte jamais le toucher et ne dépend pas du fond choisi par l'org. */
+.screen--idle {
+  position: relative;
+  isolation: isolate;
+}
+
+.screen--idle::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 clamp(80px, 14vw, 200px) rgba(6, 6, 8, 0.7),
+    inset 0 0 clamp(28px, 5vw, 64px) rgba(232, 180, 90, 0.09);
+}
+
 .screen--idle.has-idle-image {
   background-image: linear-gradient(rgba(6, 6, 8, 0.55), rgba(6, 6, 8, 0.72)), var(--idle-image);
   background-size: cover;
@@ -156,10 +174,26 @@ h2 {
 }
 
 /* Logo d'org (F19) : remplace le titre typographique. Contraint pour ne pas dominer l'écran. */
+/* Logo d'org : traité comme une image PROJETÉE, pas collée. On ne maîtrise pas ce que le
+   client téléverse (carré, fond incrusté, bords durs) — alors on fond les bords dans le fond,
+   quel qu'il soit (couleur d'org ou image d'attente). Même geste que la vignette de la page
+   web : des dégradés qui laissent le fond reprendre la main sur les bords.
+   L'arrondi ne sert que si le logo a un fond opaque ; sur un PNG détouré il ne se voit pas. */
 .brand__logo {
   max-width: min(70vw, 520px);
   max-height: 28vh;
   object-fit: contain;
+  border-radius: clamp(8px, 1.2vw, 16px);
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0, #000 16%, #000 84%, transparent 100%),
+    linear-gradient(to bottom, transparent 0, #000 16%, #000 84%, transparent 100%),
+    radial-gradient(ellipse at center, #000 48%, transparent 96%);
+  mask-image:
+    linear-gradient(to right, transparent 0, #000 16%, #000 84%, transparent 100%),
+    linear-gradient(to bottom, transparent 0, #000 16%, #000 84%, transparent 100%),
+    radial-gradient(ellipse at center, #000 48%, transparent 96%);
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
 }
 
 /* Mention non supprimable sur marque d'org — discrète, jamais en avant. */
@@ -340,9 +374,14 @@ h2 {
 }
 
 /* ── Lecteur ──────────────────────────────────────────────────────────────── */
+/* Pendant la projection, l'entourage est TOUJOURS noir — jamais la couleur de l'org. Une teinte
+   autour de l'image fausse la perception des couleurs du film et casse l'immersion ; les salles
+   sont masquées de noir mat pour cette raison. La marque s'exprime avant et après, pas pendant. */
 .screen--player {
   justify-content: center;
   gap: 2rem;
+  background: #000;
+  background-image: none;
 }
 
 .player__video {
