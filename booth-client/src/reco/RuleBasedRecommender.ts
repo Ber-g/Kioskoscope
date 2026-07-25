@@ -12,14 +12,23 @@ export class RuleBasedRecommender implements Recommender {
   recommend(catalog: readonly Film[], context: RecoContext): readonly Film[] {
     const seen = new Set(context.alreadyPlayed.map((p) => p.filmId));
     const { mood, maxDurationSeconds } = context.query;
+    const active = catalog.filter((f) => f.active);
+    const rank = (films: readonly Film[]): readonly Film[] =>
+      films
+        .map((film) => ({ film, score: this.score(film, mood, maxDurationSeconds) }))
+        .sort((a, b) => b.score - a.score)
+        .map((s) => s.film);
 
-    const scored = catalog
-      .filter((f) => f.active && !seen.has(f.id))
-      .filter((f) => maxDurationSeconds === null || f.durationSeconds <= maxDurationSeconds)
-      .map((film) => ({ film, score: this.score(film, mood, maxDurationSeconds) }))
-      .sort((a, b) => b.score - a.score);
-
-    return scored.map((s) => s.film);
+    // Repli en CASCADE : un visiteur qui a PAYÉ ne doit jamais aboutir à une liste vide tant que le
+    // catalogue contient des films. La durée reste une PRÉFÉRENCE (score), pas un filtre bloquant.
+    const unseen = active.filter((f) => !seen.has(f.id));
+    // 1. Idéal : non vus qui tiennent dans la durée demandée.
+    const fit = unseen.filter((f) => maxDurationSeconds === null || f.durationSeconds <= maxDurationSeconds);
+    if (fit.length > 0) return rank(fit);
+    // 2. Repli : non vus, toutes durées (les plus courts remontent via le score).
+    if (unseen.length > 0) return rank(unseen);
+    // 3. Repli ultime : tout le catalogue actif (le visiteur a déjà tout vu mais a re-payé une séance).
+    return rank(active);
   }
 
   private score(film: Film, mood: string | null, maxDurationSeconds: number | null): number {
