@@ -84,6 +84,22 @@ export interface SessionRow {
   readonly films: ReadonlyArray<{ title: string; source: string; completed: boolean }>;
 }
 
+/**
+ * UNE LECTURE de film (ligne de `plays`), enrichie du contexte de sa séance (CIN-099).
+ *
+ * C'est l'unité comptable du produit : « ce film a été lu N fois ». Volontairement INDÉPENDANTE
+ * de toute notion de revenu — une séance gratuite (forfait, festival, location) produit des
+ * lectures qu'il faut compter pour les rapports aux ayants droit, même quand elle rapporte 0 €.
+ */
+export interface FilmPlayRow {
+  readonly mediaId: string;
+  readonly title: string;
+  readonly boothLabel: string;
+  readonly at: number;
+  readonly completed: boolean;
+  readonly source: string;
+}
+
 /** Version logicielle déployable (Phase 4 / F10). */
 export interface Release {
   readonly id: string;
@@ -326,10 +342,27 @@ export class FleetStore {
   }
 
   private async loadFromSupabase(): Promise<void> {
-    const { data: userRes } = await supabase!.auth.getUser();
+    // `getUser()` est un appel RÉSEAU. Il échoue sur une coupure, un timeout ou un 5xx — et
+    // renvoie alors `user: undefined`, exactement comme une absence de session.
+    //
+    // BUG-010 : cette méthode est rejouée après CHAQUE écriture, y compris à la fin d'un
+    // téléversement de film (plusieurs centaines de Mo, connexion saturée, plusieurs minutes).
+    // Un seul échec transitoire suffisait alors à faire `authed = false` → écran de connexion,
+    // avec le média pourtant bien envoyé. On ne confond donc plus « pas de session » et
+    // « impossible de vérifier » : seule la première déconnecte.
+    const { data: userRes, error: userErr } = await supabase!.auth.getUser();
     const uid = userRes.user?.id;
     if (!uid) {
+      // `getSession()` lit le jeton stocké localement (et ne tente un rafraîchissement qu'en cas
+      // d'expiration). Une session encore présente ⇒ l'échec vient du réseau, pas des droits :
+      // on garde l'utilisateur en place et on laisse les données actuelles à l'écran.
+      const { data: sessionRes } = await supabase!.auth.getSession();
+      if (sessionRes.session) {
+        console.error("loadFromSupabase : vérification d'identité indisponible, session conservée —", userErr?.message ?? "raison inconnue");
+        return; // ne touche NI à `authed`, NI à `identity`, NI aux caches
+      }
       this.authed = false;
+      this.identity = null; // sans ça, l'identité périmée survivait à la déconnexion
       this.emit();
       return;
     }
@@ -1175,6 +1208,50 @@ export class FleetStore {
       amountCents: s.amount_cents ?? null,
       films: (bySession.get(s.id) ?? []).sort((a, b) => a.position - b.position).map(({ title, source, completed }) => ({ title, source, completed })),
     }));
+  }
+
+  /**
+   * Toutes les lectures de films, à plat (CIN-099). Sert la comptabilisation PAR FILM :
+   * l'agrégation (par titre, par jour) est faite côté UI, qui décide de la maille affichée.
+   *
+   * Même source que `sessionsList()` mais orientée film plutôt que séance — d'où une méthode
+   * distincte : joindre les deux forcerait l'appelant à re-déplier des tableaux imbriqués.
+   * Les lignes sont scopées par la RLS (une org ne voit que ses propres lectures).
+   */
+  async filmPlaysList(): Promise<FilmPlayRow[]> {
+    if (this.mode !== "supabase") return [];
+    const { data: sess } = await supabase!
+      .from("sessions")
+      .select("id,booth_id,started_at")
+      .order("started_at", { ascending: false })
+      .limit(1000);
+    const { data: playsData } = await supabase!.from("plays").select("session_id,media_id,completed,source");
+    const boothLabel = new Map(this.booths.map((b) => [b.id, b.label]));
+    const mediaTitle = new Map(this.media.map((m) => [m.id, m.title]));
+    const sessionCtx = new Map(
+      ((sess ?? []) as Array<{ id: string; booth_id: string; started_at: string }>).map((s) => [
+        s.id,
+        { boothLabel: boothLabel.get(s.booth_id) ?? "—", at: new Date(s.started_at).getTime() },
+      ]),
+    );
+    const rows: FilmPlayRow[] = [];
+    for (const p of (playsData ?? []) as Array<{ session_id: string; media_id: string; completed: boolean; source: string }>) {
+      const ctx = sessionCtx.get(p.session_id);
+      // Lecture dont la séance est hors fenêtre (au-delà des 1000 dernières) : on l'ignore
+      // plutôt que de l'horodater à 1970, ce qui fausserait le graphe.
+      if (!ctx) continue;
+      rows.push({
+        mediaId: p.media_id,
+        // Un média supprimé laisse ses lectures derrière lui : on garde la ligne (le compte
+        // reste juste) avec un titre explicite plutôt que de la faire disparaître.
+        title: mediaTitle.get(p.media_id) ?? "Média supprimé",
+        boothLabel: ctx.boothLabel,
+        at: ctx.at,
+        completed: p.completed,
+        source: p.source,
+      });
+    }
+    return rows.sort((a, b) => b.at - a.at);
   }
 
   // ── Mises à jour & résilience (Phase 4 / F10) ────────────────────────────────

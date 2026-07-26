@@ -1,281 +1,195 @@
-import { Modal } from "bootstrap";
-import type { Booth, HealthStatus } from "../domain/types";
+import type { Booth } from "../domain/types";
 import type { FleetStore } from "../data/store";
-import { el, icon } from "./dom";
-import { boothLabelEl } from "./components";
+import { el, icon, relativeTime } from "./dom";
+import { connectionBadge, healthBadge, heartbeatBadge, sortBooths, type SortKey, type SortState } from "./components";
 import { allHealthStatuses, healthMeta } from "../domain/status";
-import { MODULES, SUBSCRIPTION_TYPES } from "../domain/modules";
+import { t } from "../i18n";
 
-// Vue « Flotte » (CIN-084) — pilotage PLATEFORME, réservé au global_admin. Roster
-// par ORGANISATION (filtrable) + actions par lot : souscription/modules et
-// réinitialisation au style maître. Les cabines restent cliquables → hub (cohérence
-// nav @design). Toutes les écritures sont imposées global_admin-only par la RLS.
-
-type StyleFilter = "all" | "master" | "custom";
+// Vue « Flotte » (CIN-091 c) — LE PARC DE MACHINES. Commune à TOUS les comptes, contenu scopé :
+// un opérateur ne voit que les bornes de son organisation, le global_admin voit tout et filtre.
+//
+// ⚠️ Ne pas confondre avec `organizations.ts` (ex-« Flotte »), qui liste des CLIENTS. Ici : du
+// matériel. Cette page répond à « où est la machine X, va-t-elle bien, sur quelle version » —
+// un inventaire, pas un tableau de bord.
+//
+// Division du travail assumée avec la Vue d'ensemble (@design) : l'Overview donne l'état du parc
+// EN UN COUP D'ŒIL (tuiles KPI, répartition, carte) ; la Flotte sert à TROUVER une machine
+// précise et agir dessus (recherche, filtres, numéro de série, tri). Deux gestes différents —
+// c'est pourquoi on ne réplique ici ni les KPI ni la carte. Le chiffre d'affaires reste hors de
+// cet inventaire : il vit dans Revenus, qui peut être masqué (CIN-099).
+//
+// Le scoping N'EST PAS une garantie de sécurité : `visibleBooths()` s'appuie sur la RLS
+// (mode supabase) — l'UI ne fait que présenter ce que la base a déjà autorisé.
 
 interface FleetState {
   search: string;
-  subscription: string; // "all" | clé de souscription
-  style: StyleFilter;
-  selected: Set<string>;
-}
-
-/** Libellé lisible d'une souscription (repli = la clé brute). */
-function subscriptionLabel(key: string | undefined): string {
-  return SUBSCRIPTION_TYPES.find((s) => s.key === key)?.label ?? key ?? "—";
-}
-
-/** Résumé compact de l'état des cabines d'une org : un pastille colorée + compte par statut. */
-function statusSummary(booths: readonly Booth[]): HTMLElement {
-  if (booths.length === 0) return el("span", { class: "text-secondary small" }, ["Aucune cabine"]);
-  const counts = new Map<HealthStatus, number>();
-  for (const b of booths) counts.set(b.health, (counts.get(b.health) ?? 0) + 1);
-  const chips = allHealthStatuses()
-    .filter((s) => (counts.get(s) ?? 0) > 0)
-    .map((s) => {
-      const m = healthMeta(s);
-      return el("span", { class: `badge bg-${m.color}-lt d-inline-flex align-items-center gap-1`, title: m.label }, [
-        icon(m.iconPath, 14),
-        el("span", {}, [String(counts.get(s) ?? 0)]),
-      ]);
-    });
-  return el("span", { class: "d-inline-flex flex-wrap gap-1" }, chips);
-}
-
-/** Badge modules accordés : « Tous » si pas d'entitlement (défaut ouvert), sinon les libellés. */
-function modulesCell(store: FleetStore, orgId: string): HTMLElement {
-  const ent = store.entitlementFor(orgId);
-  if (!ent) return el("span", { class: "badge bg-green-lt" }, ["Tous"]);
-  if (ent.enabledModules.length === 0) return el("span", { class: "badge bg-secondary-lt" }, ["Aucun"]);
-  const labels = ent.enabledModules.map((k) => MODULES.find((m) => m.key === k)?.label ?? k);
-  return el("span", { class: "d-inline-flex flex-wrap gap-1" }, labels.map((l) => el("span", { class: "badge bg-blue-lt" }, [l])));
+  orgId: string; // "all" | id d'organisation
+  health: string; // "all" | statut de santé
+  sort: SortState;
 }
 
 export function fleetPage(store: FleetStore, onOpenBooth: (id: string) => void): HTMLElement {
-  // Garde-fou de défense en profondeur : la vue n'existe que pour le global_admin (la nav la cache
-  // déjà, la RLS refuse déjà les écritures — c'est la 3ᵉ ligne, jamais la seule).
-  if (!store.isGlobalAdmin) {
-    return el("div", { class: "alert alert-danger" }, ["Réservé à l'administration plateforme."]);
-  }
-
-  const orgs = store.organizations();
   const booths = store.visibleBooths();
-  const boothsByOrg = new Map<string, Booth[]>();
-  for (const b of booths) {
-    const list = boothsByOrg.get(b.organizationId) ?? [];
-    list.push(b);
-    boothsByOrg.set(b.organizationId, list);
-  }
+  const orgs = store.organizations();
+  const orgName = (id: string): string => orgs.find((o) => o.id === id)?.name ?? "—";
 
-  const state: FleetState = { search: "", subscription: "all", style: "all", selected: new Set() };
+  // La colonne « Organisation » n'apparaît que si le compte voit effectivement plusieurs orgs :
+  // pour un client mono-org, c'est une colonne constante, donc du bruit (cf. sélecteur d'org du
+  // formulaire média, même principe — on n'affiche pas un choix qui n'en est pas un).
+  const spannedOrgs = new Set(booths.map((b) => b.organizationId));
+  const showOrgColumn = spannedOrgs.size > 1;
+
+  const state: FleetState = { search: "", orgId: "all", health: "all", sort: { key: "health", dir: "asc" } };
   const container = el("div", {}, []);
 
-  const isCustom = (orgId: string): boolean => store.orgStyleFor(orgId) !== null;
-
-  const filtered = (): typeof orgs => {
+  const filtered = (): Booth[] => {
     const q = state.search.trim().toLowerCase();
-    return orgs.filter((o) => {
-      if (q && !o.name.toLowerCase().includes(q)) return false;
-      if (state.subscription !== "all" && (store.entitlementFor(o.id)?.subscriptionType ?? "demo") !== state.subscription) return false;
-      if (state.style === "master" && isCustom(o.id)) return false;
-      if (state.style === "custom" && !isCustom(o.id)) return false;
-      return true;
+    const list = booths.filter((b) => {
+      if (state.orgId !== "all" && b.organizationId !== state.orgId) return false;
+      if (state.health !== "all" && b.health !== state.health) return false;
+      if (!q) return true;
+      // Recherche sur ce qu'on a sous les yeux quand on cherche une machine : son nom, où elle
+      // est posée, et le numéro inscrit dessus.
+      return (
+        b.label.toLowerCase().includes(q) ||
+        b.location.toLowerCase().includes(q) ||
+        (b.serial ?? "").toLowerCase().includes(q)
+      );
     });
+    return sortBooths(list, state.sort);
   };
 
   const render = (): HTMLElement => {
     const list = filtered();
-    // La sélection ne porte que sur les orgs visibles (filtrées).
-    const visibleIds = new Set(list.map((o) => o.id));
-    for (const id of [...state.selected]) if (!visibleIds.has(id)) state.selected.delete(id);
 
-    // ── Barre de filtres ──────────────────────────────────────────────────────
-    const search = el("input", { class: "form-control", type: "search", placeholder: "Rechercher une organisation…", value: state.search }) as HTMLInputElement;
+    // ── Filtres ───────────────────────────────────────────────────────────────
+    const search = el("input", { class: "form-control", type: "search", placeholder: "Nom, lieu ou n° de série…", value: state.search }) as HTMLInputElement;
     search.addEventListener("input", () => {
       state.search = search.value;
       container.replaceChildren(render());
-      // Rendre le focus après re-render (la saisie recrée l'input).
+      // Le re-render recrée l'input : on lui rend le focus et le curseur en fin de saisie,
+      // sinon on ne peut pas taper deux caractères d'affilée.
       const next = container.querySelector<HTMLInputElement>('input[type="search"]');
-      if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+      if (next) {
+        next.focus();
+        next.setSelectionRange(next.value.length, next.value.length);
+      }
     });
 
-    const subSelect = el("select", { class: "form-select w-auto" }, [
-      el("option", { value: "all" }, ["Toutes souscriptions"]),
-      ...SUBSCRIPTION_TYPES.map((s) => el("option", { value: s.key }, [s.label])),
+    const orgSelect = el("select", { class: "form-select w-auto" }, [
+      el("option", { value: "all" }, ["Toutes organisations"]),
+      ...orgs.filter((o) => spannedOrgs.has(o.id)).map((o) => el("option", { value: o.id }, [o.name])),
     ]) as HTMLSelectElement;
-    subSelect.value = state.subscription;
-    subSelect.addEventListener("change", () => { state.subscription = subSelect.value; container.replaceChildren(render()); });
-
-    const styleSelect = el("select", { class: "form-select w-auto" }, [
-      el("option", { value: "all" }, ["Tous styles"]),
-      el("option", { value: "master" }, ["Style maître"]),
-      el("option", { value: "custom" }, ["Personnalisé"]),
-    ]) as HTMLSelectElement;
-    styleSelect.value = state.style;
-    styleSelect.addEventListener("change", () => { state.style = styleSelect.value as StyleFilter; container.replaceChildren(render()); });
-
-    const toolbar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center mb-3" }, [
-      el("div", { class: "flex-grow-1", style: "min-width:220px" }, [search]),
-      subSelect,
-      styleSelect,
-    ]);
-
-    // ── Barre d'actions par lot (si sélection) ────────────────────────────────
-    const selectedOrgs = list.filter((o) => state.selected.has(o.id));
-    const batchBar =
-      selectedOrgs.length === 0
-        ? el("span", {}, [])
-        : (() => {
-            const subBtn = el("button", { class: "btn btn-primary", type: "button" }, [icon("M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", 18), "Souscription & modules"]);
-            subBtn.addEventListener("click", () => openSubscriptionModal(store, selectedOrgs.map((o) => o.id), selectedOrgs.map((o) => o.name)));
-            const resetBtn = el("button", { class: "btn btn-outline-danger", type: "button" }, [icon("M20 11a8.1 8.1 0 0 0 -15.5 -2M4 5v4h4M4 13a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4", 18), "Réinitialiser au style maître"]);
-            resetBtn.addEventListener("click", () => runReset(store, selectedOrgs.map((o) => o.id), selectedOrgs.map((o) => o.name)));
-            const clear = el("button", { class: "btn btn-link", type: "button" }, ["Tout désélectionner"]);
-            clear.addEventListener("click", () => { state.selected.clear(); container.replaceChildren(render()); });
-            return el("div", { class: "card bg-primary-lt mb-3" }, [
-              el("div", { class: "card-body d-flex flex-wrap align-items-center gap-2 py-2" }, [
-                el("strong", {}, [`${selectedOrgs.length} organisation${selectedOrgs.length > 1 ? "s" : ""} sélectionnée${selectedOrgs.length > 1 ? "s" : ""}`]),
-                el("div", { class: "ms-auto d-flex flex-wrap gap-2" }, [subBtn, resetBtn, clear]),
-              ]),
-            ]);
-          })();
-
-    // ── Tableau roster ────────────────────────────────────────────────────────
-    const selectAll = el("input", { class: "form-check-input m-0", type: "checkbox", "aria-label": "Tout sélectionner" }) as HTMLInputElement;
-    selectAll.checked = list.length > 0 && list.every((o) => state.selected.has(o.id));
-    selectAll.addEventListener("change", () => {
-      if (selectAll.checked) for (const o of list) state.selected.add(o.id);
-      else for (const o of list) state.selected.delete(o.id);
+    orgSelect.value = state.orgId;
+    orgSelect.addEventListener("change", () => {
+      state.orgId = orgSelect.value;
       container.replaceChildren(render());
     });
 
-    const rows = list.map((o) => {
-      const orgBooths = boothsByOrg.get(o.id) ?? [];
-      const check = el("input", { class: "form-check-input m-0", type: "checkbox", "aria-label": `Sélectionner ${o.name}` }) as HTMLInputElement;
-      check.checked = state.selected.has(o.id);
-      check.addEventListener("change", () => {
-        if (check.checked) state.selected.add(o.id);
-        else state.selected.delete(o.id);
+    const healthSelect = el("select", { class: "form-select w-auto" }, [
+      el("option", { value: "all" }, ["Tous les états"]),
+      ...allHealthStatuses().map((s) => el("option", { value: s }, [healthMeta(s).label])),
+    ]) as HTMLSelectElement;
+    healthSelect.value = state.health;
+    healthSelect.addEventListener("change", () => {
+      state.health = healthSelect.value;
+      container.replaceChildren(render());
+    });
+
+    const toolbar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center mb-3" }, [
+      el("div", { class: "flex-grow-1", style: "min-width:220px" }, [search]),
+      ...(showOrgColumn ? [orgSelect] : []),
+      healthSelect,
+    ]);
+
+    // ── Tableau inventaire ────────────────────────────────────────────────────
+    const header = (key: SortKey, label: string): HTMLElement => {
+      const active = state.sort.key === key;
+      const arrow = active ? (state.sort.dir === "asc" ? " ↑" : " ↓") : "";
+      const th = el("th", { class: `cursor-pointer user-select-none ${active ? "text-primary" : ""}` }, [`${label}${arrow}`]);
+      th.addEventListener("click", () => {
+        state.sort = state.sort.key === key ? { key, dir: state.sort.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" };
         container.replaceChildren(render());
       });
-      const boothChips = orgBooths.length
-        ? el("div", { class: "d-inline-flex flex-wrap gap-2" }, orgBooths.map((b) => boothLabelEl(b.label, () => onOpenBooth(b.id))))
-        : el("span", { class: "text-secondary small" }, ["—"]);
-      const styleBadge = isCustom(o.id)
-        ? el("span", { class: "badge bg-azure-lt" }, ["Personnalisé"])
-        : el("span", { class: "badge bg-secondary-lt" }, ["Maître"]);
-      return el("tr", {}, [
-        el("td", {}, [check]),
+      return th;
+    };
+
+    const rows = list.map((b) => {
+      const tr = el("tr", { class: "cursor-pointer" }, [
         el("td", {}, [
-          el("div", { class: "fw-bold" }, [o.name]),
-          el("div", { class: "text-secondary small" }, [o.type]),
+          el("div", { class: "fw-bold" }, [b.label]),
+          el("div", { class: "text-secondary small" }, [b.location]),
         ]),
-        el("td", {}, [el("span", { class: "badge bg-purple-lt" }, [subscriptionLabel(store.entitlementFor(o.id)?.subscriptionType)])]),
-        el("td", {}, [modulesCell(store, o.id)]),
-        el("td", {}, [styleBadge]),
+        ...(showOrgColumn ? [el("td", { class: "text-secondary" }, [orgName(b.organizationId)])] : []),
         el("td", {}, [
-          el("div", { class: "d-flex flex-column gap-1" }, [statusSummary(orgBooths), boothChips]),
+          b.serial
+            ? el("span", { class: "font-monospace small" }, [b.serial])
+            : el("span", { class: "text-secondary small fst-italic" }, ["non renseigné"]),
+        ]),
+        el("td", {}, [healthBadge(b.health)]),
+        el("td", {}, [connectionBadge(b)]),
+        el("td", { class: "text-secondary" }, [b.softwareVersion]),
+        el("td", {}, [
+          el("div", { class: "d-flex align-items-center gap-2" }, [
+            heartbeatBadge(b.lastHeartbeatAt),
+            el("span", { class: "text-secondary small" }, [relativeTime(b.lastHeartbeatAt)]),
+          ]),
         ]),
       ]);
+      tr.addEventListener("click", () => onOpenBooth(b.id));
+      return tr;
     });
+
+    // Deux vides très différents : « aucune machine » (le compte n'a pas de parc) et « aucun
+    // résultat » (les filtres sont trop stricts). Les confondre laisserait croire à une perte
+    // de données — le second propose donc de relâcher les filtres.
+    const emptyMessage =
+      booths.length === 0
+        ? "Aucune borne rattachée à votre organisation pour l'instant."
+        : "Aucune borne ne correspond à ces filtres.";
 
     const table =
       list.length === 0
-        ? el("div", { class: "card-body text-secondary text-center py-5" }, ["Aucune organisation ne correspond aux filtres."])
+        ? el("div", { class: "card-body text-secondary text-center py-5" }, [emptyMessage])
         : el("div", { class: "table-responsive" }, [
-            el("table", { class: "table table-vcenter card-table" }, [
+            el("table", { class: "table table-vcenter card-table table-hover" }, [
               el("thead", {}, [
                 el("tr", {}, [
-                  el("th", { class: "w-1" }, [selectAll]),
-                  el("th", {}, ["Organisation"]),
-                  el("th", {}, ["Souscription"]),
-                  el("th", {}, ["Modules"]),
-                  el("th", {}, ["Style"]),
-                  el("th", {}, ["Cabines"]),
+                  header("label", t("table.booth")),
+                  ...(showOrgColumn ? [el("th", {}, ["Organisation"])] : []),
+                  el("th", {}, ["N° de série"]),
+                  header("health", t("table.health")),
+                  header("connection", t("table.connection")),
+                  header("version", t("table.version")),
+                  header("heartbeat", t("table.seen")),
                 ]),
               ]),
               el("tbody", {}, rows),
             ]),
           ]);
 
+    const counter =
+      list.length === booths.length
+        ? `${booths.length} borne${booths.length > 1 ? "s" : ""}`
+        : `${list.length} borne${list.length > 1 ? "s" : ""} sur ${booths.length}`;
+
     return el("div", {}, [
       el("div", { class: "mb-3" }, [
-        el("h2", { class: "page-title m-0" }, ["Flotte"]),
-        el("div", { class: "text-secondary" }, [`Pilotage multi-organisations (super-admin) · ${orgs.length} organisation${orgs.length > 1 ? "s" : ""}, ${booths.length} cabine${booths.length > 1 ? "s" : ""}.`]),
+        el("h2", { class: "page-title m-0 d-flex align-items-center gap-2" }, [
+          icon("M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8", 22),
+          "Flotte",
+        ]),
+        el("div", { class: "text-secondary" }, [
+          store.isGlobalAdmin
+            ? `Parc complet, toutes organisations · ${counter}.`
+            : `Les bornes de votre organisation · ${counter}.`,
+        ]),
       ]),
       toolbar,
-      batchBar,
       el("div", { class: "card" }, [table]),
     ]);
   };
 
   container.replaceChildren(render());
   return container;
-}
-
-// ── Action par lot : souscription & modules (modal) ──────────────────────────
-function openSubscriptionModal(store: FleetStore, orgIds: readonly string[], orgNames: readonly string[]): void {
-  const subSelect = el("select", { class: "form-select" }, SUBSCRIPTION_TYPES.map((s) => el("option", { value: s.key }, [s.label]))) as HTMLSelectElement;
-  subSelect.value = SUBSCRIPTION_TYPES[0]?.key ?? "demo";
-
-  // Une case par module (toutes cochées par défaut = tout accordé).
-  const moduleChecks = MODULES.map((m) => {
-    const input = el("input", { class: "form-check-input", type: "checkbox" }) as HTMLInputElement;
-    input.checked = true;
-    const label = el("label", { class: "form-check" }, [input, el("span", { class: "form-check-label" }, [m.label])]);
-    return { key: m.key, input, label };
-  });
-
-  const error = el("div", { class: "alert alert-danger d-none" }, []);
-  const result = el("div", { class: "d-none" }, []);
-  const apply = el("button", { class: "btn btn-primary ms-auto", type: "button" }, [`Appliquer à ${orgIds.length} organisation${orgIds.length > 1 ? "s" : ""}`]);
-
-  apply.addEventListener("click", () => {
-    error.classList.add("d-none");
-    apply.setAttribute("disabled", "true");
-    const enabledModules = moduleChecks.filter((c) => c.input.checked).map((c) => c.key);
-    void store.saveEntitlementsBatch(orgIds, { subscriptionType: subSelect.value, enabledModules }).then((res) => {
-      apply.removeAttribute("disabled");
-      if (!res.ok) {
-        error.textContent = res.error ?? "Échec de l'application.";
-        error.classList.remove("d-none");
-        return;
-      }
-      result.replaceChildren(el("div", { class: "alert alert-success mb-0" }, [`✓ ${res.updated} organisation${res.updated > 1 ? "s" : ""} mise${res.updated > 1 ? "s" : ""} à jour.`]));
-      result.classList.remove("d-none");
-      apply.classList.add("d-none");
-    });
-  });
-
-  const modalEl = el("div", { class: "modal modal-blur fade", tabindex: "-1" }, [
-    el("div", { class: "modal-dialog modal-dialog-centered" }, [
-      el("div", { class: "modal-content" }, [
-        el("div", { class: "modal-header" }, [el("h3", { class: "modal-title" }, ["Souscription & modules"]), el("button", { class: "btn-close", type: "button", "data-bs-dismiss": "modal" }, [])]),
-        el("div", { class: "modal-body" }, [
-          error,
-          el("p", { class: "text-secondary" }, [`Ces réglages REMPLACENT la souscription et les modules de : ${orgNames.join(", ")}.`]),
-          el("div", { class: "mb-3" }, [el("label", { class: "form-label" }, ["Souscription"]), subSelect]),
-          el("div", { class: "mb-2" }, [el("label", { class: "form-label" }, ["Modules accordés"]), ...moduleChecks.map((c) => c.label)]),
-          result,
-        ]),
-        el("div", { class: "modal-footer" }, [el("button", { class: "btn", type: "button", "data-bs-dismiss": "modal" }, ["Fermer"]), apply]),
-      ]),
-    ]),
-  ]);
-  document.body.append(modalEl);
-  const modal = new Modal(modalEl);
-  modalEl.addEventListener("hidden.bs.modal", () => modalEl.remove(), { once: true });
-  modal.show();
-}
-
-// ── Action par lot : réinitialiser au style maître (destructive) ─────────────
-function runReset(store: FleetStore, orgIds: readonly string[], orgNames: readonly string[]): void {
-  const n = orgIds.length;
-  if (!confirm(`Réinitialiser ${n} organisation${n > 1 ? "s" : ""} au style maître Kioskoscope ?\n\n${orgNames.join(", ")}\n\nLeurs couleurs, fontes, titres et logos personnalisés seront supprimés — leurs cabines reviendront au visuel par défaut. Action irréversible.`)) return;
-  void store.resetOrgStylesBatch(orgIds).then((res) => {
-    // Le store a déjà rechargé + réémis (la page s'est reconstruite, badges → « Maître »).
-    // On confirme donc via une alerte, indépendante du DOM détaché.
-    if (!res.ok) alert("Échec de la réinitialisation : " + (res.error ?? "erreur inconnue"));
-    else alert(`${n} organisation${n > 1 ? "s" : ""} réinitialisée${n > 1 ? "s" : ""} au style maître.`);
-  });
 }

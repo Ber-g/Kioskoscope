@@ -516,3 +516,98 @@ export async function verifyOperator(
   }
   return { ok: true, role: entry.role, identifier: entry.identifier };
 }
+
+// ── Codecs vidéo lisibles navigateur — fondation CIN-022 ─────────────────────
+// La borne lit les médias avec l'élément <video> natif : seuls certains conteneurs sont garantis
+// lisibles (H.264/AAC en .mp4, VP8/9 en .webm). Ce helper PUR (heuristique par extension, sans lire
+// l'entête) sert de garde-fou à l'UPLOAD (dashboard : avertir avant qu'un fichier illisible n'arrive
+// sur une borne) et de filtre côté borne. Un vrai probe de codec (MediaSource.isTypeSupported /
+// entête conteneur) viendra plus tard ; ceci pose la base commune, testable, sans réseau ni DOM.
+
+// ⚠️ LIMITE ASSUMÉE : une extension décrit un CONTENEUR, pas un codec. Un `.mp4` peut porter du
+// H.265/HEVC que Chrome ne décode pas ; un `.mov` porte le plus souvent du H.264 parfaitement
+// lisible. L'heuristique répond donc « ce conteneur est-il le bon ? », jamais « ça va se lire ».
+// Conséquence de conception : on ne BLOQUE jamais un upload sur cette base — on avertit.
+
+/** Conteneurs dont le contenu est, en pratique, lisible par l'élément <video> (H.264/AAC, VP8/9). */
+export const BROWSER_PLAYABLE_VIDEO_EXTENSIONS: readonly string[] = ["mp4", "m4v", "webm"];
+
+/**
+ * Conteneurs dont la lisibilité DÉPEND du codec embarqué — ni rassurer, ni alarmer.
+ * `.mov` (QuickTime) est le cas typique : massivement utilisé en production vidéo, il contient
+ * presque toujours du H.264 qui se lit. Le classer « à transcoder » produirait un faux positif
+ * sur un format courant — et un avertissement qui se trompe souvent est un avertissement qu'on
+ * apprend à ignorer.
+ */
+export const AMBIGUOUS_VIDEO_EXTENSIONS: readonly string[] = ["mov", "3gp"];
+
+/**
+ * Conteneurs à transcoder : non lisibles nativement par les navigateurs actuels.
+ * `ogv` (Ogg/Theora) figure ici depuis que Chrome 123 (2024) a retiré Theora — Safari ne l'a
+ * jamais supporté. Le laisser en « lisible » rassurerait à tort.
+ */
+export const NON_PLAYABLE_VIDEO_EXTENSIONS: readonly string[] = ["mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "ogv"];
+
+/** Extension (sans point, en minuscules) d'un nom de fichier, ou "" si absente. Ignore le chemin. */
+export function fileExtension(filename: string): string {
+  const base = filename.split(/[/\\]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+/**
+ * Une vidéo est-elle probablement lisible par le navigateur (heuristique par EXTENSION) ?
+ * `true` = conteneur attendu ; `false` = à transcoder ; `null` = indéterminé (extension inconnue
+ * ou conteneur ambigu → ne pas bloquer, mais ne pas rassurer non plus).
+ */
+export function isBrowserPlayableVideo(filename: string): boolean | null {
+  const ext = fileExtension(filename);
+  if (ext === "") return null;
+  if (BROWSER_PLAYABLE_VIDEO_EXTENSIONS.includes(ext)) return true;
+  if (NON_PLAYABLE_VIDEO_EXTENSIONS.includes(ext)) return false;
+  return null; // ambigu ou inconnu
+}
+
+/** Verdict de lisibilité, destiné à l'affichage. */
+export type VideoPlayability = "playable" | "transcode" | "unknown";
+
+export interface VideoPlayabilityHint {
+  readonly verdict: VideoPlayability;
+  readonly extension: string;
+  /** Message prêt à afficher (FR), formulé pour un opérateur — jamais un jargon de codec. */
+  readonly message: string;
+}
+
+/**
+ * Verdict + message pour l'UI. SOURCE UNIQUE du texte affiché : le dashboard (garde-fou d'upload)
+ * et la borne (filtre de catalogue) doivent dire exactement la même chose d'un même fichier, sinon
+ * l'opérateur reçoit deux diagnostics contradictoires pour un seul problème.
+ */
+export function videoPlayabilityHint(filename: string): VideoPlayabilityHint {
+  const extension = fileExtension(filename);
+  if (extension === "") {
+    return { verdict: "unknown", extension, message: "Fichier sans extension : impossible de vérifier qu'il sera lisible sur une borne." };
+  }
+  if (BROWSER_PLAYABLE_VIDEO_EXTENSIONS.includes(extension)) {
+    return { verdict: "playable", extension, message: `Format .${extension} — lisible sur les bornes.` };
+  }
+  if (NON_PLAYABLE_VIDEO_EXTENSIONS.includes(extension)) {
+    return {
+      verdict: "transcode",
+      extension,
+      message: `Le format .${extension} ne se lit pas sur les bornes. Convertissez le fichier en .mp4 (H.264) ou .webm avant de l'envoyer, sinon le film restera noir en cabine.`,
+    };
+  }
+  if (AMBIGUOUS_VIDEO_EXTENSIONS.includes(extension)) {
+    return {
+      verdict: "unknown",
+      extension,
+      message: `Le format .${extension} se lit selon ce qu'il contient. Vérifiez le film dans l'aperçu avant de l'envoyer sur une borne ; en cas de doute, convertissez-le en .mp4 (H.264).`,
+    };
+  }
+  return {
+    verdict: "unknown",
+    extension,
+    message: `Format .${extension} inhabituel : vérifiez le film dans l'aperçu avant de l'envoyer sur une borne.`,
+  };
+}

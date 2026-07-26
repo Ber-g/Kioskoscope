@@ -11,12 +11,33 @@
 import { contrastRatio, parseHexColor, readableInk } from "@kioskoscope/domain";
 import type { OrgStyle, OrgStyleAssets, OrgStyleFonts, OrgStylePalette } from "@kioskoscope/domain";
 import type { FleetStore, OrgAssetKind, OrgSummary } from "../data/store";
-import { el, icon } from "./dom";
+import { el, icon, toast } from "./dom";
 
 /** Brouillons éditables (mutables, cordes) alignés sur la forme figée du domaine. */
 type PaletteDraft = { -readonly [K in keyof OrgStylePalette]?: string };
 type FontsDraft = { -readonly [K in keyof OrgStyleFonts]?: string };
 type AssetsDraft = { -readonly [K in keyof OrgStyleAssets]?: string };
+
+/**
+ * Brouillon d'édition NON ENREGISTRÉ, conservé hors du cycle de rendu (BUG-006).
+ *
+ * Pourquoi : téléverser un asset écrit en base → `loadFromSupabase()` → `emit()` → l'App se
+ * re-rend entièrement et reconstruit cet éditeur. Tant que les couleurs/fontes/titre en cours
+ * de saisie vivaient dans la closure de `editor()`, ce re-render les effaçait — l'opérateur
+ * perdait ses modifs sans le moindre avertissement. L'upload n'était que le déclencheur le plus
+ * visible : n'IMPORTE quel `emit()` du store (autre onglet, action concurrente) avait le même
+ * effet. Le brouillon survit donc au re-render, et n'est purgé qu'une fois la vérité écrite en
+ * base (enregistrement ou réinitialisation réussis) — après quoi on re-seede depuis le store.
+ *
+ * Clé = id d'organisation : changer d'org n'hérite jamais du brouillon d'une autre.
+ * Les `assets`, eux, sont persistés dès l'upload → ils viennent toujours du store, pas d'ici.
+ */
+interface StyleDraft {
+  readonly palette: PaletteDraft;
+  readonly fonts: FontsDraft;
+  title: string;
+}
+const DRAFTS = new Map<string, StyleDraft>();
 
 // Valeurs du style MAÎTRE Kioskoscope (miroir des tokens cabine, thème sombre). Servent de
 // repli pour l'aperçu et de placeholder « héritée » des champs. Une modification du maître
@@ -183,10 +204,17 @@ function upsellCard(): HTMLElement {
 
 function editor(store: FleetStore, org: OrgSummary, canManage: boolean, rebuild: () => void): HTMLElement {
   const existing = store.orgStyleFor(org.id);
-  const palette: PaletteDraft = { ...(existing?.palette ?? {}) };
-  const fonts: FontsDraft = { ...(existing?.fonts ?? {}) };
+  // Reprend le brouillon en cours s'il existe (re-render provoqué par le store — BUG-006),
+  // sinon repart de la vérité en base. Voir `DRAFTS`.
+  const draft: StyleDraft = DRAFTS.get(org.id) ?? {
+    palette: { ...(existing?.palette ?? {}) },
+    fonts: { ...(existing?.fonts ?? {}) },
+    title: existing?.title ?? "",
+  };
+  DRAFTS.set(org.id, draft);
+  const { palette, fonts } = draft;
+  // Les assets sont écrits en base dès l'upload → la source de vérité est le store.
   const assets: AssetsDraft = { ...(existing?.assets ?? {}) };
-  let title = existing?.title ?? "";
   const dis = canManage ? {} : { disabled: "true" };
 
   const effColor = (k: keyof OrgStylePalette): string => (palette[k] || MASTER_PALETTE[k]);
@@ -208,7 +236,7 @@ function editor(store: FleetStore, org: OrgSummary, canManage: boolean, rebuild:
     pvScreen.style.background = effColor("bg");
     pvTitle.style.color = effColor("textEmphasis");
     pvTitle.style.fontFamily = effFont("display");
-    pvTitle.textContent = title.trim() || MASTER_TITLE;
+    pvTitle.textContent = draft.title.trim() || MASTER_TITLE;
     pvSubtitle.style.color = effColor("text");
     pvSubtitle.style.fontFamily = effFont("body");
     pvCard.style.background = effColor("surface");
@@ -400,9 +428,9 @@ function editor(store: FleetStore, org: OrgSummary, canManage: boolean, rebuild:
   };
 
   // ── Titre ───────────────────────────────────────────────────────────────────
-  const titleInput = el("input", { type: "text", class: "form-control", value: title, placeholder: `${MASTER_TITLE} (maître)`, maxlength: "60", autocomplete: "off", ...dis }) as HTMLInputElement;
+  const titleInput = el("input", { type: "text", class: "form-control", value: draft.title, placeholder: `${MASTER_TITLE} (maître)`, maxlength: "60", autocomplete: "off", ...dis }) as HTMLInputElement;
   titleInput.addEventListener("input", () => {
-    title = titleInput.value;
+    draft.title = titleInput.value;
     update();
   });
 
@@ -413,12 +441,15 @@ function editor(store: FleetStore, org: OrgSummary, canManage: boolean, rebuild:
     status.className = "small text-secondary";
     status.textContent = "Enregistrement…";
     save.setAttribute("disabled", "true");
-    void store.upsertOrgStyle(org.id, buildStyle(palette, fonts, title)).then((res) => {
+    void store.upsertOrgStyle(org.id, buildStyle(palette, fonts, draft.title)).then((res) => {
       if (!canManage) return;
       save.removeAttribute("disabled");
       if (res.ok) {
-        status.className = "small text-green";
-        status.textContent = "Enregistré ✓";
+        // Le brouillon a rejoint la base : on le purge pour que l'éditeur reparte de la vérité
+        // du store. `upsertOrgStyle` réémet → cet arbre DOM est détaché juste après, d'où le
+        // toast (ancré sur body) plutôt qu'un message posé dans le formulaire.
+        DRAFTS.delete(org.id);
+        toast("Style enregistré ✓");
       } else {
         status.className = "small text-danger";
         status.textContent = res.error ?? "Échec de l'enregistrement.";
@@ -432,8 +463,13 @@ function editor(store: FleetStore, org: OrgSummary, canManage: boolean, rebuild:
     status.className = "small text-secondary";
     status.textContent = "Réinitialisation…";
     void store.resetOrgStyle(org.id).then((res) => {
-      if (res.ok) rebuild(); // re-seed depuis le store (désormais vide) → champs vidés, aperçu maître
-      else {
+      if (res.ok) {
+        // Purge AVANT le rebuild : sinon le brouillon en mémoire ré-appliquerait aussitôt les
+        // valeurs que l'opérateur vient justement de demander à effacer.
+        DRAFTS.delete(org.id);
+        rebuild(); // re-seed depuis le store (désormais vide) → champs vidés, aperçu maître
+        toast("Style réinitialisé au maître Kioskoscope ✓");
+      } else {
         status.className = "small text-danger";
         status.textContent = res.error ?? "Échec de la réinitialisation.";
       }

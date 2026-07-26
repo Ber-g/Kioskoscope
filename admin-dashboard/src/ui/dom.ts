@@ -38,6 +38,34 @@ export function icon(path: string, size = 24): SVGElement {
   return svg;
 }
 
+/**
+ * Confirmation brève, ancrée sur `document.body` — donc SURVIVANTE au re-render de l'App.
+ *
+ * Les écritures du store rechargent puis réémettent (`emit()`), ce qui reconstruit la page :
+ * un message de succès posé dans le formulaire est détaché avant d'avoir été lu (l'opérateur
+ * ne sait plus si son enregistrement a abouti — cf. BUG-006). Le toast vit hors de cet arbre.
+ * Non bloquant, contrairement à `alert()` : il n'interrompt pas le geste suivant.
+ *
+ * `aria-live="polite"` + `role="status"` : annoncé par le lecteur d'écran sans voler le focus.
+ */
+export function toast(message: string, kind: "success" | "error" = "success"): void {
+  const bg = kind === "success" ? "var(--tblr-green)" : "var(--tblr-red)";
+  const node = el("div", {
+    role: "status",
+    "aria-live": "polite",
+    style:
+      `position:fixed;right:1rem;bottom:1rem;z-index:1090;max-width:min(24rem,calc(100vw - 2rem));` +
+      `padding:.6rem .9rem;border-radius:.5rem;color:#fff;background:${bg};` +
+      `box-shadow:0 .5rem 1.5rem rgba(0,0,0,.25);font-size:.875rem;opacity:0;transition:opacity .15s`,
+  }, [message]);
+  document.body.append(node);
+  requestAnimationFrame(() => { node.style.opacity = "1"; });
+  window.setTimeout(() => {
+    node.style.opacity = "0";
+    window.setTimeout(() => node.remove(), 200);
+  }, kind === "error" ? 6000 : 3000);
+}
+
 export function formatMoney(cents: number, currency = "EUR"): string {
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency }).format(cents / 100);
 }

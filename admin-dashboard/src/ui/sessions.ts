@@ -2,6 +2,7 @@ import type { FleetStore, SessionRow } from "../data/store";
 import { el, formatMoney, icon } from "./dom";
 import { t } from "../i18n";
 import { boothLabelEl } from "./components";
+import { filmPlaysView } from "./filmPlays";
 
 // Menu Sessions (F9, 2e tranche) : liste des séances (Kiosk, date, méthode de
 // déverrouillage, films joués, montant) + quelques KPI. Données réelles : `sessions`
@@ -30,7 +31,35 @@ function kpiTile(label: string, value: string, hue: string, iconPath: string): H
 
 export function sessionsPage(store: FleetStore, onOpenBooth?: (id: string) => void): HTMLElement {
   const container = el("div", {}, [el("div", { class: "text-secondary p-3" }, ["Chargement des séances…"])]);
-  void store.sessionsList().then((rows) => container.replaceChildren(render(store, rows, onOpenBooth)));
+  // Deux lectures du MÊME fait (une cabine a joué des films), selon la question posée :
+  // « qu'est-ce qui s'est passé ce soir-là ? » (séances) ou « combien de fois ce film
+  // a-t-il tourné ? » (par film — CIN-099). Charger les deux jeux en parallèle évite un
+  // temps d'attente à la bascule.
+  void Promise.all([store.sessionsList(), store.filmPlaysList()]).then(([rows, plays]) => {
+    let mode: "sessions" | "films" = "sessions";
+    const paint = (): void => {
+      const seg = (label: string, m: typeof mode): HTMLElement => {
+        const b = el("button", { class: `btn ${mode === m ? "btn-primary" : ""}`, type: "button" }, [label]);
+        b.addEventListener("click", () => {
+          mode = m;
+          paint();
+        });
+        return b;
+      };
+      const toggle = el("div", { class: "btn-group mb-3", role: "group" }, [seg("Séances", "sessions"), seg("Par film", "films")]);
+      container.replaceChildren(
+        el("div", { class: "mb-1" }, [
+          el("h2", { class: "page-title m-0" }, [t("page.sessions")]),
+          el("div", { class: "text-secondary" }, [
+            "Séances et films joués, remontés par les Kiosks. Ces compteurs sont indépendants des revenus : une séance gratuite (location, festival, forfait) est comptée ici même si elle ne génère aucune transaction.",
+          ]),
+        ]),
+        toggle,
+        mode === "sessions" ? render(store, rows, onOpenBooth) : filmPlaysView(plays),
+      );
+    };
+    paint();
+  });
   return container;
 }
 
@@ -70,11 +99,8 @@ function render(store: FleetStore, rows: readonly SessionRow[], onOpenBooth?: (i
     ]);
   });
 
+  // Le titre et le chapô sont posés par `sessionsPage` (communs aux deux modes).
   return el("div", {}, [
-    el("div", { class: "mb-3" }, [
-      el("h2", { class: "page-title m-0" }, [t("page.sessions")]),
-      el("div", { class: "text-secondary" }, ["Séances et films joués, remontés par les Kiosks. Ces compteurs sont indépendants des revenus : une séance gratuite (location, festival, forfait) est comptée ici même si elle ne génère aucune transaction."]),
-    ]),
     el("div", { class: "row row-cards g-2 mb-3" }, [
       kpiTile("Séances", String(rows.length), "purple", "M8 4v16M16 4v16M4 8h16M4 16h16"),
       kpiTile("Films / séance", avgFilms, "azure", "M4 5h16v14H4zM4 9h16M10 13l3 2l-3 2z"),

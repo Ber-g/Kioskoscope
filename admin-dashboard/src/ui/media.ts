@@ -1,9 +1,10 @@
 import { Modal } from "bootstrap";
-import { CANONICAL_MOODS } from "@kioskoscope/domain";
+import { CANONICAL_MOODS, videoPlayabilityHint } from "@kioskoscope/domain";
 import type { Media } from "../domain/types";
 import type { FleetStore } from "../data/store";
 import { sha256Hex } from "../data/hash";
 import { openPreview } from "./preview";
+import { subtitleTracksPanel } from "./subtitles";
 import { el } from "./dom";
 import { t } from "../i18n";
 
@@ -227,7 +228,10 @@ function statsPanel(store: FleetStore): HTMLElement {
 }
 
 function rowActions(store: FleetStore, m: Media, onChanged: () => void): HTMLElement {
-  const preview = el("button", { class: "btn btn-sm", type: "button" }, ["Aperçu"]);
+  // « Validation » et non « Aperçu » (CIN-094) : l'écran n'est pas une prévisualisation de
+  // confort, c'est la porte par laquelle un opérateur approuve un média avant qu'il ne parte en
+  // cabine. Le nom dit l'engagement pris, pas le média regardé.
+  const preview = el("button", { class: "btn btn-sm", type: "button" }, ["Validation"]);
   preview.addEventListener("click", () => openPreview(store, m, onChanged));
   const edit = el("button", { class: "btn btn-sm ms-1", type: "button" }, ["Modifier"]);
   edit.addEventListener("click", () => openMediaForm(store, m, onChanged));
@@ -377,17 +381,43 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
   const drmScheme = el("input", { class: "form-control", type: "text", value: base.drmScheme ?? "", placeholder: "widevine, playready… (si DRM)" }) as HTMLInputElement;
   const synopsis = el("textarea", { class: "form-control", rows: "2" }, [base.synopsis]) as HTMLTextAreaElement;
 
+  // Le sélecteur d'organisation n'a de sens que s'il y a VRAIMENT un choix à faire : un
+  // global_admin n'a pas d'org active (`activeOrganizationId: null`) et doit donc désigner la
+  // destination du média. Un opérateur mono-org, lui, est déjà DANS son organisation : lui
+  // présenter une liste à une seule entrée transforme un contexte acquis en décision à prendre
+  // (retour de session de test, 2026-07-26). L'élément reste construit — `orgSelect.value` alimente
+  // l'enregistrement — mais il n'est monté dans le formulaire que s'il arbitre quelque chose.
   const orgSelect = el(
     "select",
     { class: "form-select" },
     orgs.map((o) => el("option", { value: o.id, ...(o.id === base.organizationId ? { selected: "selected" } : {}) }, [o.name])),
   ) as HTMLSelectElement;
+  const needsOrgChoice = orgs.length > 1;
 
   const fileInput = el("input", { class: "form-control", type: "file", accept: "video/*" }) as HTMLInputElement;
   const hashInfo = el("div", { class: "form-hint" }, [isNew ? "Choisissez un fichier : son empreinte SHA-256 est calculée pour détecter les doublons." : "Empreinte existante conservée."]);
+  // Garde-fou codec (CIN-022) : on avertit DÈS la sélection du fichier, avant tout téléversement —
+  // découvrir en cabine qu'un film reste noir coûte infiniment plus cher qu'un avertissement ici.
+  // Volontairement NON bloquant : l'heuristique porte sur le conteneur, pas sur le codec réel
+  // (cf. `videoPlayabilityHint`), donc elle n'a pas autorité pour refuser un fichier.
+  const codecInfo = el("div", { class: "mt-1" }, []);
+  const showCodecHint = (name: string): void => {
+    const hint = videoPlayabilityHint(name);
+    if (hint.verdict === "playable") {
+      codecInfo.className = "form-hint mt-1 text-green";
+      codecInfo.textContent = hint.message;
+      return;
+    }
+    codecInfo.className = hint.verdict === "transcode" ? "alert alert-warning py-2 mt-1 mb-0" : "form-hint mt-1 text-yellow";
+    codecInfo.textContent = hint.message;
+  };
   fileInput.addEventListener("change", () => {
     file = fileInput.files?.[0] ?? null;
-    if (!file) return;
+    if (!file) {
+      codecInfo.replaceChildren();
+      return;
+    }
+    showCodecHint(file.name);
     hashInfo.textContent = "Calcul de l'empreinte…";
     void sha256Hex(file).then((h) => {
       computedHash = h;
@@ -402,8 +432,8 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
   const body = el("div", {}, [
     error,
     el("div", { class: "row" }, [
-      field("Organisation", orgSelect),
-      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo])),
+      ...(needsOrgChoice ? [field("Organisation", orgSelect)] : []),
+      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo, codecInfo])),
       field("Titre", title),
       field("Réalisateur", director),
       field("Année", year),
@@ -421,6 +451,15 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
       field("Tags éditoriaux", tags),
       field("TMDB id", tmdbId),
     ]),
+    el("div", { class: "hr-text" }, ["Sous-titres"]),
+    // CIN-094 : les pistes se gèrent ici (métadonnée du média), plus seulement dans l'écran de
+    // validation. Un média non encore enregistré n'a ni ligne en base ni empreinte figée : la
+    // clé étrangère et le chemin de stockage n'existent pas, on ne peut donc rien y rattacher.
+    isNew
+      ? el("div", { class: "text-secondary small fst-italic" }, [
+          "Enregistrez d'abord le média : les pistes de sous-titres se rattachent à une fiche existante.",
+        ])
+      : subtitleTracksPanel(store, base, onChanged),
   ]);
 
   const modalEl = el("div", { class: "modal modal-blur fade", tabindex: "-1" }, [

@@ -14,6 +14,9 @@ import {
   verifyOperator,
   normalizeIdentifier,
   PBKDF2_ITERATIONS,
+  fileExtension,
+  isBrowserPlayableVideo,
+  videoPlayabilityHint,
   type AccessEntry,
   type AccessTable,
 } from "../src/index";
@@ -102,6 +105,26 @@ async function main(): Promise<void> {
   // (l'état n'est divulgué qu'après un PIN correct) → doit répondre « invalid ».
   const revokedWrongPin = await verifyOperator(table, "PERCHOIR-CAB001-REV", "000000");
   assert(revokedWrongPin.ok === false && revokedWrongPin.reason === "invalid", "révoqué + PIN faux → invalid (anti-énumération)");
+
+  // ── Codecs vidéo lisibles navigateur (fondation CIN-022) ──
+  assert(fileExtension("demo.MP4") === "mp4", "fileExtension : minuscules");
+  assert(fileExtension("no-ext") === "", "fileExtension : absente → \"\"");
+  assert(fileExtension("a/b/clip.webm") === "webm", "fileExtension : ignore le chemin");
+  assert(isBrowserPlayableVideo("film.mp4") === true, "mp4 → lisible navigateur");
+  assert(isBrowserPlayableVideo("film.webm") === true, "webm → lisible navigateur");
+  assert(isBrowserPlayableVideo("film.mkv") === false, "mkv → à transcoder");
+  assert(isBrowserPlayableVideo("film.xyz") === null, "extension inconnue → indéterminé");
+  // `.mov` contient presque toujours du H.264 lisible : le déclarer « à transcoder » produisait un
+  // faux positif sur un format de production courant → indéterminé (on vérifie, on n'alarme pas).
+  assert(isBrowserPlayableVideo("film.mov") === null, "mov → indéterminé (dépend du codec embarqué)");
+  // Theora retiré de Chrome 123 (2024), jamais supporté par Safari → ne plus rassurer.
+  assert(isBrowserPlayableVideo("film.ogv") === false, "ogv → à transcoder (Theora abandonné)");
+  assert(videoPlayabilityHint("film.mp4").verdict === "playable", "hint : mp4 → playable");
+  assert(videoPlayabilityHint("film.mkv").verdict === "transcode", "hint : mkv → transcode");
+  assert(videoPlayabilityHint("film.mov").verdict === "unknown", "hint : mov → unknown");
+  assert(videoPlayabilityHint("sans-extension").verdict === "unknown", "hint : sans extension → unknown");
+  assert(videoPlayabilityHint("film.mkv").message.includes("mp4"), "hint : le message dit QUOI faire (convertir en mp4)");
+  assert(videoPlayabilityHint("FILM.MKV").extension === "mkv", "hint : extension normalisée en minuscules");
 
   console.log(`\n—— ${passed}/${passed + failed} assertions OK ——`);
   if (failed > 0) {
