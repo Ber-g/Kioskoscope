@@ -283,6 +283,33 @@ async function runTenantSuite(name, client, ownOrg, otherOrg) {
     }
   }
 
+  // 13. Versions vidéo par langue (CIN-095, migration 0027). Une version porte un CHEMIN DE
+  //     STOCKAGE : une fuite ici ne divulgue pas seulement des métadonnées, elle donne l'adresse
+  //     du fichier d'un autre exploitant. À traiter au même rang que `media`.
+  {
+    const { data, error } = await client.from("media_videos").select("organization_id, storage_url");
+    if (error && /does not exist|relation|schema cache/i.test(error.message)) {
+      assert(true, `media_videos : table absente (migration 0027 non appliquée) → bloc ignoré`);
+    } else {
+      assert(!error, `media_videos lisible sans erreur (${error?.message ?? "ok"})`);
+      const leak = (data ?? []).filter((r) => r.organization_id !== ownOrg);
+      assert(leak.length === 0, `media_videos : aucune fuite cross-org (${leak.length} fuite(s))`);
+
+      const probe = await client.from("media_videos").select("storage_url").eq("organization_id", otherOrg);
+      assert((probe.data ?? []).length === 0, `sonde media_videos where org=adverse → 0 chemin de stockage exposé`);
+
+      // Écriture dans l'org adverse : refusée (rattacher une version à un média qu'on ne possède
+      // pas reviendrait à faire diffuser SON fichier sur les cabines d'un autre exploitant).
+      const { data: ins, error: insErr } = await client
+        .from("media_videos")
+        .insert({ organization_id: otherOrg, media_id: "00000000-0000-0000-0000-0000000000ff", lang: "xx", storage_url: "iso/intrus" })
+        .select();
+      const intruded = (ins ?? []).length;
+      assert(insErr != null || intruded === 0, `INSERT media_videos dans l'org adverse → refusé (${insErr ? "erreur RLS/FK" : intruded + " inséré(s)"})`);
+      if (intruded > 0) await client.from("media_videos").delete().eq("storage_url", "iso/intrus");
+    }
+  }
+
   // 12. Ouvertures de page de partage (F21 / CIN-106, migration 0026).
   //
   //     Enjeu particulier : ces compteurs alimentent des statistiques destinées à des AYANTS
