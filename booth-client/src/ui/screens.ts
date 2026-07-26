@@ -1,4 +1,4 @@
-import type { Film, Play } from "../domain/types";
+import type { Film, Play, PlayEndReason } from "../domain/types";
 import type { UnlockStatus } from "../unlock/UnlockAdapter";
 import { getBrand, isCustomBrand } from "../domain/brand";
 import { createCountdown, el, formatDuration, renderQrDataUrl } from "./dom";
@@ -273,20 +273,34 @@ export function recoScreen(recommended: readonly Film[], cb: RecoCallbacks): Scr
 }
 
 // ── Lecture (réelle si storageUrl, sinon simulée) ────────────────────────────
-export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
+/**
+ * `onProgress` (F21 / CIN-105) : progression d'écoute, en secondes de film.
+ *
+ * ⚠️ N'est appelé QUE sur une lecture RÉELLE. La lecture simulée (aucun fichier) défile en ~12 s
+ * et ne prouve rien : la remonter produirait des durées vues fabriquées. Ces chiffres servant de
+ * base déclarative auprès d'ayants droit, un zéro honnête vaut mieux qu'un chiffre inventé.
+ */
+export function playerScreen(
+  film: Film,
+  onFinished: (reason: PlayEndReason) => void,
+  onProgress?: (positionSeconds: number, durationSeconds: number) => void,
+): ScreenResult {
   const title = el("div", { class: "player__title" }, [film.title]);
   // Barre d'avancement : montée UNIQUEMENT en lecture simulée (outil de dev). Sur une VRAIE vidéo, on
   // n'affiche pas le temps restant — c'est une séance de cinéma, pas un lecteur : on ne « spoile » pas la fin.
   let progress: HTMLElement | undefined;
   const skip = el("button", { class: "btn btn--ghost btn--corner", type: "button" }, ["Passer (démo)"]);
 
+  // Le lecteur SAIT pourquoi il s'arrête ; c'est lui qui doit le dire, plutôt que de laisser
+  // l'appelant le deviner à partir d'un pourcentage. Un film qui va au bout, un film qu'on passe
+  // et un fichier illisible sont trois faits différents — et un seul est un achèvement.
   let disposed = false;
-  const finishOnce = () => {
+  const finishOnce = (reason: PlayEndReason) => {
     if (disposed) return;
     disposed = true;
-    onFinished();
+    onFinished(reason);
   };
-  skip.addEventListener("click", finishOnce);
+  skip.addEventListener("click", () => finishOnce("skipped"));
 
   let intervalId: number | undefined;
   let videoEl: HTMLVideoElement | undefined;
@@ -299,8 +313,17 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
     // crossorigin="anonymous" est REQUIS pour que les pistes <track> servies cross-origin (URLs
     // signées supabase, autre domaine) se chargent ; sans lui, les sous-titres échouent en silence.
     videoEl = el("video", { class: "player__video", src: film.storageUrl, crossorigin: "anonymous", autoplay: true, playsinline: true });
-    videoEl.addEventListener("ended", finishOnce);
-    videoEl.addEventListener("error", finishOnce); // jamais bloquer sur un fichier absent/corrompu
+    videoEl.addEventListener("ended", () => finishOnce("ended"));
+    videoEl.addEventListener("error", () => finishOnce("error")); // jamais bloquer sur un fichier absent/corrompu
+    if (onProgress) {
+      // `timeupdate` est émis ~4 fois/s par le navigateur : suffisant pour les déciles, et sans
+      // minuterie à nous. On préfère la durée du fichier à celle de la fiche : c'est ce qui a
+      // réellement été lu. Repli sur la fiche tant que les métadonnées ne sont pas chargées.
+      videoEl.addEventListener("timeupdate", () => {
+        const duration = Number.isFinite(videoEl!.duration) && videoEl!.duration > 0 ? videoEl!.duration : film.durationSeconds;
+        onProgress(videoEl!.currentTime, duration);
+      });
+    }
 
     // F12 — sous-titres : pistes VTT (déjà « vérifiées » côté backend). La SÉLECTION DE LANGUE revient
     // au PUBLIC (visiteur) : la borne n'ayant pas de contrôles natifs, on rend nos propres chips de
@@ -356,7 +379,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
     intervalId = window.setInterval(() => {
       const ratio = Math.min(1, (performance.now() - started) / SIM_MS);
       bar.style.width = `${ratio * 100}%`;
-      if (ratio >= 1) finishOnce();
+      if (ratio >= 1) finishOnce("ended");
     }, 100);
     stage = el("div", { class: "player__stage" }, [
       el("span", { class: "sim-badge" }, ["DÉMO · lecture simulée"]),
@@ -395,7 +418,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
   // délégués à l'anneau (le bouton « Passer »).
   // Anneau F14 : les chips de langue (si présentes) + « Passer » sont navigables/validables au clavier
   // ou aux boutons physiques — la sélection de langue reste donc pilotable sans écran tactile.
-  const ring = new FocusRing({ items: [...subtitleChips, skip], onBack: finishOnce });
+  const ring = new FocusRing({ items: [...subtitleChips, skip], onBack: () => finishOnce("skipped") });
   const handler: IntentHandler = {
     handle(intent: Intent): void {
       switch (intent) {
@@ -406,7 +429,7 @@ export function playerScreen(film: Film, onFinished: () => void): ScreenResult {
           }
           break;
         case "stop":
-          finishOnce();
+          finishOnce("skipped");
           break;
         case "volumeUp":
           adjustVolume(0.1);
