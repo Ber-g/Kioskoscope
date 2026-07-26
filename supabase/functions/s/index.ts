@@ -191,6 +191,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const rows = (data ?? []) as RecapRow[];
   if (rows.length === 0) return notFound(wantJson);
 
+  // Comptage des ouvertures de la page de partage (F21 / CIN-106). Journalisé APRÈS avoir établi
+  // que le token existe — un token inconnu ne doit rien créer, sinon on offrirait un compteur
+  // d'énumération. ⚠️ ZÉRO donnée personnelle : ni IP, ni user-agent, ni cookie ; on n'enregistre
+  // que « telle séance a vu sa page ouverte à tel instant ».
+  //
+  // Volontairement NON attendu (`void`) et jamais bloquant : une statistique ne doit pas pouvoir
+  // empêcher un visiteur de voir sa page. Un échec se journalise et s'oublie.
+  void admin
+    .rpc("record_share_open", { p_token: token })
+    .then(({ error: openErr }: { error: { message: string } | null }) => {
+      if (openErr) console.error("[share] record_share_open", openErr.message);
+    });
+
   if (wantJson) {
     return new Response(jsonDoc(rows), {
       headers: { ...SECURITY_HEADERS, ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" },

@@ -17,6 +17,9 @@ import {
   fileExtension,
   isBrowserPlayableVideo,
   videoPlayabilityHint,
+  watchRatio,
+  emptyDeciles,
+  PLAY_DECILES,
   type AccessEntry,
   type AccessTable,
 } from "../src/index";
@@ -125,6 +128,18 @@ async function main(): Promise<void> {
   assert(videoPlayabilityHint("sans-extension").verdict === "unknown", "hint : sans extension → unknown");
   assert(videoPlayabilityHint("film.mkv").message.includes("mp4"), "hint : le message dit QUOI faire (convertir en mp4)");
   assert(videoPlayabilityHint("FILM.MKV").extension === "mkv", "hint : extension normalisée en minuscules");
+
+  // ── Taux d'écoute (F21 / CIN-105) ──
+  // Ce ratio part dans des rapports d'ayants droit : il ne doit jamais dépasser 100 %, ni être
+  // calculé sur une durée absente (un pourcentage faux est pire que pas de pourcentage).
+  assert(watchRatio(50, 100) === 0.5, "watchRatio : 50/100 → 0.5");
+  assert(watchRatio(100, 100) === 1, "watchRatio : lecture complète → 1");
+  assert(watchRatio(150, 100) === 1, "watchRatio : borné à 1 (jamais > 100 %)");
+  assert(watchRatio(10, 0) === null, "watchRatio : durée nulle → null (on n'invente pas)");
+  assert(watchRatio(10, Number.NaN) === null, "watchRatio : durée non finie → null");
+  assert(watchRatio(-1, 100) === null, "watchRatio : durée vue négative → null");
+  assert(emptyDeciles().length === PLAY_DECILES, "emptyDeciles : longueur = PLAY_DECILES");
+  assert(emptyDeciles().every((d) => d === false), "emptyDeciles : tout à false");
 
   console.log(`\n—— ${passed}/${passed + failed} assertions OK ——`);
   if (failed > 0) {

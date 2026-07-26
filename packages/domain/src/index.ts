@@ -259,6 +259,16 @@ export interface Session {
   readonly paymentProviderRef: string | null;
 }
 
+/** Nombre de tranches de la courbe de rétention. Doit rester aligné sur la contrainte SQL (0026). */
+export const PLAY_DECILES = 10;
+
+/**
+ * Pourquoi une lecture s'est arrêtée. Seul `ended` vaut achèvement.
+ * Distinguer les trois cas est ce qui empêche un taux d'achèvement flatteur mais faux : un
+ * fichier illisible ou un film passé ne sont pas des séances vues.
+ */
+export type PlayEndReason = "ended" | "skipped" | "error";
+
 export interface Play {
   readonly id: string;
   readonly sessionId: string;
@@ -267,6 +277,31 @@ export interface Play {
   readonly startedAt: number;
   completed: boolean;
   readonly source: PlaySource;
+  // ── Mesure d'écoute (F21 / CIN-105) ────────────────────────────────────────
+  // Renseignées pendant la lecture, envoyées avec le snapshot de fin de séance (donc couvertes
+  // par le buffer hors-ligne). Ces chiffres servent de base déclarative auprès d'ayants droit :
+  // ils doivent refléter ce qui a été VU, jamais ce qui a été chargé.
+  endedAt: number | null;
+  /** Secondes RÉELLEMENT vues (hors pause, hors avance). Jamais > durée du film. */
+  watchedSeconds: number;
+  /** `deciles[i]` = le spectateur a atteint la tranche i du film. Longueur = PLAY_DECILES. */
+  decilesReached: boolean[];
+}
+
+/** Déciles vierges — toujours passer par ce constructeur pour garantir la longueur attendue. */
+export function emptyDeciles(): boolean[] {
+  return new Array<boolean>(PLAY_DECILES).fill(false);
+}
+
+/**
+ * Taux d'écoute d'une lecture, borné à [0,1]. `null` si la durée du film est inconnue ou nulle —
+ * on préfère ne RIEN afficher qu'un pourcentage calculé sur une durée fausse : ce chiffre part
+ * chez un distributeur.
+ */
+export function watchRatio(watchedSeconds: number, mediaDurationSeconds: number): number | null {
+  if (!Number.isFinite(mediaDurationSeconds) || mediaDurationSeconds <= 0) return null;
+  if (!Number.isFinite(watchedSeconds) || watchedSeconds < 0) return null;
+  return Math.min(1, watchedSeconds / mediaDurationSeconds);
 }
 
 // ── Accès opérateur cabine (CIN-073, F17 volet A) ────────────────────────────

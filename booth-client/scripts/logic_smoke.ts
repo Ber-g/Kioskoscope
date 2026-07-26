@@ -244,6 +244,60 @@ function testSession(): void {
     const t2 = mgr.start("free", null, null).shareToken;
     assert(t1 !== t2, "deux sessions → deux shareToken distincts");
   }
+
+  // ── S9. Mesure d'écoute (F21 / CIN-105) ────────────────────────────────────
+  // Ces chiffres servent de base déclarative auprès d'ayants droit : chaque invariant ci-dessous
+  // protège contre une SUR-déclaration (compter plus que ce qui a été vu).
+  console.log("S9. mesure d'écoute — déciles, monotonie, achèvement");
+  {
+    const mgr = new SessionManager(BOOTH, ORG);
+    mgr.start("free", null, null);
+    const film = makeFilm({ durationSeconds: 100 });
+    const play = mgr.recordPlayStart(film, "user_choice");
+
+    assert(play.watchedSeconds === 0, "à l'ouverture : 0 seconde vue");
+    assert(play.decilesReached.length === 10, "10 déciles initialisés");
+    assert(play.decilesReached.every((d) => d === false), "aucun décile atteint au départ");
+    assert(play.endedAt === null, "lecture en cours : pas de fin");
+
+    mgr.recordPlayProgress(play.id, 25, 100);
+    assert(play.watchedSeconds === 25, "progression → 25 s vues");
+    assert(play.decilesReached[2] === true, "25 % → 3ᵉ décile atteint");
+    assert(play.decilesReached[3] === false, "25 % → 4ᵉ décile PAS atteint");
+
+    // Retour en arrière : une seconde revue n'est pas une seconde vue en plus, et une seconde
+    // déjà vue ne peut pas être « dé-vue ». Sans cette monotonie, un spectateur qui rembobine
+    // ferait baisser la durée déclarée.
+    mgr.recordPlayProgress(play.id, 10, 100);
+    assert(play.watchedSeconds === 25, "retour arrière → la durée vue ne redescend PAS");
+    assert(play.decilesReached[2] === true, "retour arrière → les déciles atteints le restent");
+
+    // Saut en avant : la courbe de rétention ne doit pas se « trouer », mais la durée vue ne
+    // doit PAS être gonflée par un passage non regardé.
+    mgr.recordPlayProgress(play.id, 80, 100);
+    assert(play.decilesReached[7] === true, "saut à 80 % → 8ᵉ décile atteint");
+    assert(play.decilesReached.slice(0, 8).every((d) => d), "saut en avant → aucun trou dans la courbe");
+
+    // Durée inconnue (métadonnées absentes) : on n'invente pas de déciles.
+    const play2 = mgr.recordPlayStart(film, "user_choice");
+    mgr.recordPlayProgress(play2.id, 30, 0);
+    assert(play2.watchedSeconds === 30, "durée inconnue → la durée vue est quand même comptée");
+    assert(play2.decilesReached.every((d) => d === false), "durée inconnue → aucun décile inventé");
+
+    // Position négative / non finie : ignorée plutôt que propagée.
+    mgr.recordPlayProgress(play2.id, -5, 100);
+    assert(play2.watchedSeconds === 30, "position négative ignorée");
+
+    // Interruption vs achèvement — la distinction qui protège le taux d'achèvement déclaré.
+    mgr.markPlayStopped(play2.id);
+    assert(play2.completed === false, "lecture interrompue → PAS achevée");
+    assert(play2.endedAt !== null, "lecture interrompue → horodatée");
+    assert(play2.decilesReached[9] === false, "interruption → le dernier décile reste non atteint");
+
+    mgr.markPlayCompleted(play.id);
+    assert(play.completed === true, "fin naturelle → achevée");
+    assert(play.decilesReached.every((d) => d === true), "fin naturelle → tous les déciles atteints");
+  }
 }
 
 function main(): void {

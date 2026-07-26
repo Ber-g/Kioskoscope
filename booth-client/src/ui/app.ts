@@ -182,10 +182,17 @@ export class App {
     applyMoodTheme(film.moods[0] ?? this.lastQuery.mood);
     const play = this.sessions.recordPlayStart(film, source);
     this.mount(
-      playerScreen(film, () => {
-        this.sessions.markPlayCompleted(play.id);
-        this.goAfterFilm(film);
-      }),
+      playerScreen(
+        film,
+        (reason) => {
+          // Seule une fin NATURELLE vaut achèvement (F21). Un film passé ou un fichier illisible
+          // gonfleraient un taux d'achèvement destiné à des ayants droit.
+          if (reason === "ended") this.sessions.markPlayCompleted(play.id);
+          else this.sessions.markPlayStopped(play.id);
+          this.goAfterFilm(film);
+        },
+        (positionSeconds, durationSeconds) => this.sessions.recordPlayProgress(play.id, positionSeconds, durationSeconds),
+      ),
     );
   }
 

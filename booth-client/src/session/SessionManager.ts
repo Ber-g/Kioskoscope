@@ -1,4 +1,5 @@
 import type { Film, Play, PlaySource, Session, UnlockMethod } from "../domain/types";
+import { PLAY_DECILES, emptyDeciles } from "@kioskoscope/domain";
 
 // Gère le cycle de vie d'une session côté Kiosk : création, enregistrement des
 // films lancés (Play), clôture. Pour l'instant tout est en mémoire ; la remontée
@@ -62,15 +63,49 @@ export class SessionManager {
       startedAt: Date.now(),
       completed: false,
       source,
+      endedAt: null,
+      watchedSeconds: 0,
+      decilesReached: emptyDeciles(),
     };
     this.plays.push(play);
     return play;
   }
 
+  /**
+   * Progression d'écoute (F21 / CIN-105) — appelée pendant la lecture.
+   *
+   * `watchedSeconds` est MONOTONE : on ne redescend jamais, même si le spectateur revient en
+   * arrière. Une seconde revue n'est pas une seconde vue en plus, et une seconde déjà vue ne
+   * peut pas être « dé-vue » — c'est ce qui rend le chiffre défendable devant un ayant droit.
+   */
+  recordPlayProgress(playId: string, positionSeconds: number, durationSeconds: number): void {
+    const play = this.plays.find((p) => p.id === playId);
+    if (!play) return;
+    if (!Number.isFinite(positionSeconds) || positionSeconds < 0) return;
+
+    if (positionSeconds > play.watchedSeconds) play.watchedSeconds = positionSeconds;
+
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return;
+    // Décile atteint = la tranche dans laquelle se trouve la tête de lecture. On marque toutes
+    // les tranches jusqu'à celle-ci : un saut en avant ne doit pas « trouer » la courbe, mais il
+    // ne gonfle pas `watchedSeconds` pour autant (les deux mesures répondent à deux questions).
+    const reached = Math.min(PLAY_DECILES, Math.floor((positionSeconds / durationSeconds) * PLAY_DECILES) + 1);
+    for (let i = 0; i < reached; i++) play.decilesReached[i] = true;
+  }
+
   /** Marque le dernier film comme terminé (atteint la fin, pas interrompu). */
   markPlayCompleted(playId: string): void {
     const play = this.plays.find((p) => p.id === playId);
-    if (play) play.completed = true;
+    if (!play) return;
+    play.completed = true;
+    play.endedAt = Date.now();
+    for (let i = 0; i < PLAY_DECILES; i++) play.decilesReached[i] = true;
+  }
+
+  /** Fin de lecture SANS achèvement (interruption, abandon, passage au film suivant). */
+  markPlayStopped(playId: string): void {
+    const play = this.plays.find((p) => p.id === playId);
+    if (play && play.endedAt === null) play.endedAt = Date.now();
   }
 
   /** Clôt la session et renvoie un instantané figé (session + plays). */

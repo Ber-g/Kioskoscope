@@ -282,6 +282,63 @@ async function runTenantSuite(name, client, ownOrg, otherOrg) {
       }
     }
   }
+
+  // 12. Ouvertures de page de partage (F21 / CIN-106, migration 0026).
+  //
+  //     Enjeu particulier : ces compteurs alimentent des statistiques destinées à des AYANTS
+  //     DROIT. Deux risques distincts, testés séparément :
+  //       (a) FUITE — un exploitant lit l'audience d'un concurrent hébergé sur la plateforme ;
+  //       (b) FALSIFICATION — quelqu'un gonfle ses propres chiffres. La seule voie d'écriture est
+  //           `record_share_open()`, en SECURITY DEFINER : si elle était exécutable par un compte
+  //           authentifié, n'importe quel client pourrait incrémenter des compteurs à volonté,
+  //           EN CONTOURNANT la RLS. C'est le contrôle le plus important de ce bloc.
+  {
+    const { data, error } = await client.from("share_opens").select("organization_id, session_id");
+    if (error && /does not exist|relation|schema cache/i.test(error.message)) {
+      assert(true, `share_opens : table absente (migration 0026 non appliquée) → bloc ignoré`);
+    } else {
+      // Contrôle positif : la table est lisible (sinon un « deny all » passerait pour une isolation).
+      assert(!error, `share_opens lisible sans erreur (${error?.message ?? "ok"})`);
+
+      const leak = (data ?? []).filter((r) => r.organization_id !== ownOrg);
+      assert(leak.length === 0, `share_opens : aucune fuite cross-org (${leak.length} fuite(s))`);
+
+      const probe = await client.from("share_opens").select("organization_id").eq("organization_id", otherOrg);
+      assert((probe.data ?? []).length === 0, `sonde share_opens where org=adverse → 0 ligne`);
+
+      // (b1) Écriture DIRECTE : aucune policy INSERT n'existe → la RLS doit refuser, y compris
+      //      dans sa PROPRE org (un exploitant ne gonfle pas non plus ses propres statistiques).
+      const fakeSession = "00000000-0000-0000-0000-0000000000ff";
+      const { data: ins, error: insErr } = await client
+        .from("share_opens")
+        .insert({ organization_id: ownOrg, session_id: fakeSession })
+        .select();
+      const inserted = (ins ?? []).length;
+      assert(insErr != null || inserted === 0, `INSERT direct share_opens (même dans SA propre org) → refusé (${insErr ? "erreur RLS/FK" : inserted + " inséré(s)"})`);
+      if (inserted > 0) await client.from("share_opens").delete().eq("session_id", fakeSession);
+
+      // (b2) Écriture dans l'org ADVERSE : refusée elle aussi.
+      const { data: ins2, error: insErr2 } = await client
+        .from("share_opens")
+        .insert({ organization_id: otherOrg, session_id: fakeSession })
+        .select();
+      const intruded = (ins2 ?? []).length;
+      assert(insErr2 != null || intruded === 0, `INSERT share_opens dans l'org adverse → refusé (${insErr2 ? "erreur RLS/FK" : intruded + " inséré(s)"})`);
+      if (intruded > 0) await client.from("share_opens").delete().eq("session_id", fakeSession);
+
+      // (b3) LE contrôle clé : la fonction SECURITY DEFINER ne doit PAS être exécutable par un
+      //      compte authentifié. Elle est `grant`ée au seul service_role (l'Edge Function).
+      //      Un succès ici signifierait que n'importe quel utilisateur connecté peut écrire des
+      //      lignes en contournant la RLS — donc fabriquer de l'audience.
+      const { error: rpcErr } = await client.rpc("record_share_open", { p_token: "iso-probe-token" });
+      assert(rpcErr != null, `record_share_open() NON exécutable par un compte authentifié (${rpcErr ? rpcErr.message.slice(0, 60) : "⚠️ EXÉCUTÉE — écriture RLS-bypass ouverte"})`);
+
+      // (b4) Même verrou sur la projection publique de séance : elle est réservée à l'Edge
+      //      Function ; exécutable par un authentifié, elle exposerait des séances par token.
+      const { error: recapErr } = await client.rpc("session_recap", { p_token: "iso-probe-token" });
+      assert(recapErr != null, `session_recap() NON exécutable par un compte authentifié (${recapErr ? recapErr.message.slice(0, 60) : "⚠️ EXÉCUTÉE"})`);
+    }
+  }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -377,6 +434,21 @@ async function runDeviceSuite(url, anon) {
   assert(((probeStyle.data ?? []).length === 0), `device : sonde org_styles org adverse → 0 ligne`);
   const probeOp = await client.from("operator_access").select("id").eq("organization_id", adverseOrg);
   assert((probeOp.data ?? []).length === 0, `device : sonde operator_access org adverse → 0 ligne`);
+
+  // F21 / CIN-106 — `share_opens` : le compte borne est « nu » (aucun membership), donc
+  // `current_org_ids()` est VIDE pour lui. Il ne doit voir AUCUNE ligne, pas même celles de sa
+  // propre org : une borne n'a aucun besoin de connaître l'audience, et ne doit pas non plus
+  // pouvoir fabriquer des ouvertures (la seule voie d'écriture est réservée à l'Edge Function).
+  {
+    const opens = await client.from("share_opens").select("organization_id");
+    if (opens.error && /does not exist|relation|schema cache/i.test(opens.error.message)) {
+      assert(true, `device : share_opens absente (0026 non appliquée) → ignoré`);
+    } else {
+      assert((opens.data ?? []).length === 0, `device : share_opens → 0 ligne visible (compte nu, aucune org)`);
+      const rpcOpen = await client.rpc("record_share_open", { p_token: "iso-device-probe" });
+      assert(rpcOpen.error != null, `device : record_share_open() refusée (${rpcOpen.error ? "ok" : "⚠️ EXÉCUTÉE — une borne pourrait fabriquer de l'audience"})`);
+    }
+  }
 
   // Écriture : le device ne peut pas fabriquer une séance rattachée à l'org adverse (RLS with-check
   // booth_id = current_device_booth() + org scoping). booth_id inexistant → refusé de toute façon.

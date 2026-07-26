@@ -413,9 +413,18 @@ export class BoothBackend {
         started_at: new Date(p.startedAt).toISOString(),
         completed: p.completed,
         source: p.source,
+        // Mesure d'écoute (F21 / CIN-105) : voyage avec le snapshot, donc couverte par le buffer
+        // hors-ligne au même titre que le reste de la séance.
+        ended_at: p.endedAt === null ? null : new Date(p.endedAt).toISOString(),
+        watched_seconds: Math.max(0, Math.round(p.watchedSeconds)),
+        deciles_reached: p.decilesReached,
       }));
       const { error: pe } = await supabase.from("plays").insert(rows);
-      if (pe) {
+      // 23505 = la séance a DÉJÀ été remontée (réponse perdue au précédent essai, puis rejeu du
+      // buffer). L'index unique (session_id, position) de 0026 rend ce rejeu inoffensif : on le
+      // traite donc comme un succès, sinon la borne rejouerait indéfiniment une séance déjà
+      // enregistrée — et un ayant droit se verrait facturer deux fois la même lecture.
+      if (pe && pe.code !== "23505") {
         // Séance OK mais lectures KO : on rejouera (session upsert = no-op, plays réinsérés).
         console.error("[booth] remontée lectures (bufferisée) :", pe.message);
         return false;

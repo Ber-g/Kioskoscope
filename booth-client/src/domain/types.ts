@@ -4,7 +4,7 @@
 
 import type { Media } from "@kioskoscope/domain";
 
-export type { UnlockMethod, PlaySource, Subtitle, Session, Play, Media } from "@kioskoscope/domain";
+export type { UnlockMethod, PlaySource, PlayEndReason, Subtitle, Session, Play, Media } from "@kioskoscope/domain";
 
 /** Un court métrage jouable = un `Media` (alias historique du booth-client). */
 export type Film = Media;
