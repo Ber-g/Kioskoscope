@@ -516,3 +516,36 @@ export async function verifyOperator(
   }
   return { ok: true, role: entry.role, identifier: entry.identifier };
 }
+
+// ── Codecs vidéo lisibles navigateur — fondation CIN-022 ─────────────────────
+// La borne lit les médias avec l'élément <video> natif : seuls certains conteneurs sont garantis
+// lisibles (H.264/AAC en .mp4, VP8/9 en .webm). Ce helper PUR (heuristique par extension, sans lire
+// l'entête) sert de garde-fou à l'UPLOAD (dashboard : avertir avant qu'un fichier illisible n'arrive
+// sur une borne) et de filtre côté borne. Un vrai probe de codec (MediaSource.isTypeSupported /
+// entête conteneur) viendra plus tard ; ceci pose la base commune, testable, sans réseau ni DOM.
+
+/** Extensions de conteneurs vidéo généralement lisibles par l'élément <video> des navigateurs. */
+export const BROWSER_PLAYABLE_VIDEO_EXTENSIONS: readonly string[] = ["mp4", "m4v", "webm", "ogv"];
+
+/** Extensions connues pour n'être PAS lisibles nativement (à transcoder). Indicatif. */
+export const NON_PLAYABLE_VIDEO_EXTENSIONS: readonly string[] = ["mkv", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts"];
+
+/** Extension (sans point, en minuscules) d'un nom de fichier, ou "" si absente. Ignore le chemin. */
+export function fileExtension(filename: string): string {
+  const base = filename.split(/[/\\]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+/**
+ * Une vidéo est-elle probablement lisible par le navigateur (heuristique par EXTENSION) ?
+ * `true` = conteneur lisible ; `false` = à transcoder ; `null` = indéterminé (extension inconnue →
+ * ne pas bloquer, mais ne pas rassurer non plus). Ne remplace pas un vrai probe codec.
+ */
+export function isBrowserPlayableVideo(filename: string): boolean | null {
+  const ext = fileExtension(filename);
+  if (ext === "") return null;
+  if (BROWSER_PLAYABLE_VIDEO_EXTENSIONS.includes(ext)) return true;
+  if (NON_PLAYABLE_VIDEO_EXTENSIONS.includes(ext)) return false;
+  return null;
+}
