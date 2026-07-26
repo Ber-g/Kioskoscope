@@ -101,8 +101,27 @@ async function main(): Promise<void> {
       `[booth] branché Supabase · org ${organizationId} · ${playable.length} film(s)` +
         (blocked.size > 0 ? ` (${blocked.size} exclu(s) : droits/plafond)` : ""),
     );
+  } else if (backend.isConfigured) {
+    // BORNE RÉELLE dont le backend n'a pas répondu (réseau coupé, Supabase injoignable).
+    //
+    // ⚠️ Le catalogue d'exécution démarre sur `FACTICE_CATALOG` (catalog.ts) : sans cette
+    // branche, personne n'appelle `setCatalog` et la borne propose des films de DÉMONSTRATION —
+    // titres inventés, `storageUrl: null` donc lecture simulée. Un visiteur pouvait donc payer
+    // une séance pour regarder un film qui n'existe pas. On vide donc le catalogue : l'écran
+    // d'attente bascule sur « aucune séance disponible » (idleScreen `hasFilms=false`) et ne
+    // propose même pas de déverrouiller — pas de paiement possible, donc pas de déception.
+    //
+    // Un catalogue VIDE est un état honnête ; un catalogue FAUX ne l'est jamais. Même règle que
+    // pour une org réelle sans média (cf. commentaire `setCatalog(playable)` ci-dessus).
+    //
+    // ⚠️ Ceci ne REND PAS la borne autonome hors ligne — elle reste incapable de lire un film
+    // sans réseau (F22 / CIN-112). Ça supprime seulement le scénario trompeur en attendant.
+    setCatalog([]);
+    console.warn("[booth] backend injoignable : catalogue VIDÉ (aucune séance proposée). Les films de démonstration ne sont jamais servis sur une borne configurée.");
   } else {
-    console.info("[booth] mode hors ligne (catalogue factice, sessions en mémoire)");
+    // Dev / déploiement public sans identifiants : le catalogue factice est ICI légitime,
+    // c'est le mode bac à sable qui permet de parcourir l'expérience sans backend.
+    console.info("[booth] mode démo (aucun identifiant borne) — catalogue factice, sessions en mémoire");
   }
 
   // Sink de fin de séance. VRAIE borne : on tente la remontée ; en cas d'échec (réseau coupé, ou
