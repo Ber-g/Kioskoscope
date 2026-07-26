@@ -220,6 +220,25 @@ export interface SubtitleRecord {
   readonly workflowStatus: "todo" | "rework" | "verified";
 }
 
+/**
+ * Une VERSION VIDÉO d'un média, dans une langue (CIN-095, table `media_videos` / migration 0027).
+ * Pendant exact de `SubtitleRecord` : une version = une langue, ajouter une langue n'écrase
+ * jamais les autres. `isPrimary` = la version servie aux cabines (miroir de `media.storage_url`).
+ * `originalFilename` / `sizeBytes` / `createdAt` / `createdBy` répondent à « quel fichier est en
+ * ligne, depuis quand, envoyé par qui » (CIN-104) — nuls pour les fichiers d'avant le suivi.
+ */
+export interface MediaVideoRecord {
+  readonly id: string;
+  readonly mediaId: string;
+  readonly lang: string;
+  readonly storageUrl: string;
+  readonly originalFilename: string | null;
+  readonly sizeBytes: number | null;
+  readonly createdAt: number | null;
+  readonly createdBy: string | null;
+  readonly isPrimary: boolean;
+}
+
 // Store = cache en mémoire + couche d'accès aux données. Deux modes :
 // - `mock`     : données factices + localStorage (sans backend).
 // - `supabase` : données réelles ; l'ISOLATION est imposée par la RLS Postgres
@@ -282,6 +301,7 @@ export class FleetStore {
   private storageLocations: StorageLocation[] = [];
   private mediaInstances: MediaInstance[] = [];
   private subtitles: SubtitleRecord[] = [];
+  private mediaVideos: MediaVideoRecord[] = [];
   private transactions: TransactionRecord[] = [];
   private distributors: Distributor[] = [];
   private mediaLicensesCache: MediaLicense[] = [];
@@ -425,6 +445,27 @@ export class FleetStore {
       url: String(r.url),
       workflowStatus: r.workflow_status as SubtitleRecord["workflowStatus"],
     }));
+    // Versions vidéo (0027). `select` tolérant : si la migration n'est pas encore appliquée, on
+    // repart sur une liste vide plutôt que de casser TOUT le chargement du dashboard.
+    const { data: vids, error: vidsErr } = await supabase!
+      .from("media_videos")
+      .select("id,media_id,lang,storage_url,original_filename,size_bytes,created_at,created_by,is_primary");
+    if (vidsErr) {
+      this.mediaVideos = [];
+      if (!/does not exist|relation|schema cache/i.test(vidsErr.message)) console.error("media_videos:", vidsErr.message);
+    } else {
+      this.mediaVideos = (vids ?? []).map((r: Record<string, unknown>) => ({
+        id: String(r.id),
+        mediaId: String(r.media_id),
+        lang: String(r.lang),
+        storageUrl: String(r.storage_url),
+        originalFilename: r.original_filename == null ? null : String(r.original_filename),
+        sizeBytes: r.size_bytes == null ? null : Number(r.size_bytes),
+        createdAt: r.created_at == null ? null : new Date(String(r.created_at)).getTime(),
+        createdBy: r.created_by == null ? null : String(r.created_by),
+        isPrimary: Boolean(r.is_primary),
+      }));
+    }
     const { data: tx } = await supabase!.from("transactions").select("id,booth_id,organization_id,amount_cents,currency,provider,created_at");
     this.transactions = (tx ?? []).map(rowToTransaction);
     // Droits & redevances (tables 0007 ; gracieux si pas encore appliquée → cache vide).
@@ -1500,6 +1541,97 @@ export class FleetStore {
       noLicenseCount: rows.filter((r) => r.status === "no_license").length,
       currency: this.activeCurrency(),
     };
+  }
+
+  // ── Versions vidéo par langue (CIN-095, migration 0027) ──────────────────────
+  /** Versions vidéo d'un média — primaire d'abord, puis par langue. */
+  videosFor(mediaId: string): MediaVideoRecord[] {
+    return this.mediaVideos
+      .filter((v) => v.mediaId === mediaId)
+      .sort((a, b) => (a.isPrimary === b.isPrimary ? a.lang.localeCompare(b.lang) : a.isPrimary ? -1 : 1));
+  }
+
+  /**
+   * Téléverse une version vidéo dans une langue et l'enregistre.
+   *
+   * La PREMIÈRE version d'un média devient automatiquement primaire : un média dont aucune
+   * version n'est servie serait injouable en cabine sans que rien ne le signale.
+   * Chemin storage `{org}/{hash}/video/{lang}` → couvert par les policies d'isolation existantes
+   * (1er segment = org), au même titre que la vidéo principale et les sous-titres.
+   */
+  async saveMediaVideo(
+    media: Media,
+    lang: string,
+    file: File,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (this.mode !== "supabase") return { ok: false, error: "hors ligne" };
+    const safeLang = lang.trim().toLowerCase() || "fr";
+    const path = `${media.organizationId}/${media.contentHash}/video/${safeLang}`;
+
+    // Le bucket `media` (0003) n'a pas de policy UPDATE : remplacer une version passe par
+    // suppression puis insertion (même contrainte que pour les sous-titres, cf. saveSubtitle).
+    await supabase!.storage.from("media").remove([path]);
+    const up = await supabase!.storage.from("media").upload(path, file, { upsert: false, contentType: file.type || "video/mp4" });
+    if (up.error) return { ok: false, error: `Téléversement échoué : ${up.error.message}` };
+
+    const existing = this.mediaVideos.find((v) => v.mediaId === media.id && v.lang === safeLang);
+    const isFirst = this.mediaVideos.filter((v) => v.mediaId === media.id).length === 0;
+    const row = {
+      organization_id: media.organizationId,
+      media_id: media.id,
+      lang: safeLang,
+      storage_url: path,
+      original_filename: file.name,
+      size_bytes: file.size,
+      created_by: this.identity?.user.id ?? null,
+      ...(isFirst ? { is_primary: true } : {}),
+    };
+    const { error } = existing
+      ? await supabase!.from("media_videos").update(row).eq("id", existing.id)
+      : await supabase!.from("media_videos").insert(row);
+    if (error) return { ok: false, error: error.message };
+
+    // La borne lit toujours `media.storage_url` : on l'aligne sur la version primaire, sinon la
+    // cabine continuerait de servir l'ancien fichier sans que rien ne l'indique.
+    if (isFirst || existing?.isPrimary) {
+      const { error: me } = await supabase!.from("media").update({ storage_url: path }).eq("id", media.id);
+      if (me) return { ok: false, error: me.message };
+    }
+    await this.loadFromSupabase();
+    return { ok: true };
+  }
+
+  /** Désigne la version servie aux cabines (et aligne `media.storage_url`). */
+  async setPrimaryMediaVideo(video: MediaVideoRecord): Promise<{ ok: boolean; error?: string }> {
+    if (this.mode !== "supabase") return { ok: false, error: "hors ligne" };
+    // L'index unique partiel n'autorise qu'une primaire : on retire l'ancienne AVANT de poser la
+    // nouvelle, sinon l'update est rejeté.
+    const { error: clearErr } = await supabase!.from("media_videos").update({ is_primary: false }).eq("media_id", video.mediaId).eq("is_primary", true);
+    if (clearErr) return { ok: false, error: clearErr.message };
+    const { error } = await supabase!.from("media_videos").update({ is_primary: true }).eq("id", video.id);
+    if (error) return { ok: false, error: error.message };
+    const { error: me } = await supabase!.from("media").update({ storage_url: video.storageUrl }).eq("id", video.mediaId);
+    if (me) return { ok: false, error: me.message };
+    await this.loadFromSupabase();
+    return { ok: true };
+  }
+
+  /** Supprime une version vidéo (objet storage + ligne). Refuse de retirer la dernière version. */
+  async deleteMediaVideo(video: MediaVideoRecord): Promise<{ ok: boolean; error?: string }> {
+    if (this.mode !== "supabase") return { ok: false, error: "hors ligne" };
+    // Garde-fou : supprimer la seule version rendrait le média injouable en cabine. On le refuse
+    // explicitement plutôt que de laisser un média « vivant » sans fichier.
+    if (this.videosFor(video.mediaId).length <= 1) {
+      return { ok: false, error: "Dernière version : supprimez le média entier plutôt que son seul fichier." };
+    }
+    if (video.isPrimary) {
+      return { ok: false, error: "Version servie aux cabines : désignez-en une autre avant de la supprimer." };
+    }
+    await supabase!.storage.from("media").remove([video.storageUrl]);
+    const { error } = await supabase!.from("media_videos").delete().eq("id", video.id);
+    if (error) return { ok: false, error: error.message };
+    await this.loadFromSupabase();
+    return { ok: true };
   }
 
   // ── Aperçu média & sous-titres (F8/F12) ──────────────────────────────────────
