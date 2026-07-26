@@ -163,3 +163,8 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Médias de test (Wikimedia Commons) — retéléchargeables, jamais dans git (poids binaire).
+# Les .vtt de démo, eux, restent suivis (légers + utiles au POC sous-titres).
+booth-client/samples/*.webm
+booth-client/samples/*.mp4

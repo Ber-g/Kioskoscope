@@ -364,9 +364,15 @@ export class BoothBackend {
     // Id généré CÔTÉ BORNE (pas de RETURNING → pas besoin de policy SELECT device, CIN-002). Upsert
     // « do nothing » sur l'id → rejouer une séance déjà insérée ne la duplique pas.
     const id = sessionId ?? crypto.randomUUID();
+    // INSERT simple (pas upsert) : le compte device « nu » n'a qu'une policy INSERT sur `sessions`
+    // (sessions_device_insert, 0009/0023) — PAS d'UPDATE (écriture append-only par design). L'`upsert`
+    // PostgREST emprunte un chemin ON CONFLICT DO UPDATE qui exige une policy UPDATE → refus RLS.
+    // Idempotence du rejeu hors-ligne conservée via l'id stable : re-remonter une séance déjà insérée
+    // lève une violation d'unicité (23505) qu'on traite comme un SUCCÈS (déjà là) sans ré-insérer les
+    // lectures (elles l'ont été avec la séance d'origine → pas de double-comptage).
     const { error } = await supabase
       .from("sessions")
-      .upsert({
+      .insert({
         id,
         organization_id: this.cfg.orgId,
         booth_id: this.cfg.boothId,
@@ -376,10 +382,27 @@ export class BoothBackend {
         unlock_method: s.unlockMethod,
         amount_cents: s.amount != null ? Math.round(s.amount) : null,
         payment_provider_ref: s.paymentProviderRef,
-      }, { onConflict: "id", ignoreDuplicates: true });
+      });
     if (error) {
+      if (error.code === "23505") return true; // séance déjà remontée (rejeu idempotent) → ne pas dupliquer
       console.error("[booth] remontée séance (bufferisée) :", error.message);
       return false;
+    }
+    // REVENU (F9) : une séance payée doit produire une transaction — le menu Revenus lit
+    // `transactions`, pas `sessions.amount_cents`. Sans ça les revenus restent à zéro même
+    // avec des séances qui remontent. Id = id de séance (1 transaction par séance) → le rejeu
+    // hors ligne est idempotent (23505 = déjà comptée), zéro double-comptage du chiffre d'affaires.
+    if (s.amount != null) {
+      const { error: te } = await supabase.from("transactions").insert({
+        id,
+        organization_id: this.cfg.orgId,
+        booth_id: this.cfg.boothId,
+        session_id: id,
+        amount_cents: Math.round(s.amount),
+        provider: s.unlockMethod,
+        provider_ref: s.paymentProviderRef,
+      });
+      if (te && te.code !== "23505") console.error("[booth] remontée revenu :", te.message);
     }
     if (snapshot.plays.length > 0) {
       const rows = snapshot.plays.map((p) => ({

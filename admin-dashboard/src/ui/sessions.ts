@@ -73,7 +73,7 @@ function render(store: FleetStore, rows: readonly SessionRow[], onOpenBooth?: (i
   return el("div", {}, [
     el("div", { class: "mb-3" }, [
       el("h2", { class: "page-title m-0" }, [t("page.sessions")]),
-      el("div", { class: "text-secondary" }, ["Séances et films joués. Les données réelles arriveront quand les Kiosks seront branchées (ici : séances seedées)."]),
+      el("div", { class: "text-secondary" }, ["Séances et films joués, remontés par les Kiosks. Ces compteurs sont indépendants des revenus : une séance gratuite (location, festival, forfait) est comptée ici même si elle ne génère aucune transaction."]),
     ]),
     el("div", { class: "row row-cards g-2 mb-3" }, [
       kpiTile("Séances", String(rows.length), "purple", "M8 4v16M16 4v16M4 8h16M4 16h16"),
