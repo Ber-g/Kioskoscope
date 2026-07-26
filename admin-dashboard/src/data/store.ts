@@ -342,10 +342,27 @@ export class FleetStore {
   }
 
   private async loadFromSupabase(): Promise<void> {
-    const { data: userRes } = await supabase!.auth.getUser();
+    // `getUser()` est un appel RÉSEAU. Il échoue sur une coupure, un timeout ou un 5xx — et
+    // renvoie alors `user: undefined`, exactement comme une absence de session.
+    //
+    // BUG-010 : cette méthode est rejouée après CHAQUE écriture, y compris à la fin d'un
+    // téléversement de film (plusieurs centaines de Mo, connexion saturée, plusieurs minutes).
+    // Un seul échec transitoire suffisait alors à faire `authed = false` → écran de connexion,
+    // avec le média pourtant bien envoyé. On ne confond donc plus « pas de session » et
+    // « impossible de vérifier » : seule la première déconnecte.
+    const { data: userRes, error: userErr } = await supabase!.auth.getUser();
     const uid = userRes.user?.id;
     if (!uid) {
+      // `getSession()` lit le jeton stocké localement (et ne tente un rafraîchissement qu'en cas
+      // d'expiration). Une session encore présente ⇒ l'échec vient du réseau, pas des droits :
+      // on garde l'utilisateur en place et on laisse les données actuelles à l'écran.
+      const { data: sessionRes } = await supabase!.auth.getSession();
+      if (sessionRes.session) {
+        console.error("loadFromSupabase : vérification d'identité indisponible, session conservée —", userErr?.message ?? "raison inconnue");
+        return; // ne touche NI à `authed`, NI à `identity`, NI aux caches
+      }
       this.authed = false;
+      this.identity = null; // sans ça, l'identité périmée survivait à la déconnexion
       this.emit();
       return;
     }

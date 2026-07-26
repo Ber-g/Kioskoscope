@@ -1,5 +1,5 @@
 import { Modal } from "bootstrap";
-import { CANONICAL_MOODS } from "@kioskoscope/domain";
+import { CANONICAL_MOODS, videoPlayabilityHint } from "@kioskoscope/domain";
 import type { Media } from "../domain/types";
 import type { FleetStore } from "../data/store";
 import { sha256Hex } from "../data/hash";
@@ -393,9 +393,28 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
 
   const fileInput = el("input", { class: "form-control", type: "file", accept: "video/*" }) as HTMLInputElement;
   const hashInfo = el("div", { class: "form-hint" }, [isNew ? "Choisissez un fichier : son empreinte SHA-256 est calculée pour détecter les doublons." : "Empreinte existante conservée."]);
+  // Garde-fou codec (CIN-022) : on avertit DÈS la sélection du fichier, avant tout téléversement —
+  // découvrir en cabine qu'un film reste noir coûte infiniment plus cher qu'un avertissement ici.
+  // Volontairement NON bloquant : l'heuristique porte sur le conteneur, pas sur le codec réel
+  // (cf. `videoPlayabilityHint`), donc elle n'a pas autorité pour refuser un fichier.
+  const codecInfo = el("div", { class: "mt-1" }, []);
+  const showCodecHint = (name: string): void => {
+    const hint = videoPlayabilityHint(name);
+    if (hint.verdict === "playable") {
+      codecInfo.className = "form-hint mt-1 text-green";
+      codecInfo.textContent = hint.message;
+      return;
+    }
+    codecInfo.className = hint.verdict === "transcode" ? "alert alert-warning py-2 mt-1 mb-0" : "form-hint mt-1 text-yellow";
+    codecInfo.textContent = hint.message;
+  };
   fileInput.addEventListener("change", () => {
     file = fileInput.files?.[0] ?? null;
-    if (!file) return;
+    if (!file) {
+      codecInfo.replaceChildren();
+      return;
+    }
+    showCodecHint(file.name);
     hashInfo.textContent = "Calcul de l'empreinte…";
     void sha256Hex(file).then((h) => {
       computedHash = h;
@@ -411,7 +430,7 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
     error,
     el("div", { class: "row" }, [
       ...(needsOrgChoice ? [field("Organisation", orgSelect)] : []),
-      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo])),
+      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo, codecInfo])),
       field("Titre", title),
       field("Réalisateur", director),
       field("Année", year),
