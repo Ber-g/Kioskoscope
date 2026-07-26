@@ -170,3 +170,7 @@ dist
 # Les .vtt de démo, eux, restent suivis (légers + utiles au POC sous-titres).
 booth-client/samples/*.webm
 booth-client/samples/*.mp4
+# Registre de tickets (spec de construction) — local, non public.
+/BACKLOG-SYSTEM.md
+/backlog/
+/backlog.html
