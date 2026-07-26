@@ -24,6 +24,8 @@ kiosk/**/devices.json
 /SPEC-DECISIONS.md
 /OPS.md
 /QA.md
+# Carte de navigation (IA du back-office) — matière de la session UX, interne.
+/NAV-MAP.md
 # Ticketing léger interne (en attendant GitHub Issues).
 /TODO.md
 /BACKLOG.md

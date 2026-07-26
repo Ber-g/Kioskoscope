@@ -17,7 +17,10 @@ const DICT: Record<Lang, Record<string, string>> = {
     "nav.rights": "Droits & redevances",
     "nav.sessions": "Sessions",
     "nav.maintenance": "Maintenance",
-    "nav.organization": "Organisation",
+    // CIN-091 — « Mon organisation » (mes réglages) et « Organisations » (roster super-admin) ne
+    // peuvent pas se distinguer par un simple « s » : le possessif dit à qui appartient la page.
+    "nav.organization": "Mon organisation",
+    "nav.organizations": "Organisations",
     "nav.fleet": "Flotte",
     "nav.locked": "Module non inclus dans votre offre — contactez Kioskoscope pour l'activer",
     "overview.title": "Vue d'ensemble de la flotte",
@@ -81,7 +84,8 @@ const DICT: Record<Lang, Record<string, string>> = {
     "nav.rights": "Rights & royalties",
     "nav.sessions": "Sessions",
     "nav.maintenance": "Maintenance",
-    "nav.organization": "Organization",
+    "nav.organization": "My organization",
+    "nav.organizations": "Organizations",
     "nav.fleet": "Fleet",
     "nav.locked": "Module not included in your plan — contact Kioskoscope to enable it",
     "overview.title": "Fleet overview",

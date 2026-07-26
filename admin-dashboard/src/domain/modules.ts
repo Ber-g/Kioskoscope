@@ -11,6 +11,12 @@ export interface ModuleDef {
 export const MODULES: readonly ModuleDef[] = [
   { key: "rights", label: "Droits & redevances", view: "rights" },
   { key: "personalization", label: "Personnalisation (Mes styles)" }, // UI à venir (F19)
+  // CIN-099 : une org qui ne facture RIEN au spectateur (forfaitaire, festival) n'a pas de
+  // revenus à lire — le menu est masqué, pas grisé (voir `app.ts`). Gating par MODULE et non
+  // par type de souscription : le contenu des paliers n'est pas figé (cf. SUBSCRIPTION_TYPES),
+  // donc c'est le super-admin qui accorde le module org par org. Le comptage d'activité reste
+  // lisible sans ce module : la page Séances n'est gatée par aucun module (décision CIN-099).
+  { key: "revenue", label: "Revenus (billetterie)", view: "revenue" },
 ];
 
 export const ALL_MODULE_KEYS: readonly string[] = MODULES.map((m) => m.key);

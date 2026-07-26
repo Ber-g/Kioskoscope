@@ -14,11 +14,27 @@ import { rightsPage } from "./rights";
 import { sessionsPage } from "./sessions";
 import { settingsPage } from "./settings";
 import { fleetPage } from "./fleet";
+import { organizationsPage } from "./organizations";
 import { boothHubPage, type HubTab } from "./boothHub";
 import { mapPage, mountFleetMap } from "./mapView";
 import { t, getLang, setLang, LANGS, onLangChange } from "../i18n";
 
 const THEME_KEY = "kioskoscope.admin.theme.v1";
+
+// Vues du back-office. « fleet » = le PARC DE MACHINES (tous les comptes, scopé) ;
+// « organizations » = le roster de CLIENTS (super-admin). Ces deux mots ont été confondus
+// jusqu'à CIN-091 — les garder distincts ici est ce qui empêche la confusion de revenir.
+type View =
+  | "overview"
+  | "media"
+  | "revenue"
+  | "rights"
+  | "sessions"
+  | "maintenance"
+  | "settings"
+  | "fleet"
+  | "organizations"
+  | "booth";
 
 interface FilterState {
   readonly statuses: readonly HealthStatus[];
@@ -33,7 +49,10 @@ export class App {
   private editing = false;
   private filter: FilterState | null = null;
   private sort: SortState = { key: "health", dir: "asc" };
-  private view: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings" | "fleet" | "booth" = "overview";
+  private view: View = "overview";
+  // CIN-091 : org ciblée par la page d'administration (menu « Organisations » → clic sur une
+  // org). `null` = le compte administre sa propre org (cas de l'opérateur, qui n'a que la sienne).
+  private adminOrgId: string | null = null;
   // CIN-045 : hub de gestion d'une cabine (vue dédiée, scopée à une borne).
   private selectedBoothId: string | null = null;
   private boothTab: HubTab = "synthese";
@@ -79,7 +98,7 @@ export class App {
       this.view === "media"
         ? mediaPage(this.store, () => this.render())
         : this.view === "revenue"
-          ? revenuePage(this.store, (id) => this.openDrawer(id))
+          ? (this.store.activeHasModule("revenue") ? revenuePage(this.store, (id) => this.openDrawer(id)) : this.overview())
           : this.view === "rights"
             ? (this.store.activeHasModule("rights") ? rightsPage(this.store, () => this.render(), (id) => this.openDrawer(id)) : this.overview())
             : this.view === "sessions"
@@ -87,9 +106,11 @@ export class App {
               : this.view === "maintenance"
                 ? maintenancePage(this.store, () => this.render(), (id) => this.openDrawer(id))
                 : this.view === "settings"
-                  ? settingsPage(this.store, () => this.render())
+                  ? settingsPage(this.store, () => this.render(), this.adminOrgId, () => this.setView("organizations"))
                   : this.view === "fleet"
-                    ? (this.store.isGlobalAdmin ? fleetPage(this.store, (id) => this.openBoothHub(id)) : this.overview())
+                    ? fleetPage(this.store, (id) => this.openBoothHub(id))
+                    : this.view === "organizations"
+                    ? (this.store.isGlobalAdmin ? organizationsPage(this.store, (id) => this.openBoothHub(id), (id) => this.openOrgAdmin(id)) : this.overview())
                     : this.view === "booth" && this.selectedBoothId
                     ? boothHubPage(this.store, this.selectedBoothId, () => this.setView("overview"), () => this.render(), this.boothTab, (tab) => { this.boothTab = tab; }, () => this.setView("media"))
                     : this.overview();
@@ -108,8 +129,18 @@ export class App {
     }
   }
 
-  private setView(v: "overview" | "media" | "revenue" | "rights" | "sessions" | "maintenance" | "settings" | "fleet"): void {
+  private setView(v: View): void {
     this.view = v;
+    // Quitter le menu « Organisation » relâche la cible d'administration : y revenir plus tard
+    // par le menu doit rouvrir SA propre org, pas la dernière org inspectée en super-admin.
+    if (v !== "settings") this.adminOrgId = null;
+    this.render();
+  }
+
+  /** Ouvre la page d'administration d'une organisation (CIN-091 b) : le hub `settings` ciblé. */
+  private openOrgAdmin(orgId: string): void {
+    this.adminOrgId = orgId;
+    this.view = "settings";
     this.render();
   }
 
@@ -155,19 +186,32 @@ export class App {
         el("h1", { class: "navbar-brand fs-2 fw-bold m-0" }, ["KIOSKOSCOPE"]),
         el("div", { class: "collapse navbar-collapse", id: "sidebar-menu" }, [
           el("ul", { class: "navbar-nav pt-lg-2 w-100" }, [
+            // Ordre = groupes de sens, du parc vers l'administration (CIN-091) :
+            //   PARC (Vue d'ensemble, Flotte) · CONTENU (Médias) · ACTIVITÉ (Revenus, Droits,
+            //   Sessions) · TECHNIQUE (Maintenance) · ADMINISTRATION (Mon organisation,
+            //   Organisations). « Flotte » suit immédiatement la vue d'ensemble : même objet
+            //   — les machines — vues de loin puis de près.
             navItem(t("nav.overview"), "M4 21v-13l8 -4l8 4v13M9 21v-6h6v6", this.view === "overview", () => this.setView("overview")),
+            navItem(t("nav.fleet"), "M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8", this.view === "fleet", () => this.setView("fleet")),
             navItem(t("nav.media"), "M4 5h16v14H4zM4 9h16M10 13l3 2l-3 2z", this.view === "media", () => this.setView("media")),
-            navItem(t("nav.revenue"), "M12 3v18M8 7h6a2 2 0 0 1 0 4h-4a2 2 0 0 0 0 4h6", this.view === "revenue", () => this.setView("revenue")),
+            // Revenus (CIN-099) : MASQUÉ — pas grisé — si l'org ne facture pas au spectateur
+            // (forfaitaire/festival). Un cadenas « Revenus » proposerait d'acheter une fonction
+            // structurellement sans objet pour ces orgs : c'est du bruit, pas de l'upsell
+            // (@design). Contraste avec « Droits », vrai module optionnel → cadenas conservé.
+            ...(this.store.activeHasModule("revenue")
+              ? [navItem(t("nav.revenue"), "M12 3v18M8 7h6a2 2 0 0 1 0 4h-4a2 2 0 0 0 0 4h6", this.view === "revenue", () => this.setView("revenue"))]
+              : []),
             this.store.activeHasModule("rights")
               ? navItem(t("nav.rights"), "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", this.view === "rights", () => this.setView("rights"))
               : navItem(t("nav.rights"), "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", false, undefined, true),
             navItem(t("nav.sessions"), "M8 4v16M16 4v16M4 8h16M4 16h16", this.view === "sessions", () => this.setView("sessions")),
             navItem(t("nav.maintenance"), "M12 3l1.5 3.5l3.5 1.5l-3.5 1.5l-1.5 3.5l-1.5 -3.5l-3.5 -1.5l3.5 -1.5zM6 14l.7 1.8l1.8 .7l-1.8 .7l-.7 1.8l-.7 -1.8l-1.8 -.7l1.8 -.7z", this.view === "maintenance", () => this.setView("maintenance")),
             navItem(t("nav.organization"), "M3 21h18M9 8h1M9 12h1M9 16h1M14 8h1M14 12h1M14 16h1M5 21V5a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v16", this.view === "settings", () => this.setView("settings")),
-            // Flotte (CIN-084) : pilotage plateforme multi-org — réservé au global_admin (un client
-            // ne voit jamais cette entrée). La RLS refuse en plus toute écriture non-admin (défense).
+            // Organisations (ex-« Flotte », CIN-084 → renommée CIN-091) : roster des CLIENTS,
+            // pilotage plateforme — réservé au global_admin (un client ne voit jamais cette
+            // entrée). La RLS refuse en plus toute écriture non-admin (défense en profondeur).
             ...(this.store.isGlobalAdmin
-              ? [navItem(t("nav.fleet"), "M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8", this.view === "fleet", () => this.setView("fleet"))]
+              ? [navItem(t("nav.organizations"), "M3 21h18M5 21V7l7 -4l7 4v14M10 12h4M10 16h4M10 8h4", this.view === "organizations", () => this.setView("organizations"))]
               : []),
           ]),
         ]),

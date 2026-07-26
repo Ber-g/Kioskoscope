@@ -84,7 +84,7 @@ Câblage livré (CIN-077) :
   statut `pending`/`running`/`done`/`failed`, journal apt, horodatage. RLS : lecture org,
   **écriture humaine réservée `global_admin`** (la plateforme décide des patchs), device
   lit + met à jour SA borne. Index partiel unique = une seule commande active par borne.
-  ⇒ **migration `0017` à appliquer par Beranger.**
+  ⇒ **migration `0017` à appliquer sur Supabase.**
 - Le `booth-client` (authentifié device) **relaie** (`backend.relayOsUpdates` + poll 5 min) :
   lit les commandes `pending` de sa borne, appelle l'agent local, remonte `running` →
   `done`/`failed` + le journal apt.

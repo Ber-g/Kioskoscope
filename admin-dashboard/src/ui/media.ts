@@ -4,6 +4,7 @@ import type { Media } from "../domain/types";
 import type { FleetStore } from "../data/store";
 import { sha256Hex } from "../data/hash";
 import { openPreview } from "./preview";
+import { subtitleTracksPanel } from "./subtitles";
 import { el } from "./dom";
 import { t } from "../i18n";
 
@@ -377,11 +378,18 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
   const drmScheme = el("input", { class: "form-control", type: "text", value: base.drmScheme ?? "", placeholder: "widevine, playready… (si DRM)" }) as HTMLInputElement;
   const synopsis = el("textarea", { class: "form-control", rows: "2" }, [base.synopsis]) as HTMLTextAreaElement;
 
+  // Le sélecteur d'organisation n'a de sens que s'il y a VRAIMENT un choix à faire : un
+  // global_admin n'a pas d'org active (`activeOrganizationId: null`) et doit donc désigner la
+  // destination du média. Un opérateur mono-org, lui, est déjà DANS son organisation : lui
+  // présenter une liste à une seule entrée transforme un contexte acquis en décision à prendre
+  // (retour de session de test, 2026-07-26). L'élément reste construit — `orgSelect.value` alimente
+  // l'enregistrement — mais il n'est monté dans le formulaire que s'il arbitre quelque chose.
   const orgSelect = el(
     "select",
     { class: "form-select" },
     orgs.map((o) => el("option", { value: o.id, ...(o.id === base.organizationId ? { selected: "selected" } : {}) }, [o.name])),
   ) as HTMLSelectElement;
+  const needsOrgChoice = orgs.length > 1;
 
   const fileInput = el("input", { class: "form-control", type: "file", accept: "video/*" }) as HTMLInputElement;
   const hashInfo = el("div", { class: "form-hint" }, [isNew ? "Choisissez un fichier : son empreinte SHA-256 est calculée pour détecter les doublons." : "Empreinte existante conservée."]);
@@ -402,7 +410,7 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
   const body = el("div", {}, [
     error,
     el("div", { class: "row" }, [
-      field("Organisation", orgSelect),
+      ...(needsOrgChoice ? [field("Organisation", orgSelect)] : []),
       field("Fichier vidéo", el("div", {}, [fileInput, hashInfo])),
       field("Titre", title),
       field("Réalisateur", director),
@@ -421,6 +429,15 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
       field("Tags éditoriaux", tags),
       field("TMDB id", tmdbId),
     ]),
+    el("div", { class: "hr-text" }, ["Sous-titres"]),
+    // CIN-094 : les pistes se gèrent ici (métadonnée du média), plus seulement dans l'écran de
+    // validation. Un média non encore enregistré n'a ni ligne en base ni empreinte figée : la
+    // clé étrangère et le chemin de stockage n'existent pas, on ne peut donc rien y rattacher.
+    isNew
+      ? el("div", { class: "text-secondary small fst-italic" }, [
+          "Enregistrez d'abord le média : les pistes de sous-titres se rattachent à une fiche existante.",
+        ])
+      : subtitleTracksPanel(store, base, onChanged),
   ]);
 
   const modalEl = el("div", { class: "modal modal-blur fade", tabindex: "-1" }, [

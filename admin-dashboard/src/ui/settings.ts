@@ -3,15 +3,18 @@ import type { FleetStore, OperatorAccessRecord, OrgMember, OrgSummary } from "..
 import type { OrgRole } from "../domain/types";
 import type { OperatorRole } from "@kioskoscope/domain";
 import { PERMISSION_MATRIX, ROLE_HINTS, ROLE_LABELS, ROLE_ORDER } from "../domain/roles";
-import { el, icon } from "./dom";
+import { el, icon, toast } from "./dom";
+import { MODULES, SUBSCRIPTION_TYPES } from "../domain/modules";
 import { orgStyleSettingsTab } from "./orgStyleSettings";
 
 // Menu Organisation (hub à onglets, patterns SaaS classiques) : Général, Membres,
 // Invitations, Rôles & permissions, Kiosks, Mes styles, Paiement. La gestion (écriture) est
 // réservée au super_user (aligné sur la RLS 0006) ; les autres voient en lecture.
 
-type Tab = "general" | "members" | "invites" | "roles" | "booths" | "styles" | "access" | "billing";
-const TABS: ReadonlyArray<{ key: Tab; label: string }> = [
+type Tab = "general" | "members" | "invites" | "roles" | "booths" | "styles" | "access" | "billing" | "subscription";
+// `adminOnly` : onglet de pilotage PLATEFORME (l'org le subit, ne le règle pas). Masqué —
+// pas grisé — hors global_admin : un client n'a pas à savoir qu'un écran d'attribution existe.
+const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly?: boolean }> = [
   { key: "general", label: "Général" },
   { key: "members", label: "Membres" },
   { key: "invites", label: "Invitations" },
@@ -20,6 +23,7 @@ const TABS: ReadonlyArray<{ key: Tab; label: string }> = [
   { key: "styles", label: "Mes styles" },
   { key: "access", label: "Accès opérateur" },
   { key: "billing", label: "Paiement" },
+  { key: "subscription", label: "Souscription & modules", adminOnly: true },
 ];
 
 /** Rôles attribuables à un accès opérateur cabine (global_admin = plateforme, non créé ici). */
@@ -52,11 +56,27 @@ const ROLE_SUFFIX: Record<OperatorRole, string> = {
   global_admin: "GADMIN",
 };
 
-export function settingsPage(store: FleetStore, onChanged: () => void): HTMLElement {
+/**
+ * Hub d'administration d'UNE organisation.
+ *
+ * `targetOrgId` (CIN-091 b) : org à ouvrir d'emblée, quand on arrive depuis le roster
+ * « Organisations » en cliquant un client. Sans lui, on retombe sur l'org active du compte —
+ * le cas de l'opérateur, qui n'administre que la sienne. Le global_admin n'a PAS d'org active
+ * (`activeOrganizationId: null`) : c'est précisément ce paramètre qui lui donne un contexte.
+ */
+export function settingsPage(
+  store: FleetStore,
+  onChanged: () => void,
+  targetOrgId: string | null = null,
+  onBack?: () => void,
+): HTMLElement {
   const orgs = store.organizations();
+  // On ne fait confiance à `targetOrgId` que s'il désigne une org réellement visible : un id
+  // périmé (org supprimée entre-temps) ne doit pas produire une page vide et muette.
+  const target = targetOrgId && orgs.some((o) => o.id === targetOrgId) ? targetOrgId : null;
   const state = {
     tab: "general" as Tab,
-    orgId: store.current?.activeOrganizationId ?? orgs[0]?.id ?? null,
+    orgId: target ?? store.current?.activeOrganizationId ?? orgs[0]?.id ?? null,
   };
 
   const container = el("div", {}, []);
@@ -82,10 +102,11 @@ export function settingsPage(store: FleetStore, onChanged: () => void): HTMLElem
     const stylesGated = org ? !store.hasModule(org.id, "personalization") && !store.isGlobalAdmin : false;
     const lockPath = "M6 11V7a4 4 0 0 1 8 0v4M5 11h10a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1H5a1 1 0 0 1 -1 -1v-6a1 1 0 0 1 1 -1z";
 
+    const visibleTabs = TABS.filter((t) => !t.adminOnly || store.isGlobalAdmin);
     const tabsNav = el(
       "ul",
       { class: "nav nav-tabs mb-3" },
-      TABS.map((t) => {
+      visibleTabs.map((t) => {
         const gated = t.key === "styles" && stylesGated;
         const children: Array<Node | string> = [t.label];
         if (gated) children.push(el("span", { class: "ms-1 text-secondary" }, [icon(lockPath, 14)]));
@@ -104,9 +125,29 @@ export function settingsPage(store: FleetStore, onChanged: () => void): HTMLElem
       body.prepend(el("div", { class: "alert alert-secondary" }, ["Lecture seule — seul un super-utilisateur de l'organisation peut modifier ces réglages."]));
     }
 
+    // Arrivé depuis le roster « Organisations » : la page administre le client DÉSIGNÉ, pas la
+    // sienne. Le titre porte donc son nom, et un retour explicite ramène au roster — sans quoi
+    // on se retrouve « dans une org » sans savoir comment en sortir (ambiguïté visée par CIN-091).
+    const fromRoster = target !== null && onBack !== undefined;
+    const backLink = (() => {
+      if (!fromRoster) return el("span", {}, []);
+      const b = el("button", { class: "btn btn-link p-0 mb-1 d-inline-flex align-items-center gap-1", type: "button" }, [
+        icon("M15 6l-6 6l6 6", 16),
+        "Organisations",
+      ]);
+      b.addEventListener("click", () => onBack!());
+      return b;
+    })();
+
     container.replaceChildren(
       el("div", { class: "d-flex align-items-center mb-3 gap-2 flex-wrap" }, [
-        el("div", {}, [el("h2", { class: "page-title m-0" }, ["Organisation"]), el("div", { class: "text-secondary" }, [org ? org.name : "Aucune organisation"])]),
+        el("div", {}, [
+          backLink,
+          el("h2", { class: "page-title m-0" }, [fromRoster && org ? org.name : "Mon organisation"]),
+          el("div", { class: "text-secondary" }, [
+            fromRoster ? "Administration de l'organisation (super-admin)" : org ? org.name : "Aucune organisation",
+          ]),
+        ]),
         orgPicker,
       ]),
       org ? el("div", {}, [tabsNav, body]) : el("div", { class: "card" }, [el("div", { class: "card-body text-secondary" }, ["Aucune organisation à gérer."])]),
@@ -168,6 +209,71 @@ function generalTab(store: FleetStore, org: OrgSummary | null, canManage: boolea
         field("Thème", "Identifiant de thème UI (optionnel).", theme),
       ]),
       canManage ? el("div", { class: "d-flex align-items-center gap-3" }, [save, status]) : el("span", {}, []),
+    ]),
+  ]);
+}
+
+// ── Onglet Souscription & modules (super-admin) ───────────────────────────────
+// Pendant UNITAIRE des actions par lot du roster « Organisations » : ici on règle UNE org, en
+// voyant son état courant. L'écriture est refusée à quiconque n'est pas global_admin par la RLS
+// (0011) — le masquage de l'onglet n'est que la couche de confort.
+function subscriptionTab(store: FleetStore, org: OrgSummary | null, onChanged: () => void): HTMLElement {
+  if (!org) return el("span", {}, []);
+  const ent = store.entitlementFor(org.id);
+
+  const subSelect = el("select", { class: "form-select" }, SUBSCRIPTION_TYPES.map((s) => el("option", { value: s.key }, [s.label]))) as HTMLSelectElement;
+  subSelect.value = ent?.subscriptionType ?? "demo";
+
+  // Pas de ligne d'entitlement = TOUT est accordé (défaut ouvert, cf. migration 0011). On coche
+  // donc tout, pour que l'écran montre l'état RÉEL et non un formulaire vide trompeur.
+  const moduleChecks = MODULES.map((m) => {
+    const input = el("input", { class: "form-check-input", type: "checkbox" }) as HTMLInputElement;
+    input.checked = ent ? ent.enabledModules.includes(m.key) : true;
+    const label = el("label", { class: "form-check" }, [
+      input,
+      el("span", { class: "form-check-label" }, [m.label]),
+      m.view ? el("span", { class: "form-check-description" }, [`Masque ou grise le menu « ${m.label} » du back-office.`]) : el("span", {}, []),
+    ]);
+    return { key: m.key, input, label };
+  });
+
+  const status = el("div", { class: "small" }, []);
+  const save = el("button", { class: "btn btn-primary", type: "button" }, ["Enregistrer"]);
+  save.addEventListener("click", () => {
+    status.className = "small text-secondary";
+    status.textContent = "Enregistrement…";
+    save.setAttribute("disabled", "true");
+    void store
+      .saveEntitlements(org.id, {
+        subscriptionType: subSelect.value,
+        enabledModules: moduleChecks.filter((c) => c.input.checked).map((c) => c.key),
+      })
+      .then((res) => {
+        save.removeAttribute("disabled");
+        if (res.ok) {
+          // `saveEntitlements` recharge et réémet → cet arbre est détaché juste après : le toast
+          // (ancré sur body) est le seul retour que l'opérateur verra réellement.
+          toast("Souscription & modules enregistrés ✓");
+          onChanged();
+        } else {
+          status.className = "small text-danger";
+          status.textContent = res.error ?? "Échec de l'enregistrement.";
+        }
+      });
+  });
+
+  return el("div", { class: "card" }, [
+    el("div", { class: "card-body" }, [
+      el("div", { class: "alert alert-info" }, [
+        "Réglages PLATEFORME : l'organisation les subit et ne peut pas les modifier elle-même. Sans ligne enregistrée, tous les modules sont considérés comme accordés.",
+      ]),
+      el("div", { class: "mb-3" }, [
+        el("label", { class: "form-label" }, ["Souscription"]),
+        subSelect,
+        el("div", { class: "form-hint" }, ["Le palier est un libellé commercial : ce sont les modules ci-dessous qui décident réellement de ce qui est visible."]),
+      ]),
+      el("div", { class: "mb-3" }, [el("label", { class: "form-label" }, ["Modules accordés"]), ...moduleChecks.map((c) => c.label)]),
+      el("div", { class: "d-flex align-items-center gap-3" }, [save, status]),
     ]),
   ]);
 }
@@ -670,6 +776,7 @@ export function openAccessModal(
 
 const tabRenderers: Record<Tab, (store: FleetStore, org: OrgSummary | null, canManage: boolean, onChanged: () => void) => HTMLElement> = {
   general: generalTab,
+  subscription: (store, org, _canManage, onChanged) => subscriptionTab(store, org, onChanged),
   members: membersTab,
   invites: invitesTab,
   roles: () => rolesTab(),
