@@ -98,6 +98,17 @@ export interface FilmPlayRow {
   readonly at: number;
   readonly completed: boolean;
   readonly source: string;
+  // ── Profondeur d'écoute (F21 / CIN-105, migration 0026) ────────────────────
+  /** Secondes réellement vues. 0 pour les lectures antérieures à l'instrumentation. */
+  readonly watchedSeconds: number;
+  /** Déciles atteints (10 booléens) — matière de la courbe de rétention. */
+  readonly decilesReached: readonly boolean[];
+  /** Durée du média au moment de l'affichage — dénominateur du taux d'écoute. 0 si inconnue. */
+  readonly durationSeconds: number;
+  /** Séance d'origine : sert à ne compter son montant QU'UNE fois malgré N lectures. */
+  readonly sessionId: string;
+  /** Montant de la séance (null = gratuite). Porté par chaque lecture, dédoublonné à l'agrégat. */
+  readonly sessionAmountCents: number | null;
 }
 
 /** Version logicielle déployable (Phase 4 / F10). */
@@ -1263,33 +1274,51 @@ export class FleetStore {
     if (this.mode !== "supabase") return [];
     const { data: sess } = await supabase!
       .from("sessions")
-      .select("id,booth_id,started_at")
+      .select("id,booth_id,started_at,amount_cents")
       .order("started_at", { ascending: false })
       .limit(1000);
-    const { data: playsData } = await supabase!.from("plays").select("session_id,media_id,completed,source");
+    // `watched_seconds` / `deciles_reached` viennent de 0026 : on les demande explicitement pour
+    // que la vue puisse dire JUSQU'OÙ un film a été regardé, et pas seulement combien de fois.
+    const { data: playsData, error: playsErr } = await supabase!
+      .from("plays")
+      .select("session_id,media_id,completed,source,watched_seconds,deciles_reached");
+    // Base sans 0026 : on retombe sur les colonnes historiques plutôt que de tout perdre.
+    const legacy = Boolean(playsErr);
+    const fallback = legacy ? await supabase!.from("plays").select("session_id,media_id,completed,source") : null;
+    const plays = (legacy ? fallback?.data : playsData) ?? [];
+
     const boothLabel = new Map(this.booths.map((b) => [b.id, b.label]));
-    const mediaTitle = new Map(this.media.map((m) => [m.id, m.title]));
+    const mediaById = new Map(this.media.map((m) => [m.id, m]));
     const sessionCtx = new Map(
-      ((sess ?? []) as Array<{ id: string; booth_id: string; started_at: string }>).map((s) => [
+      ((sess ?? []) as Array<{ id: string; booth_id: string; started_at: string; amount_cents: number | null }>).map((s) => [
         s.id,
-        { boothLabel: boothLabel.get(s.booth_id) ?? "—", at: new Date(s.started_at).getTime() },
+        { boothLabel: boothLabel.get(s.booth_id) ?? "—", at: new Date(s.started_at).getTime(), amount: s.amount_cents ?? null },
       ]),
     );
     const rows: FilmPlayRow[] = [];
-    for (const p of (playsData ?? []) as Array<{ session_id: string; media_id: string; completed: boolean; source: string }>) {
+    for (const p of plays as Array<{
+      session_id: string; media_id: string; completed: boolean; source: string;
+      watched_seconds?: number; deciles_reached?: boolean[];
+    }>) {
       const ctx = sessionCtx.get(p.session_id);
       // Lecture dont la séance est hors fenêtre (au-delà des 1000 dernières) : on l'ignore
       // plutôt que de l'horodater à 1970, ce qui fausserait le graphe.
       if (!ctx) continue;
+      const media = mediaById.get(p.media_id);
       rows.push({
         mediaId: p.media_id,
         // Un média supprimé laisse ses lectures derrière lui : on garde la ligne (le compte
         // reste juste) avec un titre explicite plutôt que de la faire disparaître.
-        title: mediaTitle.get(p.media_id) ?? "Média supprimé",
+        title: media?.title ?? "Média supprimé",
         boothLabel: ctx.boothLabel,
         at: ctx.at,
         completed: p.completed,
         source: p.source,
+        watchedSeconds: Number(p.watched_seconds ?? 0),
+        decilesReached: Array.isArray(p.deciles_reached) ? p.deciles_reached : [],
+        durationSeconds: media?.durationSeconds ?? 0,
+        sessionId: p.session_id,
+        sessionAmountCents: ctx.amount,
       });
     }
     return rows.sort((a, b) => b.at - a.at);
