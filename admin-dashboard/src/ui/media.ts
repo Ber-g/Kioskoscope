@@ -228,7 +228,10 @@ function statsPanel(store: FleetStore): HTMLElement {
 }
 
 function rowActions(store: FleetStore, m: Media, onChanged: () => void): HTMLElement {
-  const preview = el("button", { class: "btn btn-sm", type: "button" }, ["Aperçu"]);
+  // « Validation » et non « Aperçu » (CIN-094) : l'écran n'est pas une prévisualisation de
+  // confort, c'est la porte par laquelle un opérateur approuve un média avant qu'il ne parte en
+  // cabine. Le nom dit l'engagement pris, pas le média regardé.
+  const preview = el("button", { class: "btn btn-sm", type: "button" }, ["Validation"]);
   preview.addEventListener("click", () => openPreview(store, m, onChanged));
   const edit = el("button", { class: "btn btn-sm ms-1", type: "button" }, ["Modifier"]);
   edit.addEventListener("click", () => openMediaForm(store, m, onChanged));

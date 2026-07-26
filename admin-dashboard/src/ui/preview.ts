@@ -235,7 +235,7 @@ export function openPreview(store: FleetStore, media: Media, onChanged: () => vo
     el("div", { class: "modal-dialog modal-xl modal-dialog-centered" }, [
       el("div", { class: "modal-content" }, [
         el("div", { class: "modal-header" }, [
-          el("h3", { class: "modal-title" }, [`Aperçu — ${media.title}`]),
+          el("h3", { class: "modal-title" }, [`Validation — ${media.title}`]),
           el("button", { class: "btn-close", type: "button", "data-bs-dismiss": "modal" }, []),
         ]),
         el("div", { class: "modal-body" }, [videoWrap, validateWrap, subsSection]),
