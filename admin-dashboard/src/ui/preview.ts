@@ -211,21 +211,24 @@ export function openPreview(store: FleetStore, media: Media, onChanged: () => vo
   if (existing.length > 0) for (const s of existing) pillsWrap.append(makePill(s));
   else pillsWrap.append(placeholder);
 
-  const fileInput = el("input", { class: "form-control", type: "file", accept: ".vtt,.srt,text/vtt,application/x-subrip", style: "max-width:20rem" }) as HTMLInputElement;
-  fileInput.addEventListener("change", () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
-    void file.text().then((text) => loadCues(parseSubtitles(text)));
-  });
-
+  // CIN-094 — L'IMPORT DE PISTES A ÉTÉ RETIRÉ D'ICI, volontairement.
+  //
+  // Cet écran proposait d'importer un fichier de sous-titres, alors que « Modifier un média »
+  // le propose aussi : deux portes pour un même geste, et l'ajout se cherchait dans la mauvaise
+  // (constaté en session de test). « Validation » est une PORTE D'APPROBATION — on regarde le
+  // rendu final et on approuve — pas un atelier. L'ajout et le retrait de pistes vivent
+  // désormais sur la fiche média, à un seul endroit.
+  //
+  // Ce qui RESTE ici : charger une piste déjà enregistrée pour la CALER (décalage global). Le
+  // calage n'est pas de la saisie de métadonnée, c'est du contrôle qualité — il a sa place dans
+  // l'écran de validation.
   const subsSection = el("div", {}, [
     el("div", { class: "d-flex align-items-center gap-2 mb-2 flex-wrap" }, [
       el("span", { class: "text-secondary" }, ["Sous-titres :"]),
       pillsWrap,
     ]),
-    el("div", { class: "d-flex align-items-center gap-2 mb-3 flex-wrap" }, [
-      el("span", { class: "text-secondary small" }, ["Importer .srt / .vtt :"]),
-      fileInput,
+    el("div", { class: "text-secondary small mb-3" }, [
+      "Pour ajouter ou retirer une piste, passez par « Modifier » sur la fiche du média.",
     ]),
     controls,
   ]);

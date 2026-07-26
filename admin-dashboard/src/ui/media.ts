@@ -5,6 +5,7 @@ import type { FleetStore } from "../data/store";
 import { sha256Hex } from "../data/hash";
 import { openPreview } from "./preview";
 import { subtitleTracksPanel } from "./subtitles";
+import { videoVersionsPanel } from "./videoVersions";
 import { el } from "./dom";
 import { t } from "../i18n";
 
@@ -451,10 +452,18 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
       field("Tags éditoriaux", tags),
       field("TMDB id", tmdbId),
     ]),
-    el("div", { class: "hr-text" }, ["Sous-titres"]),
-    // CIN-094 : les pistes se gèrent ici (métadonnée du média), plus seulement dans l'écran de
-    // validation. Un média non encore enregistré n'a ni ligne en base ni empreinte figée : la
-    // clé étrangère et le chemin de stockage n'existent pas, on ne peut donc rien y rattacher.
+    // CIN-094+095 : un média = DEUX tableaux de pistes, vidéos et sous-titres, chacun avec son
+    // « + ». C'est ici — dans « Modifier » — que se gèrent les pistes, plus dans « Validation »,
+    // qui est une porte d'approbation et non un atelier.
+    // Un média non encore enregistré n'a ni ligne en base ni empreinte figée : la clé étrangère
+    // et le chemin de stockage n'existent pas, on ne peut donc rien y rattacher.
+    el("div", { class: "hr-text" }, ["Vidéos"]),
+    isNew
+      ? el("div", { class: "text-secondary small fst-italic" }, [
+          "Enregistrez d'abord le média : les versions vidéo se rattachent à une fiche existante.",
+        ])
+      : videoVersionsPanel(store, base, onChanged),
+    el("div", { class: "hr-text mt-3" }, ["Sous-titres"]),
     isNew
       ? el("div", { class: "text-secondary small fst-italic" }, [
           "Enregistrez d'abord le média : les pistes de sous-titres se rattachent à une fiche existante.",
