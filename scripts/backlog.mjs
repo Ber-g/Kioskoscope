@@ -323,6 +323,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .ghost:hover{color:var(--ink)}
 main{padding:22px}
 .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+[hidden]{display:none !important}   /* sinon display:flex écrase l'attribut hidden */
 input[type=search]{font:inherit;padding:7px 11px;border:1px solid var(--line);border-radius:7px;
   background:var(--panel);color:var(--ink);min-width:230px}
 .chip{border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--muted);
