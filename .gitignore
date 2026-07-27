@@ -26,11 +26,8 @@ kiosk/**/devices.json
 /QA.md
 # Carte de navigation (IA du back-office) — matière de la session UX, interne.
 /NAV-MAP.md
-# Ticketing léger interne (en attendant GitHub Issues).
-/TODO.md
+# Registre de tickets (généré par TicketoScope) — local, non public.
 /BACKLOG.md
-# Runbook d'actions humaines (infra Supabase/Cloudflare) — local, non public.
-/ACTIONS-BERANGER.md
 # Prompts de délégation aux agents parallèles — locaux.
 /AGENT-PROMPT-CIN045.md
 /AGENT-PROMPT-F19-DASHBOARD.md
@@ -171,6 +168,7 @@ dist
 booth-client/samples/*.webm
 booth-client/samples/*.mp4
 # Registre de tickets (spec de construction) — local, non public.
-/BACKLOG-SYSTEM.md
 /backlog/
 /backlog.html
+# Identifiants de test/exploitation — local uniquement.
+/COMPTES-LOCAL.md

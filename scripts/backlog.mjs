@@ -4,7 +4,7 @@
  *
  * Un ticket = un fichier Markdown avec frontmatter. Le générateur en tire :
  *   - BACKLOG.md   : une ligne par ticket (la surface de scan, volontairement compacte)
- *   - backlog.html : trois vues (kanban, fils par épique, graphe des blocages)
+ *   - backlog.html : vues web (kanban, fils, blocages, roadmap, historique git, actions)
  *
  * Zéro dépendance : Node natif uniquement.
  *
@@ -17,6 +17,7 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { createServer } from 'node:http';
+import { execFileSync } from 'node:child_process';
 
 // ─────────────────────────────────────────────────────────── configuration
 
@@ -113,6 +114,17 @@ function read() {
     }
   }
 
+  const recipes = [];
+  const recipeDir = join(DIR, 'recipes');
+  if (existsSync(recipeDir)) {
+    for (const f of readdirSync(recipeDir).filter((f) => f.endsWith('.md')).sort()) {
+      const [meta, body, w] = parseFrontmatter(readFileSync(join(recipeDir, f), 'utf8'), `recipes/${f}`);
+      warnings.push(...w);
+      recipes.push({ id: meta.id || basename(f, '.md'), title: meta.title || basename(f, '.md'),
+        when: meta.when || '', body: body.trim() });
+    }
+  }
+
   // Intégrité référentielle : une référence pendante est une erreur de saisie, pas un détail.
   const known = new Set(tickets.map((t) => t.id));
   const knownEpics = new Set(epics.map((e) => e.id));
@@ -122,7 +134,71 @@ function read() {
     }
     if (t.epic && !knownEpics.has(t.epic)) warnings.push(`${t.id} : épique « ${t.epic} » sans fichier epics/${t.epic}.md`);
   }
-  return { tickets, epics, warnings };
+  return { tickets, epics, recipes, warnings };
+}
+
+// ─────────────────────────────────────────────────────────── historique git
+
+/**
+ * Lit l'historique du dépôt courant et calcule une disposition en couloirs (lanes),
+ * comme un « git log --graph » : chaque commit reçoit une colonne, les fusions et les
+ * bifurcations tracent des lignes entre colonnes. Zéro dépendance : on parse la sortie
+ * de `git log`. Renvoie `null` hors d'un dépôt git (la vue s'efface alors proprement).
+ *
+ * Ordre : `--date-order` donne récent → ancien ; un parent étant toujours plus ancien,
+ * il est traité APRÈS son enfant. On réserve donc le couloir d'un parent au moment où
+ * l'on place l'enfant ; le couloir est retrouvé quand on atteint le parent.
+ */
+function gitHistory({ max = 400 } = {}) {
+  const US = '\x1f', RS = '\x1e'; // séparateurs improbables dans un message de commit
+  let raw;
+  try {
+    raw = execFileSync('git', [
+      'log', '--all', '--date-order', `--max-count=${max}`,
+      `--pretty=format:%H${US}%h${US}%P${US}%an${US}%aI${US}%D${US}%s${RS}`,
+    ], { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 32 * 1024 * 1024 });
+  } catch {
+    return null; // pas un dépôt git, ou git indisponible
+  }
+
+  const commits = raw.split(RS).map((r) => r.replace(/^\n/, '')).filter((r) => r.trim()).map((rec) => {
+    const [H, h, P, author, date, D, subject] = rec.split(US);
+    return {
+      H, h, author, date, subject: subject ?? '',
+      parents: P ? P.trim().split(/\s+/) : [],
+      refs: D ? D.split(',').map((s) => s.trim()).filter(Boolean) : [],
+    };
+  });
+  if (commits.length === 0) return null;
+
+  const rowByHash = new Map(commits.map((c) => [c.H, true]));
+  const lanes = []; // lanes[i] = hash attendu dans ce couloir, ou null si libre
+  const freeLane = () => { const i = lanes.indexOf(null); return i >= 0 ? i : lanes.push(null) - 1; };
+  let laneCount = 0;
+  for (const c of commits) {
+    let col = lanes.indexOf(c.H);
+    if (col < 0) { col = freeLane(); lanes[col] = c.H; } // tête de branche : nouveau couloir
+    c.col = col;
+    // Les autres couloirs qui attendaient ce même commit (fusions) se replient sur `col`.
+    for (let i = 0; i < lanes.length; i++) if (i !== col && lanes[i] === c.H) lanes[i] = null;
+    // Premier parent = continuité du couloir ; parents de fusion = nouveaux couloirs.
+    const [p0, ...rest] = c.parents;
+    lanes[col] = p0 && rowByHash.has(p0) ? p0 : null; // parent hors fenêtre → on libère le couloir
+    for (const p of rest) if (rowByHash.has(p) && !lanes.includes(p)) lanes[freeLane()] = p;
+    laneCount = Math.max(laneCount, lanes.length);
+  }
+
+  const edgeList = [];
+  for (const c of commits) {
+    for (const p of c.parents) {
+      if (rowByHash.has(p)) edgeList.push({ from: c.H, to: p, merge: c.parents.length > 1 });
+    }
+  }
+  const merges = commits.filter((c) => c.parents.length > 1).length;
+  return {
+    commits: commits.map((c) => ({ H: c.H, h: c.h, col: c.col, parents: c.parents, author: c.author, date: c.date, refs: c.refs, subject: c.subject })),
+    edges: edgeList, laneCount, merges, truncated: commits.length >= max,
+  };
 }
 
 /** Une arête déclarée d'un seul côté vaut des deux : on ne veut pas d'un graphe qui dépend du sens de saisie. */
@@ -245,7 +321,7 @@ const ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const byEpicPrioId = (a, b) =>
   (a.epic || 'zzz').localeCompare(b.epic || 'zzz') || ORDER[a.priority] - ORDER[b.priority] || a.id.localeCompare(b.id);
 
-function renderIndex({ tickets, epics }) {
+function renderIndex({ tickets, epics, recipes }) {
   const titles = Object.fromEntries(epics.map((e) => [e.id, e.title]));
   const line = (t) => `- ${t.icon} [${t.id}] ${t.priority} · ${t.status} · ${t.hook}${t.epic ? ` — ${t.epic}` : ''}`;
   const active = tickets.filter((t) => t.status === 'todo' || t.status === 'doing').sort(byEpicPrioId);
@@ -270,6 +346,7 @@ function renderIndex({ tickets, epics }) {
     '> ⚠️ **Ne jamais éditer ce fichier à la main** — il est écrasé à chaque génération.',
     `> Un ticket = un fichier : \`${basename(DIR)}/<ID>.md\`. Le détail ne se lit que si l'on travaille dessus.`,
     `> Épiques : ${epics.map((e) => `${e.id} (${titles[e.id]})`).join(' · ') || '—'}`,
+    ...(recipes.length ? [`> Recettes disponibles (procédures, à ouvrir seulement au besoin) : ${recipes.map((r) => `${r.id} ${r.title}`).join(' · ')}`] : []),
     '',
     ...head,
     '## Actifs',
@@ -439,13 +516,35 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 .phase{display:flex;align-items:baseline;gap:10px;margin:0 0 6px}
 .phase b{font-size:12px;letter-spacing:.09em;text-transform:uppercase}
 .phase span{color:var(--muted);font-size:11.5px}
+.ghsum{color:var(--muted);font-size:12px;margin-bottom:12px}
+.ghwrap{display:grid;grid-template-columns:auto minmax(0,1fr);background:var(--panel);
+  border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow);overflow:auto}
+.ghsvg{display:block;flex:none}
+.ghedge{fill:none;stroke-width:1.6;opacity:.85}
+.ghedge.merge{stroke-dasharray:3 2;opacity:.7}
+.ghedge.dim{opacity:.15}
+.ghnode{stroke:var(--panel);stroke-width:2}
+.ghnode.merge{stroke-width:2.5}
+.ghnode.dim{opacity:.22}
+.ghrows{padding:16px 0}                       /* padding-top = PADY, pour aligner sur le graphe */
+.ghrow{height:30px;display:flex;align-items:center;gap:9px;padding:0 14px;overflow:hidden;white-space:nowrap}
+.ghrow:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
+.ghrow.dim{opacity:.32}
+.ghh{font-size:11.5px;color:var(--muted);flex:none}
+.ghref{font-size:10.5px;padding:0 6px;border-radius:999px;flex:none;
+  border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.ghref.head{border-color:var(--p1);color:var(--p1);font-weight:600}
+.ghref.tag{border-color:var(--p2);color:var(--p2);background:color-mix(in srgb,var(--p2) 10%,transparent)}
+.ghsub{font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
+.ghmeta{margin-left:auto;font-size:11px;color:var(--muted);flex:none;font-variant-numeric:tabular-nums}
 @media (max-width:900px){.board{grid-template-columns:1fr 1fr}}
 @media (max-width:560px){.board{grid-template-columns:1fr}main{padding:14px}}
 `;
 
 const CLIENT = `
 const D = JSON.parse(document.getElementById('data').textContent);
-const T = D.tickets, E = D.epics, EDGES = D.edges;
+const T = D.tickets, E = D.epics, EDGES = D.edges, G = D.git;
 const byId = Object.fromEntries(T.map(t => [t.id, t]));
 let GEDGES = EDGES;
 const epicTitle = Object.fromEntries(E.map(e => [e.id, e.title]));
@@ -621,6 +720,74 @@ function highlight(id) {
   }
 }
 
+// ─── Historique git : graphe des commits, branches et fusions (façon git log --graph)
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs) => { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+// Couleur déterministe par couloir : teintes réparties, lisibles en clair comme en sombre.
+const laneColor = col => 'hsl(' + ((col * 67) % 360) + ' 60% 55%)';
+const relTime = iso => {
+  const d = new Date(iso), s = (Date.now() - d.getTime()) / 1000;
+  if (!isFinite(s)) return '';
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + ' min';
+  if (s < 86400) return Math.round(s / 3600) + ' h';
+  if (s < 2592000) return Math.round(s / 86400) + ' j';
+  return d.toISOString().slice(0, 10);
+};
+const matchCommit = c => { if (!q) return true;
+  return (c.h + ' ' + c.subject + ' ' + c.author + ' ' + c.refs.join(' ')).toLowerCase().includes(q); };
+
+function renderHistory(root) {
+  if (!G || !G.commits.length) { root.appendChild(el('div', 'empty', 'Aucun historique git dans ce dossier.')); return; }
+  const ROW = 30, COLW = 20, PADX = 20, PADY = 16, R = 4.5;
+  const rowOf = {}; G.commits.forEach((c, i) => rowOf[c.H] = i);
+  const X = col => PADX + col * COLW, Y = i => PADY + i * ROW + ROW / 2;
+  const graphW = PADX * 2 + Math.max(1, G.laneCount) * COLW;
+  const totalH = PADY * 2 + G.commits.length * ROW;
+
+  root.appendChild(el('div', 'ghsum',
+    G.commits.length + (G.truncated ? '+' : '') + ' commits · ' + G.merges + ' fusions · ' +
+    G.laneCount + ' couloir' + (G.laneCount > 1 ? 's' : '') + (G.truncated ? ' · tronqué aux ' + G.commits.length + ' plus récents' : '')));
+
+  const wrap = el('div', 'ghwrap');
+  const svg = svgEl('svg', { class: 'ghsvg', width: graphW, height: totalH, viewBox: '0 0 ' + graphW + ' ' + totalH });
+
+  // Arêtes enfant → parent : verticales dans le même couloir, courbées lors d'un changement.
+  for (const e of G.edges) {
+    const a = G.commits[rowOf[e.from]], b = G.commits[rowOf[e.to]];
+    if (!a || !b) continue;
+    const x1 = X(a.col), y1 = Y(rowOf[e.from]), x2 = X(b.col), y2 = Y(rowOf[e.to]);
+    const d = a.col === b.col ? 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2
+      : 'M' + x1 + ',' + y1 + ' C' + x1 + ',' + ((y1 + y2) / 2) + ' ' + x2 + ',' + ((y1 + y2) / 2) + ' ' + x2 + ',' + y2;
+    const dim = q && !matchCommit(a) && !matchCommit(b);
+    svg.appendChild(svgEl('path', { d, class: 'ghedge' + (e.merge ? ' merge' : '') + (dim ? ' dim' : ''), stroke: laneColor(Math.min(a.col, b.col)) }));
+  }
+  // Nœuds : un cercle par commit ; les fusions (≥2 parents) sont un peu plus grosses.
+  G.commits.forEach((c, i) => {
+    const merge = c.parents.length > 1;
+    svg.appendChild(svgEl('circle', { cx: X(c.col), cy: Y(i), r: merge ? R + 1.5 : R,
+      fill: laneColor(c.col), class: 'ghnode' + (merge ? ' merge' : '') + (q && !matchCommit(c) ? ' dim' : '') }));
+  });
+  wrap.appendChild(svg);
+
+  // Colonne de droite : métadonnées alignées ligne à ligne avec le graphe.
+  const rows = el('div', 'ghrows');
+  for (const c of G.commits) {
+    const refs = c.refs.map(r => {
+      const head = r === 'HEAD' || r.startsWith('HEAD ->');
+      const tag = r.startsWith('tag:');
+      const label = r.replace(/^tag:\s*/, '').replace(/^HEAD -> /, '');
+      return '<span class="ghref' + (tag ? ' tag' : head ? ' head' : '') + '">' + escape(label) + '</span>';
+    }).join('');
+    const row = el('div', 'ghrow' + (q && !matchCommit(c) ? ' dim' : ''),
+      '<code class="ghh">' + escape(c.h) + '</code>' + refs +
+      '<span class="ghsub">' + fmt(c.subject) + '</span>' +
+      '<span class="ghmeta">' + escape(c.author) + ' · ' + relTime(c.date) + '</span>');
+    rows.appendChild(row);
+  }
+  wrap.appendChild(rows);
+  root.appendChild(wrap);
+}
+
 function renderRoadmap(root) {
   const phaseRank = p => { const m = (p || '').match(/\d+/); return m ? +m[0] : 98; };
   const label = p => !p ? 'Sans phase' : (/^[0-9]/.test(p) ? 'Phase ' + p : p.charAt(0).toUpperCase() + p.slice(1));
@@ -679,6 +846,17 @@ function renderRoadmap(root) {
   }
 }
 
+function renderRecipes(root) {
+  if (!D.recipes.length) { root.appendChild(el('div', 'empty', 'Aucune recette.')); return; }
+  for (const r of D.recipes) {
+    const box = el('div', 'thread');
+    box.appendChild(el('h2', null, escape(r.title) + '<span class="k">' + r.id + '</span>'));
+    if (r.when) box.appendChild(el('div', 'meta', escape(r.when)));
+    box.appendChild(el('div', 'prose db', D.recipeBodies[r.id] || ''));
+    root.appendChild(box);
+  }
+}
+
 function renderActions(root) {
   const acts = hiddenA.has('todo') ? [] : D.actions.filter(a => !DONE.has(a.id));
   if (!hiddenA.has('done')) doneList(root);
@@ -698,15 +876,16 @@ function renderActions(root) {
       (groups[k].length > 1 ? 's' : '') + ' — à faire d\\'un seul tenant</span>';
     box.appendChild(t);
     for (const a of groups[k]) {
-      const row = el('label', 'act');
+      const row = el('div', 'act');
       row.innerHTML = '<input type="checkbox"' + (D.live ? '' : ' disabled') + '>' +
         '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
         '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.priority + '</span>' +
         (a.epic ? '<span>' + a.epic + '</span>' : '') +
         (a.unblocks ? '<span class="hot">débloque ' + a.unblocks + ' ticket' + (a.unblocks > 1 ? 's' : '') + '</span>'
                     : '<span>ne débloque rien d\\'autre</span>') + '</span></span>';
-      row.querySelector('input').onchange = ev => { ev.stopPropagation(); done(a, row); };
-      row.querySelector('.id').onclick = ev => { ev.preventDefault(); ev.stopPropagation(); openTicket(a.id); };
+      row.querySelector('input').onchange = () => send(a, row, false);
+      row.onclick = ev => { if (ev.target.tagName !== 'INPUT') openTicket(a.id); };
+      row.title = 'Cliquer pour voir le détail · cocher la case pour marquer fait';
       box.appendChild(row);
     }
     root.appendChild(box);
@@ -721,31 +900,33 @@ function doneList(root) {
     (list.length > 1 ? 's' : '') + ' cochées — journalisées dans leur ticket</span>'));
   for (const a of list) {
     const row = el('div', 'act');
-    row.innerHTML = '<input type="checkbox" checked disabled>' +
+    row.innerHTML = '<input type="checkbox" checked' + (D.live ? '' : ' disabled') + '>' +
       '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
       '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.date + '</span>' +
       '<span>' + escape(a.tool) + '</span></span></span>';
     row.style.opacity = '.6';
-    row.querySelector('.id').onclick = () => openTicket(a.id);
+    row.querySelector('input').onchange = () => send(a, row, true);
+    row.onclick = ev => { if (ev.target.tagName !== 'INPUT') openTicket(a.id); };
+    row.title = 'Cliquer pour voir le détail · décocher pour remettre en attente';
     box.appendChild(row);
   }
   root.appendChild(box);
 }
 
 const DONE = new Set();
-async function done(a, row) {
-  row.classList.add('gone');
+async function send(a, row, undo) {
+  row.classList.toggle('gone', !undo);
   try {
-    const r = await fetch('/api/action/done', {
+    const r = await fetch(undo ? '/api/action/undo' : '/api/action/done', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id: a.id }),
     });
     if (!r.ok) throw new Error(await r.text());
-    DONE.add(a.id);                       // le fs.watch régénère et la page se rechargera d'elle-même
+    if (undo) DONE.delete(a.id); else DONE.add(a.id);   // fs.watch régénère, la page se recharge seule
     badge();
   } catch (e) {
     row.classList.remove('gone');
-    row.querySelector('input').checked = false;
+    row.querySelector('input').checked = undo;
     alert('Impossible d\\'enregistrer : ' + e.message);
   }
 }
@@ -797,7 +978,7 @@ function render() {
   localStorage.setItem('tks.hiddenA', JSON.stringify([...hiddenA]));
   // chaque vue ne montre que les filtres qui la concernent
   // la roadmap mesure l'avancement RÉEL : la filtrer fausserait ses barres
-  document.querySelector('.filters').hidden = view === 'actions' || view === 'roadmap';
+  document.querySelector('.filters').hidden = view === 'actions' || view === 'roadmap' || view === 'history';
   document.querySelector('#afilters').hidden = view !== 'actions';
   for (const c of document.querySelectorAll('.chip[data-act]')) c.setAttribute('aria-pressed', String(!hiddenA.has(c.dataset.act)));
   for (const b of document.querySelectorAll('.tab')) b.setAttribute('aria-selected', String(b.dataset.view === view));
@@ -810,7 +991,9 @@ function render() {
   if (view === 'kanban') renderKanban(root);
   else if (view === 'threads') renderThreads(root);
   else if (view === 'actions') renderActions(root);
+  else if (view === 'recipes') renderRecipes(root);
   else if (view === 'roadmap') renderRoadmap(root);
+  else if (view === 'history') renderHistory(root);
   else renderGraph(root);
 }
 
@@ -850,11 +1033,14 @@ setInterval(async () => {
 }, 900);
 `;
 
-function renderHtml({ tickets, epics }, { live }) {
+function renderHtml({ tickets, epics, recipes }, { live }) {
   const data = {
     tickets: tickets.map(({ body, ...rest }) => rest),
     epics: epics.map(({ body, ...rest }) => rest),
+    recipes: recipes.map(({ body, ...rest }) => rest),
+    recipeBodies: Object.fromEntries(recipes.map((r) => [r.id, md(r.body)])),
     edges: edges(tickets),
+    git: gitHistory(),
     labels: STATUS_LABEL,
     actions: actions(tickets),
     doneActions: tickets.flatMap((t) => [...t.body.matchAll(/^- ✅ (\d{4}-\d{2}-\d{2}) — (.+)$/gm)].map((m) => {
@@ -889,7 +1075,9 @@ function renderHtml({ tickets, epics }, { live }) {
     <button class="tab" role="tab" data-view="threads">Fils par épique</button>
     <button class="tab" role="tab" data-view="graph">Graphe des blocages</button>
     <button class="tab" role="tab" data-view="roadmap">Roadmap</button>
+    ${data.git ? '<button class="tab" role="tab" data-view="history">Historique</button>' : ''}
     <button class="tab" role="tab" data-view="actions">Mes actions${nAct ? ` <b class="pill">${nAct}</b>` : ''}</button>
+    ${recipes.length ? '<button class="tab" role="tab" data-view="recipes">Recettes</button>' : ''}
   </div>
 </header>
 <main>
@@ -922,7 +1110,7 @@ function generate({ quiet } = {}) {
   writeFileSync(join(OUT, 'BACKLOG.md'), renderIndex(data), 'utf8');
   writeFileSync(join(OUT, 'backlog.html'), renderHtml(data, { live: false }), 'utf8');
   if (!quiet) {
-    console.log(`${data.tickets.length} tickets · ${data.epics.length} épiques → BACKLOG.md + backlog.html`);
+    console.log(`${data.tickets.length} tickets · ${data.epics.length} épiques · ${data.recipes.length} recettes → BACKLOG.md + backlog.html`);
     for (const w of data.warnings) console.warn(`  ⚠ ${w}`);
   }
   return data;
@@ -945,6 +1133,26 @@ function completeAction(id) {
   return m[1].trim();
 }
 
+/** Décoche : retire la dernière ligne de journal et restaure la ligne `action:`. */
+function undoAction(id) {
+  const safe = readdirSync(DIR).filter((f) => f.endsWith('.md')).map((f) => basename(f, '.md'));
+  if (!safe.includes(id)) throw new Error('identifiant inconnu');
+  const file = join(DIR, `${id}.md`);
+  const raw = readFileSync(file, 'utf8');
+  if (/^action: /m.test(raw)) throw new Error('ce ticket a déjà une action en attente');
+  const lines = [...raw.matchAll(/^- ✅ \d{4}-\d{2}-\d{2} — (.+)$/gm)];
+  if (!lines.length) throw new Error('aucune action cochée à annuler');
+  const last = lines[lines.length - 1];
+  const text = last[1].trim();
+  let out = raw.slice(0, last.index) + raw.slice(last.index + last[0].length);
+  out = out.replace(/\n## Journal\s*$/, '\n');            // journal devenu vide
+  out = out.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+  out = out.replace(/^(owner: .*)$/m, `$1\naction: ${text}`);
+  if (!/^action: /m.test(out)) out = out.replace(/^(hook: .*)$/m, `$1\naction: ${text}`);
+  writeFileSync(file, out, 'utf8');
+  return text;
+}
+
 function serve() {
   let version = Date.now();
   let timer = null;
@@ -960,13 +1168,15 @@ function serve() {
   });
 
   createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/api/action/done') {
+    if (req.method === 'POST' && (req.url === '/api/action/done' || req.url === '/api/action/undo')) {
+      const undo = req.url.endsWith('/undo');
       let body = '';
       req.on('data', (c) => { body += c; if (body.length > 2000) req.destroy(); });
       req.on('end', () => {
         try {
-          const done = completeAction(JSON.parse(body).id);
-          console.log(`  ✅ action cochée — ${done}`);
+          const id = JSON.parse(body).id;
+          const done = undo ? undoAction(id) : completeAction(id);
+          console.log(`  ${undo ? '↩︎ action décochée' : '✅ action cochée'} — ${done}`);
           res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok');
         } catch (e) {
           res.writeHead(400, { 'content-type': 'text/plain' }); res.end(e.message);
