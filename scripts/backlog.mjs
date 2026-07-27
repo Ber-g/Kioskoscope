@@ -453,6 +453,7 @@ let q = '';
 const hidden = new Set(JSON.parse(localStorage.getItem('tks.hidden') || '["done","dropped"]'));
 const hiddenP = new Set(JSON.parse(localStorage.getItem('tks.hiddenP') || '[]'));
 const hiddenL = new Set(JSON.parse(localStorage.getItem('tks.hiddenL') || '[]'));
+const hiddenA = new Set(JSON.parse(localStorage.getItem('tks.hiddenA') || '["done"]'));
 
 const el = (tag, cls, html) => { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; };
 const escape = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -678,7 +679,9 @@ function renderRoadmap(root) {
 }
 
 function renderActions(root) {
-  const acts = D.actions.filter(a => !DONE.has(a.id));
+  const acts = hiddenA.has('todo') ? [] : D.actions.filter(a => !DONE.has(a.id));
+  if (!hiddenA.has('done')) doneList(root);
+  if (hiddenA.has('todo')) return;
   if (!acts.length) { root.appendChild(el('div','empty','Rien ne t\\'attend. Le goulot, ce n\\'est pas toi.')); return; }
   const groups = {};
   for (const a of acts) (groups[a.tool] ||= []).push(a);
@@ -707,6 +710,25 @@ function renderActions(root) {
     }
     root.appendChild(box);
   }
+}
+
+function doneList(root) {
+  const list = D.doneActions || [];
+  if (!list.length) { root.appendChild(el('div', 'empty', 'Rien de coché pour le moment.')); return; }
+  const box = el('div', 'thread');
+  box.appendChild(el('div', 'tool', '<b>Fait</b><span>' + list.length + ' action' +
+    (list.length > 1 ? 's' : '') + ' cochées — journalisées dans leur ticket</span>'));
+  for (const a of list) {
+    const row = el('div', 'act');
+    row.innerHTML = '<input type="checkbox" checked disabled>' +
+      '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
+      '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.date + '</span>' +
+      '<span>' + escape(a.tool) + '</span></span></span>';
+    row.style.opacity = '.6';
+    row.querySelector('.id').onclick = () => openTicket(a.id);
+    box.appendChild(row);
+  }
+  root.appendChild(box);
 }
 
 const DONE = new Set();
@@ -771,6 +793,12 @@ function render() {
   localStorage.setItem('tks.hidden', JSON.stringify([...hidden]));
   localStorage.setItem('tks.hiddenP', JSON.stringify([...hiddenP]));
   localStorage.setItem('tks.hiddenL', JSON.stringify([...hiddenL]));
+  localStorage.setItem('tks.hiddenA', JSON.stringify([...hiddenA]));
+  // chaque vue ne montre que les filtres qui la concernent
+  // la roadmap mesure l'avancement RÉEL : la filtrer fausserait ses barres
+  document.querySelector('.filters').hidden = view === 'actions' || view === 'roadmap';
+  document.querySelector('#afilters').hidden = view !== 'actions';
+  for (const c of document.querySelectorAll('.chip[data-act]')) c.setAttribute('aria-pressed', String(!hiddenA.has(c.dataset.act)));
   for (const b of document.querySelectorAll('.tab')) b.setAttribute('aria-selected', String(b.dataset.view === view));
   for (const c of document.querySelectorAll('.chip[data-status]')) c.setAttribute('aria-pressed', String(!hidden.has(c.dataset.status)));
   for (const c of document.querySelectorAll('.chip[data-prio]')) c.setAttribute('aria-pressed', String(!hiddenP.has(c.dataset.prio)));
@@ -792,6 +820,8 @@ for (const c of document.querySelectorAll('.chip[data-prio]'))
   c.onclick = () => { const p = c.dataset.prio; hiddenP.has(p) ? hiddenP.delete(p) : hiddenP.add(p); render(); };
 for (const c of document.querySelectorAll('.chip[data-layer]'))
   c.onclick = () => { const l = c.dataset.layer; hiddenL.has(l) ? hiddenL.delete(l) : hiddenL.add(l); render(); };
+for (const c of document.querySelectorAll('.chip[data-act]'))
+  c.onclick = () => { const a = c.dataset.act; hiddenA.has(a) ? hiddenA.delete(a) : hiddenA.add(a); render(); };
 document.querySelector('#q').oninput = ev => { q = ev.target.value.trim().toLowerCase(); render(); };
 document.querySelector('#theme').onclick = () => {
   const cur = document.documentElement.dataset.theme ||
@@ -826,6 +856,12 @@ function renderHtml({ tickets, epics }, { live }) {
     edges: edges(tickets),
     labels: STATUS_LABEL,
     actions: actions(tickets),
+    doneActions: tickets.flatMap((t) => [...t.body.matchAll(/^- ✅ (\d{4}-\d{2}-\d{2}) — (.+)$/gm)].map((m) => {
+      const i = m[2].indexOf('—');
+      return { id: t.id, icon: t.icon, date: m[1],
+        tool: i < 0 ? 'divers' : m[2].slice(0, i).trim(),
+        text: i < 0 ? m[2].trim() : m[2].slice(i + 1).trim() };
+    })).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id)),
     live,
     bodies: Object.fromEntries(tickets.map((t) => [t.id, md(t.body)])),
     epicBodies: Object.fromEntries(epics.map((e) => [e.id, md(e.body)])),
@@ -863,6 +899,10 @@ function renderHtml({ tickets, epics }, { live }) {
     <span style="width:10px"></span>
     ${[...new Set(tickets.map((t) => t.layer).filter(Boolean))].sort()
       .map((l) => `<button class="chip" data-layer="${l}">${l}</button>`).join('\n    ')}
+  </div>
+  <div class="filters" id="afilters" hidden>
+    <button class="chip" data-act="todo">À faire</button>
+    <button class="chip" data-act="done">Fait</button>
   </div>
   <div id="root"></div>
 </main>
