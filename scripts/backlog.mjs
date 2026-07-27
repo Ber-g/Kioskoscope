@@ -198,7 +198,28 @@ function gitHistory({ max = 400 } = {}) {
   return {
     commits: commits.map((c) => ({ H: c.H, h: c.h, col: c.col, parents: c.parents, author: c.author, date: c.date, refs: c.refs, subject: c.subject })),
     edges: edgeList, laneCount, merges, truncated: commits.length >= max,
+    activity: gitActivity(),
   };
+}
+
+/**
+ * Activité par jour = nombre de commits/jour, sur ~53 semaines glissantes. KPI le moins
+ * coûteux qu'on tire de git : on ne lit que la DATE de chaque commit (`--pretty=%ad`),
+ * jamais le contenu — donc pas d'analyse de diff. Sert de « heatmap de contributions ».
+ * Renvoie une carte { 'YYYY-MM-DD': n }, ou null hors dépôt git.
+ */
+function gitActivity({ weeks = 53 } = {}) {
+  const since = new Date(Date.now() - weeks * 7 * 86_400_000).toISOString().slice(0, 10);
+  let raw;
+  try {
+    raw = execFileSync('git', ['log', '--all', `--since=${since}`, '--pretty=format:%ad', '--date=format:%Y-%m-%d'],
+      { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    return null;
+  }
+  const counts = {};
+  for (const line of raw.split('\n')) { const d = line.trim(); if (d) counts[d] = (counts[d] || 0) + 1; }
+  return counts;
 }
 
 /** Une arête déclarée d'un seul côté vaut des deux : on ne veut pas d'un graphe qui dépend du sens de saisie. */
@@ -538,6 +559,15 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 .ghref.tag{border-color:var(--p2);color:var(--p2);background:color-mix(in srgb,var(--p2) 10%,transparent)}
 .ghsub{font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
 .ghmeta{margin-left:auto;font-size:11px;color:var(--muted);flex:none;font-variant-numeric:tabular-nums}
+.ghcal{margin-bottom:18px}
+.ghcalhead{display:flex;align-items:center;gap:12px;margin-bottom:4px;flex-wrap:wrap}
+.ghcaltitle{color:var(--muted);font-size:12px}
+.callab{fill:var(--muted);font-size:8px}
+.calsvg{width:100%;display:block}
+.calcell{stroke:var(--panel);stroke-width:1}
+.callegend{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:11px;margin-left:auto}
+.calkeys{display:inline-flex;gap:3px}
+.calkey{width:12px;height:12px;border-radius:2.5px;display:inline-block}
 @media (max-width:900px){.board{grid-template-columns:1fr 1fr}}
 @media (max-width:560px){.board{grid-template-columns:1fr}main{padding:14px}}
 `;
@@ -736,8 +766,77 @@ const relTime = iso => {
 const matchCommit = c => { if (!q) return true;
   return (c.h + ' ' + c.subject + ' ' + c.author + ' ' + c.refs.join(' ')).toLowerCase().includes(q); };
 
+// Calendrier d'activité (heatmap de contributions, façon GitHub) : commits/jour sur ~53
+// semaines. Pleine largeur : les carrés restent PETITS et carrés, c'est leur espacement
+// horizontal qui s'étire pour occuper toute la largeur (mesurée au rendu + au resize).
+// Intensité relative au jour le plus actif → dégradé bleu clair (#87d4f2) vers magenta.
+const CAL_COLORS = ['rgba(130,130,145,.16)', '#87d4f2', '#a59bd7', '#c363bb', '#e12aa0'];
+const DOW_FR = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
+const MON_FR = ['janv', 'févr', 'mars', 'avr', 'mai', 'juin', 'juil', 'août', 'sept', 'oct', 'nov', 'déc'];
+const mondayRow = d => (d.getDay() + 6) % 7; // Lun=0 … Dim=6
+let calRelayout = null; // réexécuté au resize pour re-répartir les colonnes
+
+function commitCalendar(counts) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - (52 * 7 + mondayRow(today))); // recule jusqu'à un lundi
+  const days = [];
+  for (const d = new Date(start); d <= today; d.setDate(d.getDate() + 1)) {
+    const key = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    days.push({ key, date: new Date(d), count: counts[key] || 0 });
+  }
+  const max = Math.max(1, ...days.map(x => x.count));
+  const weeks = Math.ceil(days.length / 7);
+
+  const svg = svgEl('svg', { class: 'calsvg' }); // largeur 100 % via CSS ; hauteur posée au layout
+  // Répartition : la largeur d'une colonne = largeur dispo / nb semaines. Les carrés gardent
+  // une petite taille fixe (≤ 10 px, hauteur totale ≤ ~100 px) et sont centrés dans leur colonne.
+  const layout = () => {
+    const Wpx = Math.round(svg.getBoundingClientRect().width);
+    if (!Wpx) return;
+    const LEFT = 22, TOP = 12, ROWGAP = 3;
+    const colStep = (Wpx - LEFT) / weeks;
+    const CELL = Math.max(6, Math.min(9, Math.floor(colStep) - 2));
+    const rowStep = CELL + ROWGAP;
+    const H = TOP + 7 * rowStep;
+    svg.setAttribute('viewBox', '0 0 ' + Wpx + ' ' + H);
+    svg.setAttribute('height', H);
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    let lastMonth = -1;
+    days.forEach((x, i) => {
+      const col = Math.floor(i / 7), row = mondayRow(x.date);
+      const lvl = x.count === 0 ? 0 : Math.min(4, Math.ceil(x.count / max * 4)); // 0 = rien ; 1..4 = quartiles
+      const cx = LEFT + col * colStep + (colStep - CELL) / 2;
+      const rect = svgEl('rect', { x: cx, y: TOP + row * rowStep, width: CELL, height: CELL, rx: 2, fill: CAL_COLORS[lvl], class: 'calcell' });
+      const t = svgEl('title', {}); t.textContent = x.count + (x.count === 1 ? ' commit' : ' commits') + ' · ' + x.key;
+      rect.appendChild(t); svg.appendChild(rect);
+      if (row === 0 && x.date.getMonth() !== lastMonth) {
+        lastMonth = x.date.getMonth();
+        const lab = svgEl('text', { x: cx, y: TOP - 4, class: 'callab' }); lab.textContent = MON_FR[lastMonth]; svg.appendChild(lab);
+      }
+    });
+    for (const r of [0, 2, 4]) { const lab = svgEl('text', { x: 0, y: TOP + r * rowStep + CELL - 1, class: 'callab' }); lab.textContent = DOW_FR[r]; svg.appendChild(lab); }
+  };
+  calRelayout = layout;
+  requestAnimationFrame(layout);
+
+  const total = days.reduce((n, x) => n + x.count, 0), active = days.filter(x => x.count).length;
+  const legend = el('span', 'callegend', 'Moins');
+  const keys = el('span', 'calkeys');
+  for (const c of CAL_COLORS) { const s = el('span', 'calkey'); s.style.background = c; keys.appendChild(s); }
+  legend.appendChild(keys); legend.appendChild(document.createTextNode('Plus'));
+  const head = el('div', 'ghcalhead');
+  head.appendChild(el('span', 'ghcaltitle', total + ' commits · ' + active + ' jour' + (active > 1 ? 's' : '') + ' actif' + (active > 1 ? 's' : '') + ' · 53 sem.'));
+  head.appendChild(legend);
+  const wrap = el('div', 'ghcal');
+  wrap.appendChild(head); wrap.appendChild(svg);
+  return wrap;
+}
+addEventListener('resize', () => { if (calRelayout) requestAnimationFrame(calRelayout); });
+
 function renderHistory(root) {
   if (!G || !G.commits.length) { root.appendChild(el('div', 'empty', 'Aucun historique git dans ce dossier.')); return; }
+  if (G.activity) root.appendChild(commitCalendar(G.activity));
   const ROW = 30, COLW = 20, PADX = 20, PADY = 16, R = 4.5;
   const rowOf = {}; G.commits.forEach((c, i) => rowOf[c.H] = i);
   const X = col => PADX + col * COLW, Y = i => PADY + i * ROW + ROW / 2;
