@@ -174,3 +174,5 @@ booth-client/samples/*.mp4
 /COMPTES-LOCAL.md
 # Archive QA (append-only) — local, non public.
 /QA-LOG.md
+# Note de collaboration (parle d'une personne réelle) — local, non public.
+/MyHumanReport.md
