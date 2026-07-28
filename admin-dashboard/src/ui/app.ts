@@ -12,7 +12,7 @@ import { revenuePage } from "./revenue";
 import { maintenancePage } from "./maintenance";
 import { rightsPage } from "./rights";
 import { sessionsPage } from "./sessions";
-import { settingsPage } from "./settings";
+import { settingsPage, resetSettingsNav } from "./settings";
 import { fleetPage } from "./fleet";
 import { organizationsPage } from "./organizations";
 import { boothHubPage, type HubTab } from "./boothHub";
@@ -75,6 +75,59 @@ export class App {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       if (this.themePref === "system") this.applyTheme();
     });
+    // CIN-117 : revenir sur l'onglet remet les données à jour. C'est le moment où l'opérateur
+    // REGARDE — donc celui où la fraîcheur compte. Pas de `setInterval` : un onglet laissé
+    // ouvert toute la journée n'a aucune raison d'interroger la base dans le vide.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") this.autoRefresh();
+    });
+  }
+
+  // ── Rafraîchissement automatique (CIN-117) ────────────────────────────────────
+  private lastRefreshAt = 0;
+  /** Deux gestes rapprochés (retour d'onglet puis changement de vue) ne font qu'une requête. */
+  private static readonly REFRESH_MIN_INTERVAL_MS = 10_000;
+
+  /**
+   * Un rechargement est-il SÛR à cet instant ?
+   *
+   * ⚠️ Garde héritée de BUG-006 : tout `emit()` du store reconstruit la page. Un formulaire dont
+   * l'état vit dans la closure de sa fonction de rendu perd donc sa saisie. Seul
+   * `orgStyleSettings` a été immunisé (map `DRAFTS` hors cycle de rendu) — partout ailleurs, un
+   * rafraîchissement déclenché pendant une saisie REJOUERAIT le bug, et cette fois au hasard,
+   * ce qui est bien pire qu'un bug reproductible.
+   *
+   * On s'abstient donc dès qu'il y a le moindre signe d'édition en cours. Un rafraîchissement
+   * manqué est invisible ; une saisie perdue ne l'est pas.
+   */
+  private canAutoRefresh(): boolean {
+    if (this.store.isBooting || this.store.needsAuth) return false;
+    // Modale ou tiroir ouvert = geste en cours (formulaire cabine, média, accès opérateur…).
+    if (document.querySelector(".modal.show, .offcanvas.show")) return false;
+    // Champ en cours de saisie.
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLInputElement ||
+      active instanceof HTMLTextAreaElement ||
+      active instanceof HTMLSelectElement
+    ) {
+      return false;
+    }
+    // Mode « édition de la disposition » (Gridstack) : re-rendre casserait le glisser-déposer.
+    if (this.editing) return false;
+    return Date.now() - this.lastRefreshAt >= App.REFRESH_MIN_INTERVAL_MS;
+  }
+
+  /** Recharge si c'est sûr. Silencieux par construction : jamais d'erreur à l'écran ici. */
+  private autoRefresh(): void {
+    if (!this.canAutoRefresh()) return;
+    this.lastRefreshAt = Date.now();
+    void this.store.refresh().catch((e: unknown) => {
+      // Un rafraîchissement d'arrière-plan qui échoue ne doit RIEN changer à l'écran : les
+      // données affichées restent les dernières connues. `loadFromSupabase` gère déjà le cas
+      // « impossible de vérifier l'identité » sans déconnecter (BUG-010).
+      console.error("[dashboard] rafraîchissement automatique échoué —", e);
+    });
   }
 
   /** Point d'entrée : lance le chargement (async) puis rend. */
@@ -83,14 +136,28 @@ export class App {
     void this.store.init();
   }
 
+  /** Écran d'attente neutre — n'affirme ni « connecté » ni « pas connecté ». */
+  private static loadingScreen(): HTMLElement {
+    return el("div", { class: "page page-center" }, [el("div", { class: "text-secondary p-5" }, ["Chargement…"])]);
+  }
+
   render(): void {
+    // CIN-118 : tant que `getSession()` n'a pas répondu, on ne SAIT PAS si l'utilisateur est
+    // connecté. Cette branche doit passer AVANT `needsAuth`, sinon le premier rendu (synchrone,
+    // déclenché par `start()` avant que `init()` n'ait pu répondre) affiche l'écran de connexion
+    // à quelqu'un dont la session est valide — c'est ce qui renvoyait au login à chaque
+    // rechargement, et à chaque appui sur le bouton Retour du navigateur.
+    if (this.store.isBooting) {
+      this.root.replaceChildren(App.loadingScreen());
+      return;
+    }
     // Mode Supabase : connexion requise, ou chargement en cours.
     if (this.store.needsAuth) {
       this.root.replaceChildren(loginScreen(this.store));
       return;
     }
     if (!this.store.current) {
-      this.root.replaceChildren(el("div", { class: "page page-center" }, [el("div", { class: "text-secondary p-5" }, ["Chargement…"])]));
+      this.root.replaceChildren(App.loadingScreen());
       return;
     }
     this.maybeAcceptInvite();
@@ -134,13 +201,19 @@ export class App {
     // Quitter le menu « Organisation » relâche la cible d'administration : y revenir plus tard
     // par le menu doit rouvrir SA propre org, pas la dernière org inspectée en super-admin.
     if (v !== "settings") this.adminOrgId = null;
+    // BUG-006 : la navigation du menu Organisation survit désormais aux re-renders. Elle doit
+    // donc être remise à zéro ICI — sur une navigation EXPLICITE — et nulle part ailleurs.
+    else resetSettingsNav();
     this.render();
+    // CIN-117 : changer de vue est un bon moment pour rafraîchir (on quitte ce qu'on éditait).
+    this.autoRefresh();
   }
 
   /** Ouvre la page d'administration d'une organisation (CIN-091 b) : le hub `settings` ciblé. */
   private openOrgAdmin(orgId: string): void {
     this.adminOrgId = orgId;
     this.view = "settings";
+    resetSettingsNav(); // arrivée explicite depuis le roster → on ouvre sur « Général »
     this.render();
   }
 

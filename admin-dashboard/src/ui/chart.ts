@@ -20,9 +20,18 @@ export interface ChartOptions {
   readonly formatValue: (n: number) => string;
 }
 
-const W = 640;
+/**
+ * Largeur de repli, utilisée au tout premier rendu — avant que l'élément soit attaché au DOM,
+ * sa largeur réelle est inconnue (0). Le `ResizeObserver` corrige dès l'attachement.
+ */
+const W_FALLBACK = 640;
 const H = 180;
-const PAD = { top: 16, right: 12, bottom: 24, left: 40 };
+// `left` = gouttière du label d'axe Y. Il est posé à `left - 6` avec `text-anchor:"end"`, donc il
+// s'étend vers la GAUCHE : trop étroite, la gouttière fait sortir les valeurs à 4+ chiffres du
+// `viewBox`, où elles sont rognées (BUG-012). 48 laisse la place à « 12 345 » à 10 px.
+const PAD = { top: 16, right: 12, bottom: 24, left: 48 };
+/** En deçà, la zone de tracé n'a plus de sens ; on garde un plancher plutôt qu'un dessin inversé. */
+const PLOT_W_MIN = 40;
 
 function shortDate(iso: string): string {
   const [, m, d] = iso.split("-");
@@ -39,19 +48,10 @@ export function timeSeriesChart(opts: ChartOptions): HTMLElement {
   }
   const maxV = Math.max(1, ...pts.map((p) => p.value));
 
-  const plotW = W - PAD.left - PAD.right;
-  const plotH = H - PAD.top - PAD.bottom;
-  const x = (i: number): number => PAD.left + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
-  const y = (v: number): number => PAD.top + plotH - (v / maxV) * plotH;
-
-  const line = pts.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" ");
-  const area = `${line} L${x(n - 1).toFixed(1)},${(PAD.top + plotH).toFixed(1)} L${x(0).toFixed(1)},${(PAD.top + plotH).toFixed(1)} Z`;
-
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
-  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   svg.setAttribute("width", "100%");
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  svg.setAttribute("height", String(H));
   svg.classList.add("ts-chart");
 
   const mk = (tag: string, attrs: Record<string, string>): SVGElement => {
@@ -60,38 +60,89 @@ export function timeSeriesChart(opts: ChartOptions): HTMLElement {
     return node;
   };
 
-  const label = (attrs: Record<string, string>, text: string): void => {
-    const t = mk("text", attrs);
-    t.textContent = text;
-    svg.append(t);
-  };
-  // Grille horizontale discrète (0, mid, max) + libellés Y.
-  for (const frac of [0, 0.5, 1]) {
-    const gy = PAD.top + plotH - frac * plotH;
-    svg.append(mk("line", { x1: String(PAD.left), y1: String(gy), x2: String(W - PAD.right), y2: String(gy), class: "ts-grid" }));
-    label({ x: String(PAD.left - 6), y: String(gy + 4), class: "ts-axis", "text-anchor": "end" }, opts.formatValue(Math.round(frac * maxV)));
-  }
-  // Libellés X : premier, milieu, dernier.
-  for (const i of [0, Math.floor((n - 1) / 2), n - 1]) {
-    label({ x: String(x(i)), y: String(H - 6), class: "ts-axis", "text-anchor": "middle" }, shortDate(pts[i]!.date));
-  }
-
-  if (opts.kind === "area") {
-    svg.append(mk("path", { d: area, class: "ts-area", style: `fill:${opts.hue}` }));
-  }
-  svg.append(mk("path", { d: line, class: "ts-line", style: `stroke:${opts.hue}` }));
-
-  // Couche de survol : crosshair + point + infobulle.
-  const cross = mk("line", { class: "ts-cross", y1: String(PAD.top), y2: String(PAD.top + plotH), style: "display:none" });
-  const dot = mk("circle", { class: "ts-dot", r: "4", style: `fill:${opts.hue};display:none` });
-  svg.append(cross, dot);
-
   const tooltip = el("div", { class: "ts-tooltip" }, []);
   const wrap = el("div", { class: "ts-wrap" }, [
     el("div", { class: "ts-title" }, [opts.title]),
     svg,
     tooltip,
   ]);
+
+  /*
+   * BUG-012 — pourquoi le graphe se redessine au lieu d'être mis à l'échelle.
+   *
+   * Avant : `viewBox="0 0 640 180"` + `width="100%"` sans hauteur. Le SVG entier était donc
+   * étiré par `largeurConteneur / 640` — y compris la typographie des axes, qui est en unités
+   * utilisateur. Dans une carte de ~1100 px le facteur valait ≈1,7 : des libellés de 10 px
+   * s'affichaient à ~17 px, et le libellé d'axe Y sortait du `viewBox` où il était rogné.
+   * Figer la hauteur supprimait l'agrandissement, mais laissait du vide sous la courbe dans
+   * les cartes étroites (tiroir, hub cabine) et n'y rendait pas les libellés plus lisibles.
+   *
+   * Maintenant : le `viewBox` épouse la largeur RÉELLE du conteneur, donc **1 unité utilisateur
+   * = 1 pixel CSS**, à toute largeur. Plus aucune mise à l'échelle : la typo fait exactement la
+   * taille demandée par la CSS (`.ts-axis`, 10 px), le graphe remplit sa carte, et le tracé se
+   * redessine sur redimensionnement (fenêtre, ouverture du tiroir, bascule de colonnes).
+   */
+  let w = W_FALLBACK;
+  const plotH = H - PAD.top - PAD.bottom;
+  let plotW = Math.max(PLOT_W_MIN, w - PAD.left - PAD.right);
+  const x = (i: number): number => PAD.left + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+  const y = (v: number): number => PAD.top + plotH - (v / maxV) * plotH;
+
+  // Recréés à chaque tracé : les gestionnaires de survol doivent viser les noeuds COURANTS.
+  let cross = mk("line", {});
+  let dot = mk("circle", {});
+
+  const draw = (): void => {
+    plotW = Math.max(PLOT_W_MIN, w - PAD.left - PAD.right);
+    svg.setAttribute("viewBox", `0 0 ${w} ${H}`);
+    svg.replaceChildren();
+
+    const line = pts.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" ");
+    const area = `${line} L${x(n - 1).toFixed(1)},${(PAD.top + plotH).toFixed(1)} L${x(0).toFixed(1)},${(PAD.top + plotH).toFixed(1)} Z`;
+
+    const label = (attrs: Record<string, string>, text: string): void => {
+      const t = mk("text", attrs);
+      t.textContent = text;
+      svg.append(t);
+    };
+    // Grille horizontale discrète (0, mid, max) + libellés Y.
+    for (const frac of [0, 0.5, 1]) {
+      const gy = PAD.top + plotH - frac * plotH;
+      svg.append(mk("line", { x1: String(PAD.left), y1: String(gy), x2: String(w - PAD.right), y2: String(gy), class: "ts-grid" }));
+      label({ x: String(PAD.left - 6), y: String(gy + 4), class: "ts-axis", "text-anchor": "end" }, opts.formatValue(Math.round(frac * maxV)));
+    }
+    // Libellés X : premier, milieu, dernier.
+    for (const i of [0, Math.floor((n - 1) / 2), n - 1]) {
+      label({ x: String(x(i)), y: String(H - 6), class: "ts-axis", "text-anchor": "middle" }, shortDate(pts[i]!.date));
+    }
+
+    if (opts.kind === "area") {
+      svg.append(mk("path", { d: area, class: "ts-area", style: `fill:${opts.hue}` }));
+    }
+    svg.append(mk("path", { d: line, class: "ts-line", style: `stroke:${opts.hue}` }));
+
+    // Couche de survol : crosshair + point + infobulle.
+    cross = mk("line", { class: "ts-cross", y1: String(PAD.top), y2: String(PAD.top + plotH), style: "display:none" });
+    dot = mk("circle", { class: "ts-dot", r: "4", style: `fill:${opts.hue};display:none` });
+    svg.append(cross, dot);
+  };
+
+  draw();
+
+  // Le graphe suit la largeur de sa carte. `ResizeObserver` plutôt qu'un écouteur `resize` de
+  // fenêtre : la carte change aussi de largeur SANS que la fenêtre bouge (ouverture du tiroir,
+  // bascule de colonnes, repli de la barre latérale).
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver((entries) => {
+      const next = Math.round(entries[0]?.contentRect.width ?? 0);
+      // Le seuil d'1 px évite une boucle de redessin sur des largeurs fractionnaires.
+      if (next > 0 && Math.abs(next - w) >= 1) {
+        w = next;
+        draw();
+      }
+    });
+    ro.observe(wrap);
+  }
 
   const onMove = (evt: PointerEvent): void => {
     const rect = svg.getBoundingClientRect();
@@ -106,7 +157,7 @@ export function timeSeriesChart(opts: ChartOptions): HTMLElement {
     dot.setAttribute("cy", String(py));
     dot.setAttribute("style", `fill:${opts.hue}`);
     tooltip.textContent = `${shortDate(pts[i]!.date)} · ${opts.formatValue(pts[i]!.value)}`;
-    tooltip.style.left = `${(px / W) * 100}%`;
+    tooltip.style.left = `${(px / w) * 100}%`;
     tooltip.classList.add("is-visible");
   };
   const onLeave = (): void => {

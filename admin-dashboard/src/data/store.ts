@@ -327,6 +327,15 @@ export class FleetStore {
   private orgStyles = new Map<string, OrgStyle>();
   private identity: CurrentIdentity | null = null;
   private authed = false;
+  /**
+   * Vrai tant que `init()` n'a pas répondu (CIN-118).
+   *
+   * `getSession()` est asynchrone : entre le premier rendu et sa réponse, on ne SAIT PAS si
+   * l'utilisateur est connecté. Afficher l'écran de connexion pendant cet intervalle est une
+   * affirmation fausse — c'est ce qui renvoyait au login à chaque rechargement de page, alors
+   * que la session était parfaitement valide. « Je ne sais pas encore » ≠ « pas connecté ».
+   */
+  private booting = true;
   private listeners = new Set<Listener>();
 
   subscribe(fn: Listener): void {
@@ -337,7 +346,23 @@ export class FleetStore {
   }
 
   // ── Initialisation (async) ──────────────────────────────────────────────────
+  /** Vrai tant que la restauration de session n'a pas répondu (CIN-118). */
+  get isBooting(): boolean {
+    return this.booting;
+  }
+
   async init(): Promise<void> {
+    try {
+      await this.bootstrap();
+    } finally {
+      // `finally` : même si la restauration échoue, on doit SORTIR de l'état « je ne sais pas ».
+      // Rester bloqué sur « Chargement… » serait pire que d'afficher l'écran de connexion.
+      this.booting = false;
+      this.emit();
+    }
+  }
+
+  private async bootstrap(): Promise<void> {
     if (this.mode === "mock") {
       this.booths = this.loadMockBooths();
       this.orgs = MOCK_ORGS.map((o) => ({
@@ -364,6 +389,22 @@ export class FleetStore {
     await this.loadFromSupabase();
     return { ok: true };
   }
+  /**
+   * Recharge les données depuis Supabase (CIN-117).
+   *
+   * Le back-office n'avait AUCUN rafraîchissement : `loadFromSupabase()` ne tournait qu'à la
+   * connexion et après une écriture. Une séance jouée en cabine restait donc invisible jusqu'à
+   * un F5 — alors que le SPEC promet à l'opérateur de savoir « en temps réel » si une cabine
+   * fonctionne.
+   *
+   * Ne fait rien hors mode Supabase authentifié : en mock il n'y a rien à recharger.
+   * L'appelant est responsable de vérifier qu'un rechargement est SÛR (cf. `App.canAutoRefresh`).
+   */
+  async refresh(): Promise<void> {
+    if (this.mode !== "supabase" || !this.authed) return;
+    await this.loadFromSupabase();
+  }
+
   async signOut(): Promise<void> {
     await supabase!.auth.signOut();
     this.authed = false;

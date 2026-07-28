@@ -26,6 +26,34 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly?: boolean }> = [
   { key: "subscription", label: "Souscription & modules", adminOnly: true },
 ];
 
+/**
+ * Navigation de la page (onglet actif + org affichée), conservée HORS du cycle de rendu.
+ *
+ * BUG-006, seconde moitié. Cet état vivait dans la closure de `settingsPage()` : comme toute
+ * écriture du store rappelle `loadFromSupabase()` → `emit()` → `App.render()`, la page était
+ * reconstruite et l'onglet **repartait sur « Général »**. Concrètement : on téléversait un logo
+ * depuis « Mes styles » et on se retrouvait éjecté sur « Général ».
+ *
+ * L'effet était pire qu'un simple désagrément de navigation. Les couleurs en cours de saisie sont
+ * un BROUILLON qui attend « Enregistrer » (cf. `DRAFTS` dans `orgStyleSettings`), alors qu'un
+ * asset est écrit en base dès l'envoi. Être éjecté empêchait donc d'atteindre le bouton
+ * d'enregistrement : le brouillon survivait en mémoire, mais l'opérateur croyait sa couleur perdue.
+ *
+ * Même remède que `DRAFTS`, même raison : ce qui doit survivre au re-render vit hors du rendu.
+ */
+const NAV: { tab: Tab; orgId: string | null } = { tab: "general", orgId: null };
+
+/**
+ * Réinitialise la navigation du menu Organisation.
+ *
+ * À appeler à l'ENTRÉE EXPLICITE dans la page (clic de menu, ouverture d'une org depuis le
+ * roster) — jamais depuis un re-render, sinon on réintroduit exactement le bug ci-dessus.
+ */
+export function resetSettingsNav(): void {
+  NAV.tab = "general";
+  NAV.orgId = null;
+}
+
 /** Rôles attribuables à un accès opérateur cabine (global_admin = plateforme, non créé ici). */
 export const OPERATOR_ROLE_LABELS: Record<OperatorRole, string> = {
   operator: "Opérateur",
@@ -74,10 +102,13 @@ export function settingsPage(
   // On ne fait confiance à `targetOrgId` que s'il désigne une org réellement visible : un id
   // périmé (org supprimée entre-temps) ne doit pas produire une page vide et muette.
   const target = targetOrgId && orgs.some((o) => o.id === targetOrgId) ? targetOrgId : null;
-  const state = {
-    tab: "general" as Tab,
-    orgId: target ?? store.current?.activeOrganizationId ?? orgs[0]?.id ?? null,
-  };
+  // Navigation persistée hors du rendu (voir `NAV`). `resetSettingsNav()` l'a remise à zéro si
+  // l'on ARRIVE sur la page ; ici on ne fait que compléter ce qui n'est pas encore résolu.
+  const state = NAV;
+  // Une org mémorisée qui n'existe plus (supprimée, ou droits perdus depuis) ne doit pas
+  // produire une page vide et muette : on retombe sur la résolution par défaut.
+  if (state.orgId && !orgs.some((o) => o.id === state.orgId)) state.orgId = null;
+  state.orgId ??= target ?? store.current?.activeOrganizationId ?? orgs[0]?.id ?? null;
 
   const container = el("div", {}, []);
   const render = (): void => {
@@ -103,6 +134,9 @@ export function settingsPage(
     const lockPath = "M6 11V7a4 4 0 0 1 8 0v4M5 11h10a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1H5a1 1 0 0 1 -1 -1v-6a1 1 0 0 1 1 -1z";
 
     const visibleTabs = TABS.filter((t) => !t.adminOnly || store.isGlobalAdmin);
+    // L'onglet mémorisé peut avoir disparu entre-temps (perte du rôle global_admin sur un onglet
+    // `adminOnly`) : sans ce garde-fou, la page afficherait un contenu sans onglet actif visible.
+    if (!visibleTabs.some((t) => t.key === state.tab)) state.tab = "general";
     const tabsNav = el(
       "ul",
       { class: "nav nav-tabs mb-3" },
