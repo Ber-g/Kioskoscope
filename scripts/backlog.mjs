@@ -11,6 +11,8 @@
  *   node backlog.mjs                → régénère BACKLOG.md + backlog.html
  *   node backlog.mjs --serve        → http://localhost:4321, auto-reload sur modification
  *   node backlog.mjs --init         → crée un dossier backlog/ d'exemple
+ *   node backlog.mjs --ack <ID> "…" → marque les remarques d'un ticket prises en compte
+ *   node backlog.mjs --help         → l'usage, sans rien écrire
  *
  * Options : --dir <backlog> --out <.> --port <4321>
  */
@@ -38,6 +40,18 @@ const PRIORITIES = ['P0', 'P1', 'P2', 'P3'];
 // Un pictogramme par préfixe d'identifiant — à adapter par projet. Le fallback vaut pour tout le reste.
 const ACTION_TOOLS = ['supabase','cloudflare','borne','navigateur','git','contenu','recette','matériel'];
 const TYPE_ICON = { BUG: '🐛', SEC: '🔒', DOC: '📄', CIN: '🎬', _: '🎫' };
+
+/**
+ * Fichiers du dossier backlog/ qui ne sont PAS des tickets.
+ *
+ * Le dossier est balayé par extension : sans cette liste, un `PROTOCOLE.md` ou un
+ * `README.md` déposé à côté des tickets deviendrait un ticket fantôme « (sans hook) »,
+ * compté dans l'index et signalé en avertissement à chaque génération.
+ */
+const NOT_A_TICKET = new Set(['PROTOCOLE.md', 'README.md', 'A-TRANCHER.md']);
+
+/** Le sas : des remarques qui n'ont pas encore de ticket. Voir `readTriage`. */
+const TRIAGE_FILE = 'A-TRANCHER.md';
 
 // ─────────────────────────────────────────────────────────── lecture
 
@@ -72,7 +86,7 @@ function read() {
   }
   const warnings = [];
   const tickets = [];
-  for (const f of readdirSync(DIR).filter((f) => f.endsWith('.md')).sort()) {
+  for (const f of readdirSync(DIR).filter((f) => f.endsWith('.md') && !NOT_A_TICKET.has(f)).sort()) {
     const [meta, body, w] = parseFrontmatter(readFileSync(join(DIR, f), 'utf8'), f);
     warnings.push(...w);
     const id = meta.id || basename(f, '.md');
@@ -272,6 +286,43 @@ function byTool(list) {
   return Object.entries(g).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
 }
 
+/**
+ * Les remarques écrites et pas encore prises en compte, tous tickets confondus.
+ *
+ * Cette donnée existait déjà — `parseJournal` pose `pending`, et la page web s'en sert
+ * pour son badge — mais elle n'était écrite NULLE PART dans `BACKLOG.md`. Or l'index est
+ * le seul fichier qu'un agent a pour consigne de lire au démarrage : une remarque était
+ * donc invisible à qui suivait la consigne, et introuvable autrement qu'en fouillant le
+ * code du générateur. C'est ce que ça corrige.
+ *
+ * Le VERBATIM remonte, pas un compteur : « 2 remarques en attente » obligerait à rouvrir
+ * chaque ticket, c'est-à-dire à repayer exactement le coût qu'on supprime ici.
+ *
+ * Ordre : ticket dont la remarque est la plus récente d'abord. Reprendre un fil, c'est
+ * chercher ce qui vient de se dire — pas ce qui est le plus prioritaire.
+ */
+function pendingRemarks(tickets) {
+  const groups = [];
+  for (const t of tickets) {
+    const items = parseJournal(t.body)
+      .filter((e) => e.pending)
+      // `💬` porte sa remarque sur la ligne même ; `✅` la porte dans ses lignes `>`,
+      // et son texte n'est alors que l'action à laquelle elle est accrochée.
+      .map((e) => ({
+        kind: e.kind,
+        date: e.date,
+        text: (e.kind === 'comment' ? [e.text, e.comment].filter(Boolean).join(' — ') : e.comment)
+          .replace(/\s*\n\s*/g, ' · ').trim(),
+        about: e.kind === 'action' ? e.text : '',
+      }));
+    if (items.length) {
+      groups.push({ id: t.id, icon: t.icon, priority: t.priority, items,
+        last: items.reduce((m, e) => (e.date > m ? e.date : m), '') });
+    }
+  }
+  return groups.sort((a, b) => b.last.localeCompare(a.last) || a.id.localeCompare(b.id));
+}
+
 // ─────────────────────────────────────────────────────────── markdown minimal
 
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -360,6 +411,26 @@ const ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const byEpicPrioId = (a, b) =>
   (a.epic || 'zzz').localeCompare(b.epic || 'zzz') || ORDER[a.priority] - ORDER[b.priority] || a.id.localeCompare(b.id);
 
+/**
+ * Borne le verbatim d'une remarque dans l'index.
+ *
+ * ⚠️ Trouvé en conditions réelles, pas en théorie : une remarque contenant un log de test
+ * collé faisait une ligne d'index de plus de 2 000 caractères — et l'index est précisément
+ * la surface qu'on garde compacte. Le texte entier reste dans le ticket, qui est fait pour
+ * ça ; l'index n'en porte que de quoi reconnaître de quoi il s'agit.
+ *
+ * Coupé sur une frontière de mot, sinon la troncature tombe au milieu d'un identifiant et
+ * l'aperçu devient illisible là où il devait aider.
+ */
+const INDEX_QUOTE_MAX = 180;
+function quoteForIndex(text) {
+  const s = String(text ?? '').trim();
+  if (s.length <= INDEX_QUOTE_MAX) return s;
+  const cut = s.slice(0, INDEX_QUOTE_MAX);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > INDEX_QUOTE_MAX * 0.6 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+}
+
 function renderIndex({ tickets, epics, recipes }) {
   const titles = Object.fromEntries(epics.map((e) => [e.id, e.title]));
   const line = (t) => `- ${t.icon} [${t.id}] ${t.priority} · ${t.status} · ${t.hook}${t.epic ? ` — ${t.epic}` : ''}`;
@@ -367,8 +438,40 @@ function renderIndex({ tickets, epics, recipes }) {
   const closed = tickets.filter((t) => t.status === 'done' || t.status === 'dropped').sort(byEpicPrioId);
   const counts = STATUSES.map((s) => `${tickets.filter((t) => t.status === s).length} ${s}`).join(' · ');
 
-  const acts = actions(tickets);
   const head = [];
+
+  // Tout en haut : ces remarques-là n'ont même pas de ticket d'accueil. Ce sont donc
+  // celles qui se perdent le plus vite, et la seule chose qui les retient est d'être
+  // comptées ici jusqu'à ce qu'on les tranche.
+  const notes = readTriage().filter((e) => e.open);
+  if (notes.length) {
+    head.push(`## 🧾 À trancher (${notes.length})`, '');
+    for (const e of notes) {
+      head.push(`- [${e.id}] ${e.date} — « ${quoteForIndex(e.text)} »${e.about ? ` _(situé par lui sur : ${e.about})_` : ''}`);
+    }
+    head.push('', '→ Chacune doit devenir un ticket ou être écartée : '
+      + '`node backlog.mjs --triage <ID> "ce qui en a été fait"`', '');
+  }
+
+  // En PREMIER, avant les actions : une remarque en attente est ce qui se perd. Une action
+  // non faite reste une action non faite ; une remarque non instruite finit oubliée.
+  const remarks = pendingRemarks(tickets);
+  if (remarks.length) {
+    const n = remarks.reduce((s, g) => s + g.items.length, 0);
+    head.push(`## 💬 Remarques en attente (${n})`, '');
+    for (const g of remarks) {
+      for (const e of g.items) {
+        head.push(`- [${g.id}] ${e.kind === 'comment' ? '💬' : '✅'} ${e.date} — « ${quoteForIndex(e.text)} »`
+          + (e.about ? ` _(sur : ${quoteForIndex(e.about)})_` : ''));
+      }
+    }
+    // Consigne CONTEXTUELLE : elle n'apparaît que le jour où elle sert. L'en-tête est la
+    // surface de scan — y loger une instruction permanente la ferait lire pour rien 364
+    // jours sur 365.
+    head.push('', '→ Après arbitrage : `node backlog.mjs --ack <ID> "ce qui en a été fait"`', '');
+  }
+
+  const acts = actions(tickets);
   if (acts.length) {
     head.push(`## ⏳ Actions à faire — humaines (${acts.length})`, '');
     for (const [tool, list] of byTool(acts)) {
@@ -386,6 +489,9 @@ function renderIndex({ tickets, epics, recipes }) {
     `> Un ticket = un fichier : \`${basename(DIR)}/<ID>.md\`. Le détail ne se lit que si l'on travaille dessus.`,
     `> Épiques : ${epics.map((e) => `${e.id} (${titles[e.id]})`).join(' · ') || '—'}`,
     ...(recipes.length ? [`> Recettes disponibles (procédures, à ouvrir seulement au besoin) : ${recipes.map((r) => `${r.id} ${r.title}`).join(' · ')}`] : []),
+    // Le contrat d'usage n'est pas une règle de projet, c'est une propriété de l'outil :
+    // il vit avec le backlog, pas dans la mémoire de chaque agent qui le reconstitue.
+    ...(existsSync(join(DIR, 'PROTOCOLE.md')) ? [`> Contrat et discipline : \`${basename(DIR)}/PROTOCOLE.md\` — à lire une fois, au démarrage du projet.`] : []),
     '',
     ...head,
     '## Actifs',
@@ -527,6 +633,46 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 .alert{background:color-mix(in srgb,var(--p1) 15%,transparent);color:var(--p1);border-radius:999px;
   padding:3px 10px;font-size:11.5px;font-weight:600;border:1px solid color-mix(in srgb,var(--p1) 40%,transparent)}
 .pill{background:var(--p1);color:#fff;border-radius:999px;padding:0 6px;font-size:10px;margin-left:4px}
+.alert.rem{background:color-mix(in srgb,#f59e0b 16%,transparent);color:#b45309;
+  border-color:color-mix(in srgb,#f59e0b 45%,transparent)}
+:root[data-theme=dark] .alert.rem{color:#e0ab4e}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) .alert.rem{color:#e0ab4e}}
+/* Le sas « À trancher » — zone d'ÉCRITURE, pas d'alerte : ni ambre ni rouge, mais le vert
+   d'accent de l'outil. Ce qu'on y dépose n'est pas un problème, c'est une matière première. */
+#triage{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--panel);
+  border-radius:9px;padding:11px 14px;margin:0 0 14px;box-shadow:var(--shadow)}
+.tnote{display:flex;gap:9px;align-items:baseline;padding:6px 2px;border-top:1px solid var(--line);font-size:13px}
+.tnote:first-of-type{border-top:0}
+.tref{font-size:11.5px;margin-left:6px;white-space:nowrap}
+.trow{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:7px}
+.tsel{font:inherit;font-size:12px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;
+  background:var(--bg);color:var(--ink);max-width:min(420px,60vw)}
+#triage textarea{width:100%;font:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);
+  border-radius:7px;background:var(--bg);color:var(--ink);resize:vertical}
+#triage .cform{margin-top:9px;padding-top:10px;border-top:1px solid var(--line)}
+#triage .ph{cursor:pointer;margin:0}
+#triage .tbody{margin-top:8px}
+.tg{color:var(--muted);font-size:11px;width:14px;flex:none;padding:0}
+/* Bandeau des remarques en attente — présent sur TOUTES les vues, jamais filtré.
+   L'ambre (et pas le rouge des priorités) dit « en attente », pas « urgent » : une
+   remarque non instruite n'est pas une alarme, c'est une dette qui se perd. */
+#pending{border:1px solid color-mix(in srgb,#f59e0b 42%,var(--line));border-left:3px solid #f59e0b;
+  background:color-mix(in srgb,#f59e0b 7%,var(--panel));border-radius:9px;padding:11px 14px;
+  margin:0 0 14px;max-height:min(38vh,320px);overflow:auto}
+/* Partagé par le sas et le bandeau : ces deux zones ont la même anatomie. */
+.ph{display:flex;align-items:baseline;gap:9px;margin:0 0 6px;font-size:12.5px}
+.ph b{font-size:13px}
+.ph span{color:var(--muted);font-size:11.5px}
+.prem{display:flex;gap:9px;align-items:baseline;padding:6px 2px;border-top:1px solid
+  color-mix(in srgb,#f59e0b 22%,transparent);cursor:pointer;font-size:13px}
+.prem:first-of-type{border-top:0}
+.prem:hover{background:color-mix(in srgb,#f59e0b 9%,transparent)}
+.pid{font:600 11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);flex:none}
+.pt{flex:1;min-width:0}
+.pa{color:var(--muted);font-size:11.5px}
+.pf{font-size:11.5px;color:var(--muted);margin:8px 0 0;padding-top:7px;
+  border-top:1px solid color-mix(in srgb,#f59e0b 22%,transparent)}
+.pf code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;border-radius:4px}
 .act{display:flex;gap:10px;align-items:flex-start;padding:9px 4px;border-top:1px solid var(--line);cursor:pointer}
 .act:first-of-type{border-top:0}
 .act input{margin:2px 0 0;width:16px;height:16px;accent-color:var(--accent);cursor:pointer;flex:none}
@@ -1066,7 +1212,7 @@ function drawer(id, actionText) {
   d.onclick = ev => ev.stopPropagation();          // cliquer dedans ne referme pas
 
   // L'identifiant du ticket EST le code de l'action : le format n'autorise qu'une
-  // action en attente par ticket, donc « CIN-117 » la désigne sans ambiguïté. Pas de
+  // action en attente par ticket, donc « EX-117 » la désigne sans ambiguïté. Pas de
   // numérotation parallèle — ce serait une seconde identité à tenir synchronisée.
   const head = el('div', 'drawhd');
   head.innerHTML = '<b>Action <span class="code" title="Cliquer pour copier">' + id + '</span></b>' +
@@ -1133,6 +1279,136 @@ function drawer(id, actionText) {
   // Le texte saisi part avec la case si on coche sans avoir cliqué le bouton.
   d.pendingText = () => ta.value.trim();
   return d;
+}
+
+/**
+ * Bandeau des remarques en attente — rendu UNE fois, hors du cycle des vues.
+ *
+ * Une remarque n'était visible que dans le tiroir d'une action, dans l'onglet « Mes
+ * actions ». Conséquence : un commentaire libre posé sur un ticket SANS action
+ * n'apparaissait nulle part — il fallait ouvrir le ticket et le repérer au milieu du
+ * corps. C'est exactement ce qu'un système de remarques ne doit pas faire.
+ *
+ * Volontairement hors de « render() » et hors des filtres : les filtres servent à explorer
+ * le backlog, pas à décider ce qu'on a le droit d'oublier. Une remarque masquée par un
+ * filtre de priorité serait une remarque perdue.
+ */
+/**
+ * Le sas « À trancher » : ce qui s'écrit ici n'a pas de ticket d'accueil.
+ *
+ * C'est la seule zone d'écriture LIBRE de l'outil, et elle existe parce que la règle
+ * inverse — « toute remarque se rattache à un ticket existant » — supposait que le
+ * tout-venant se disait ailleurs. Il ne se disait pas ailleurs : il se perdait.
+ *
+ * Le rattachement est facultatif et le restera. Imposer de choisir une cible avant
+ * d'écrire, c'est demander d'instruire avant d'avoir noté — et c'est précisément le
+ * moment où l'on renonce à noter.
+ */
+function renderTriage() {
+  const host = document.getElementById('triage');
+  const open = D.triage || [];
+
+  // Replié par défaut. C'est une zone d'ÉCRITURE : elle n'a pas à occuper le haut de
+  // l'écran en permanence comme le fait une alerte. Mais le COMPTE reste toujours visible,
+  // replié compris — c'est lui, et lui seul, qui tient la promesse « rien ne dort ici ».
+  let shown = localStorage.getItem('tks.triage') === '1';
+  const head = el('div', 'ph');
+  head.innerHTML = '<button class="tg" aria-expanded="false">▸</button><b>🧾 ' +
+    (open.length ? open.length + ' remarque' + (open.length > 1 ? 's' : '') + ' à trancher'
+                 : 'Rien à trancher') + '</b>' +
+    '<span>sans ticket — chacune doit en devenir un, ou être écartée</span><span class="spacer"></span>';
+  const add = document.createElement('button');
+  add.className = 'ghost'; add.textContent = '+ Commentaire / Ticket';
+  head.appendChild(add);
+  host.appendChild(head);
+
+  const body = el('div', 'tbody');
+  let h = '';
+  for (const e of open) {
+    h += '<div class="tnote"><span class="pid">' + e.id + '</span>' +
+      '<span class="pt">' + escape(e.text) +
+      (e.about ? ' <a href="#" data-goto="' + e.about + '" class="tref">↦ ' + escape(e.about) + '</a>' : '') +
+      '</span><span class="pa">' + e.date + '</span></div>';
+  }
+  body.innerHTML = h;
+  host.appendChild(body);
+
+  const toggle = (on) => {
+    shown = on;
+    body.hidden = !on;
+    head.querySelector('.tg').textContent = on ? '▾' : '▸';
+    head.querySelector('.tg').setAttribute('aria-expanded', String(on));
+    localStorage.setItem('tks.triage', on ? '1' : '0');
+  };
+  head.onclick = ev => { if (ev.target !== add) toggle(!shown); };
+  add.onclick = () => {
+    toggle(true);
+    const ta = body.querySelector('textarea');
+    if (ta) ta.focus();
+  };
+  toggle(shown);
+
+  if (D.live) {
+    const form = el('div', 'cform');
+    const ta = document.createElement('textarea');
+    ta.rows = 2;
+    ta.placeholder = 'Une remarque, une idée, un constat — sans avoir à choisir de ticket…';
+    const sel = document.createElement('select');
+    sel.className = 'tsel';
+    sel.innerHTML = '<option value="">— sans rattachement —</option>' +
+      (D.refs || []).map(r => '<option value="' + r.id + '">' + r.id + ' — ' +
+        escape(r.label).slice(0, 70) + '</option>').join('');
+    const btn = document.createElement('button');
+    btn.className = 'ghost'; btn.textContent = '+ déposer';
+    btn.onclick = async () => {
+      const txt = ta.value.trim();
+      if (!txt) { ta.focus(); return; }
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/note', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ comment: txt, about: sel.value }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        ta.value = '';                                  // fs.watch régénère, la page se recharge
+      } catch (e) {
+        alert('Impossible d\\'enregistrer : ' + e.message);
+      } finally { btn.disabled = false; }
+    };
+    form.appendChild(ta);
+    const row = el('div', 'trow');
+    row.appendChild(sel); row.appendChild(btn);
+    row.appendChild(el('span', 'meta', 'Le rattachement est facultatif — il sert à me situer, pas à classer.'));
+    form.appendChild(row);
+    body.appendChild(form);
+  } else if (!open.length) {
+    // Page statique et rien en attente : le sas n'a rien à dire, et on ne peut pas y écrire.
+    host.hidden = true;
+  }
+}
+
+function renderPending() {
+  const host = document.getElementById('pending');
+  const groups = D.pending || [];
+  if (!groups.length) { host.hidden = true; return; }
+  const n = groups.reduce((s, g) => s + g.items.length, 0);
+  let h = '<div class="ph"><b>💬 ' + n + ' remarque' + (n > 1 ? 's' : '') + ' en attente</b>' +
+    '<span>écrites ici, pas encore instruites</span></div>';
+  for (const g of groups) {
+    for (const e of g.items) {
+      h += '<div class="prem" data-goto="' + g.id + '" title="Ouvrir ' + g.id + '">' +
+        '<span class="pid">' + (e.kind === 'comment' ? '💬' : '✅') + ' ' + g.id + '</span>' +
+        '<span class="pt">' + escape(e.text) +
+        (e.about ? '<span class="pa"> — sur : ' + escape(e.about) + '</span>' : '') +
+        '</span><span class="pa">' + e.date + '</span></div>';
+    }
+  }
+  // Rappeler la règle là où la tentation est la plus forte : on voit la liste, on voudrait
+  // une case à cocher. « Pris en compte » est un arbitrage, pas un accusé de lecture.
+  h += '<p class="pf">Se marquent en ligne de commande, avec une note qui dit ce qui en a été ' +
+    'fait : <code>node backlog.mjs --ack &lt;ID&gt; "…"</code></p>';
+  host.innerHTML = h;
+  host.hidden = false;
 }
 
 function doneList(root) {
@@ -1262,6 +1538,8 @@ if (saved) document.documentElement.dataset.theme = saved;
 addEventListener('keydown', ev => {
   if (ev.key === '/' && document.activeElement !== document.querySelector('#q')) { ev.preventDefault(); document.querySelector('#q').focus(); }
 });
+renderTriage();    // idem : le sas est une zone d'écriture, pas une vue
+renderPending();   // hors du cycle des vues : le bandeau ne dépend ni de l'onglet ni des filtres
 render();
 `;
 
@@ -1299,11 +1577,20 @@ function renderHtml({ tickets, epics, recipes }, { live }) {
     // Journal structuré par ticket : c'est lui qui porte l'état « en attente » /
     // « pris en compte » des remarques, affiché dans le tiroir de chaque action.
     journals: Object.fromEntries(tickets.map((t) => [t.id, parseJournal(t.body)])),
+    // Même source que le bloc en tête de BACKLOG.md : la page et l'index disent
+    // forcément la même chose, parce qu'ils lisent le même calcul.
+    pending: pendingRemarks(tickets),
+    // Le sas. `refs` alimente la liste de rattachement proposée par le formulaire : c'est
+    // la seule chose qui empêche de saisir un identifiant qui n'existe pas.
+    triage: readTriage().filter((e) => e.open),
+    refs: [...tickets.map((t) => ({ id: t.id, label: t.hook })),
+      ...epics.map((e) => ({ id: e.id, label: e.title }))],
     bodies: Object.fromEntries(tickets.map((t) => [t.id, md(t.body)])),
     epicBodies: Object.fromEntries(epics.map((e) => [e.id, md(e.body)])),
   };
   const counts = STATUSES.map((s) => `${tickets.filter((t) => t.status === s).length} ${STATUS_LABEL[s].toLowerCase()}`).join(' · ');
   const nAct = data.actions.length;
+  const nRem = data.pending.reduce((s, g) => s + g.items.length, 0);
   return `<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1315,6 +1602,7 @@ function renderHtml({ tickets, epics, recipes }, { live }) {
     <h1>Backlog</h1>
     <span class="meta">${tickets.length} tickets · ${counts}</span>
     ${nAct ? `<span class="alert">⏳ ${nAct} actions</span>` : ''}
+    ${nRem ? `<span class="alert rem">💬 ${nRem} en attente</span>` : ''}
     <span class="spacer"></span>
     <input id="q" type="search" placeholder="Filtrer  ( / )" aria-label="Filtrer les tickets">
     <button id="theme" class="ghost" title="Clair / sombre">◐</button>
@@ -1330,6 +1618,8 @@ function renderHtml({ tickets, epics, recipes }, { live }) {
   </div>
 </header>
 <main>
+  <div id="triage"></div>
+  <div id="pending" hidden></div>
   <div class="filters">
     ${STATUSES.map((s) => `<button class="chip" data-status="${s}">${STATUS_LABEL[s]}</button>`).join('\n    ')}
     <span style="width:10px"></span>
@@ -1442,6 +1732,126 @@ function appendJournal(raw, entry) {
 
 /** Marque d'accusé. Détectée en tête de ligne, après l'indentation. */
 const ACK_MARK = '↳ ✓';
+
+/*
+ * ── Le sas « À trancher » ─────────────────────────────────────────────────────
+ *
+ * Une remarque qui n'a PAS encore de ticket. Elle s'écrit depuis la page, seule, sans
+ * qu'on ait à choisir un ticket d'accueil — puis elle est instruite et devient un ticket,
+ * ou elle est écartée avec sa raison.
+ *
+ * ⚠️ Ceci renverse une règle antérieure explicite : « un commentaire se rattache TOUJOURS
+ * à un ticket existant ; le tout-venant se dit dans le chat — sinon l'outil devient une
+ * boîte de réception ». Ce que cette règle protégeait est réel et reste vrai : un magasin
+ * parallèle qui accumule sans jamais se vider est pire que pas de magasin du tout.
+ *
+ * Ce qui a changé : le tout-venant ne se disait PAS dans le chat, il s'y perdait. Une
+ * remarque lâchée en cours de session n'a pas de point de chute et disparaît avec le fil.
+ *
+ * D'où la contrainte de conception, qui est tout l'écart entre un sas et une boîte de
+ * réception : **une entrée doit sortir**. Elle est comptée et affichée tant qu'elle n'a pas
+ * été tranchée, elle ne peut être close qu'en LIGNE DE COMMANDE et avec une raison écrite
+ * — jamais d'un clic. Rien ne dort ici.
+ */
+
+/**
+ * `- 💡 [N3] [TKS-011] 2026-07-28 — le texte`
+ *
+ * Le second crochet est un **rattachement facultatif** : un ticket ou une épique que
+ * l'exploitant désigne pour situer sa remarque. Facultatif par conception — l'obligation
+ * de choisir une cible est exactement ce qui faisait qu'une remarque n'était pas écrite.
+ * Champ séparé, et non préfixe dans le texte : sans quoi un « — » dans la remarque le
+ * rendrait indécidable à la relecture.
+ */
+const NOTE_RE = /^- 💡 \[(N\d+)\](?: \[([A-Za-z][\w-]*)\])? (\d{4}-\d{2}-\d{2}) — (.*)$/;
+
+/** Identifiants auxquels une note peut se rattacher : tickets et épiques, par leur fichier. */
+function knownRefs() {
+  const ids = readdirSync(DIR)
+    .filter((f) => f.endsWith('.md') && !NOT_A_TICKET.has(f))
+    .map((f) => basename(f, '.md'));
+  const epicDir = join(DIR, 'epics');
+  const eps = existsSync(epicDir)
+    ? readdirSync(epicDir).filter((f) => f.endsWith('.md')).map((f) => basename(f, '.md'))
+    : [];
+  return { tickets: ids, epics: eps, all: new Set([...ids, ...eps]) };
+}
+
+/** Découpe le sas en entrées. Une entrée close porte une ligne `↳ ✓`. */
+function readTriage() {
+  const p = join(DIR, TRIAGE_FILE);
+  if (!existsSync(p)) return [];
+  const lines = readFileSync(p, 'utf8').split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i].match(NOTE_RE);
+    if (!head) continue;
+    const e = { id: head[1], about: head[2] || '', date: head[3], text: head[4].trim(), done: null, line: i };
+    const more = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const cont = lines[j].match(/^ {2}(>|↳ ✓) ?(.*)$/);
+      if (!cont) break;
+      if (cont[1] === '>') more.push(cont[2]);
+      else e.done = cont[2].trim();
+      i = j;
+    }
+    if (more.length) e.text = [e.text, more.join(' ').trim()].filter(Boolean).join(' · ');
+    e.open = !e.done;
+    out.push(e);
+  }
+  return out;
+}
+
+/**
+ * Ajoute une note au sas. Renvoie son identifiant.
+ *
+ * Le numéro est monotone sur TOUT le fichier, closes comprises : réutiliser le numéro
+ * d'une entrée tranchée ferait pointer deux décisions distinctes sur le même identifiant,
+ * et l'historique git deviendrait illisible.
+ */
+function addNote(text, about = '') {
+  const ref = String(about ?? '').trim();
+  // Validé SEULEMENT s'il est fourni. Un rattachement qui ne pointe nulle part vaut moins
+  // que pas de rattachement du tout : il ferait croire à un contexte qui n'existe pas.
+  if (ref && !knownRefs().all.has(ref)) throw new Error(`rattachement inconnu : ${ref}`);
+  const clean = String(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .trim()
+    .slice(0, COMMENT_MAX);
+  if (!clean) throw new Error('une note vide ne se tranche pas');
+  const p = join(DIR, TRIAGE_FILE);
+  const n = readTriage().reduce((m, e) => Math.max(m, Number(e.id.slice(1))), 0) + 1;
+  const [first, ...rest] = clean.split('\n').map((l) => l.trim()).filter(Boolean);
+  const entry = `- 💡 [N${n}]${ref ? ` [${ref}]` : ''} ${today()} — ${first}`
+    + rest.map((l) => `\n  > ${l}`).join('');
+  const header = `# À trancher
+
+_Remarques sans ticket, écrites au fil de l'eau. Chaque entrée doit finir en ticket ou être
+écartée avec sa raison : rien ne dort ici. Se tranche en ligne de commande —_
+\`node backlog.mjs --triage <ID> "ce qui en a été fait"\`
+`;
+  const fresh = !existsSync(p);
+  const raw = fresh ? header : readFileSync(p, 'utf8');
+  writeFileSync(p, `${raw.trimEnd()}\n${fresh ? '\n' : ''}${entry}\n`, 'utf8');
+  return `N${n}`;
+}
+
+/** Tranche une note : y écrit ce qu'elle est devenue. Ligne de commande uniquement. */
+function triageNote(id, note) {
+  const clean = String(note ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, COMMENT_MAX);
+  if (!clean) throw new Error('dire ce qu\'une note est devenue est obligatoire — « vu » ne vaut rien');
+  const p = join(DIR, TRIAGE_FILE);
+  if (!existsSync(p)) throw new Error('aucune note à trancher');
+  const entry = readTriage().find((e) => e.id === id);
+  if (!entry) throw new Error(`note inconnue : ${id}`);
+  if (entry.done) throw new Error(`${id} est déjà tranchée — ${entry.done}`);
+  const lines = readFileSync(p, 'utf8').split('\n');
+  let at = entry.line;
+  while (at + 1 < lines.length && /^ {2}>/.test(lines[at + 1])) at++;
+  lines.splice(at + 1, 0, `  ${ACK_MARK} ${today()} — ${clean}`);
+  writeFileSync(p, lines.join('\n'), 'utf8');
+}
 
 /**
  * Découpe le journal en entrées structurées.
@@ -1594,7 +2004,7 @@ function serve() {
   createServer((req, res) => {
     // La page web peut : cocher une action, la décocher, écrire un commentaire.
     // Elle ne peut PAS accuser réception ni changer un statut — voir ACK_MARK.
-    const POST_ROUTES = ['/api/action/done', '/api/action/undo', '/api/comment'];
+    const POST_ROUTES = ['/api/action/done', '/api/action/undo', '/api/comment', '/api/note'];
     if (req.method === 'POST' && POST_ROUTES.includes(req.url)) {
       const route = req.url;
       let body = '';
@@ -1602,8 +2012,12 @@ function serve() {
       req.on('data', (c) => { body += c; if (body.length > 8000) req.destroy(); });
       req.on('end', () => {
         try {
-          const { id, comment } = JSON.parse(body);
-          if (route === '/api/comment') {
+          const { id, comment, about } = JSON.parse(body);
+          if (route === '/api/note') {
+            // Seule route qui n'exige PAS d'identifiant de ticket : c'est tout son objet.
+            // `about` est facultatif, et validé contre les fichiers existants par `addNote`.
+            console.log(`  🧾 note déposée — ${addNote(comment, about)}`);
+          } else if (route === '/api/comment') {
             commentTicket(id, comment);
             console.log(`  💬 commentaire — ${id}`);
           } else if (route === '/api/action/undo') {
@@ -1657,7 +2071,110 @@ title: Exemple d'épique
 
 Le récit et le contexte qui n'appartiennent à aucun ticket en particulier.
 `, 'utf8');
+  writeProtocol();
   console.log(`Squelette créé dans ${DIR}. Lance « node backlog.mjs --serve ».`);
+}
+
+/**
+ * Dépose le contrat d'usage DANS le backlog.
+ *
+ * Ces règles ne sont pas des règles de projet : ce sont des propriétés de l'outil, vraies
+ * partout où il tourne. Tant qu'elles vivaient dans le README — 190 lignes destinées à un
+ * humain qui démarre — l'agent, dont la consigne est « lis BACKLOG.md et rien d'autre »,
+ * ne les voyait jamais et les reconstituait à ses frais à chaque reprise de fil. Les loger
+ * dans la mémoire d'un projet revient à les dupliquer par projet, et à les laisser diverger.
+ *
+ * Écrit une seule fois : un projet a le droit d'amender son propre contrat, et une
+ * régénération n'a pas à écraser cet amendement.
+ */
+function writeProtocol() {
+  const file = join(DIR, 'PROTOCOLE.md');
+  if (existsSync(file)) return;
+  writeFileSync(file, `# PROTOCOLE — le contrat TicketoScope
+
+_À lire une fois, au démarrage du projet. Ce fichier n'est pas régénéré : amendez-le._
+
+## Ce qui est généré, ce qui ne l'est pas
+
+\`BACKLOG.md\` et \`backlog.html\` sont **produits** par le générateur. **Ne jamais les éditer
+à la main** : ils sont écrasés à chaque génération. La source, c'est \`${basename(DIR)}/<ID>.md\` —
+un ticket, un fichier. Les épiques vivent dans \`${basename(DIR)}/epics/<ID>.md\`, les recettes
+dans \`${basename(DIR)}/recipes/<ID>.md\`. Après toute modification : relancer le générateur.
+
+## Frontmatter
+
+\`\`\`yaml
+id · hook · epic · layer · created · origin
+status (todo|doing|done|dropped) · priority (P0..P3) · owner
+follows · blocks · blocked_by · action
+\`\`\`
+
+Le \`hook\` est **une phrase** — la seule chose exposée dans l'index, et donc le champ qui
+tient le coût. S'il en faut deux, le corps est là pour ça.
+
+\`epic\` = une **fonction du produit**. \`layer\` = **où ça se code**. Deux axes, jamais
+mélangés dans le même champ.
+
+\`action:\` = ce que **seul un humain** peut faire, préfixé par l'outil concerné
+(${ACTION_TOOLS.slice(0, 4).join(' — … / ')} — …). Une ligne à l'impératif, ≤ 110 caractères.
+**Jamais de secret ni d'identifiant** : le backlog peut être versionné en public.
+
+## Lecture — le régime qui rend le coût plat
+
+Au démarrage d'une session : lire \`BACKLOG.md\` (en-tête, remarques en attente, actions,
+index) et **rien d'autre**. N'ouvrir \`${basename(DIR)}/<ID>.md\` que pour le ticket sur lequel
+on travaille. 300 tickets coûtent alors autant par opération que 30.
+
+## Remarques et prise en compte
+
+Une remarque s'écrit depuis la page web, sous l'action ou le ticket qu'elle concerne — le lien
+est **physique**, il n'y a ni identifiant de commentaire ni jointure. Elle naît « en attente »
+et remonte en tête de \`BACKLOG.md\` tant qu'elle n'est pas instruite.
+
+| Geste | Page web | Ligne de commande |
+|---|---|---|
+| Cocher une action faite | ✅ | — |
+| Écrire une remarque | ✅ | — |
+| Déclarer « pris en compte » | ❌ | \`--ack <ID> "…"\` |
+| Changer le \`status:\` d'un ticket | ❌ | ✅ (édition du fichier) |
+
+La note de \`--ack\` est **obligatoire** et doit dire **ce qui a été fait**, pas « vu ». Sans
+cette séparation, « pris en compte » finirait par vouloir dire « lu ».
+
+Instruire une remarque, c'est **trancher** : soit elle clôt son ticket, soit elle en ouvre un
+nouveau. Une remarque sans accusé reste affichée en attente, et l'indicateur perd son sens.
+
+## À trancher — le sas
+
+\`${basename(DIR)}/A-TRANCHER.md\` accueille les remarques qui n'ont **pas encore** de ticket : une
+idée, un constat, une demande, écrits au fil de l'eau depuis la page (bouton « + Commentaire /
+Ticket », replié par défaut) ou en ligne de commande.
+
+\`\`\`sh
+node backlog.mjs --note "le bouton de retour ne revient pas au bon écran"
+node backlog.mjs --note EX-001 "vu sur iPhone : ça déborde"   # rattachement FACULTATIF
+node backlog.mjs --triage N1 "ouvert en EX-021"               # ou : "écartée : hors sujet"
+\`\`\`
+
+Le rattachement à un ticket ou une épique est **facultatif** — il sert à situer, pas à classer.
+Obliger à choisir une cible avant d'écrire, c'est demander d'instruire avant d'avoir noté.
+
+**Une entrée doit sortir.** Elle est comptée en tête de \`BACKLOG.md\` tant qu'elle n'est pas
+tranchée, et elle ne se tranche qu'en ligne de commande, avec une raison écrite. C'est ce qui
+sépare un sas d'une boîte de réception : si le compte monte durablement, l'outil a dérivé.
+
+## Discipline
+
+- Rien de terminé ne reste dans l'index.
+- Une remarque se rattache **toujours** à un ticket ou une action qui existe. Le tout-venant
+  se dit ailleurs — sinon l'outil devient une boîte de réception.
+- Ce qui remonte en session devient par défaut **un ticket**, pas du code écrit dans l'urgence.
+
+## Ce qu'il n'y a pas, volontairement
+
+Fils de discussion, réponses, auteurs, mentions, réactions, résolu/non-résolu, notifications.
+C'est la pente qui mène à Jira ; rien de tout cela ne sert à une personne seule.
+`, 'utf8');
 }
 
 /**
@@ -1668,7 +2185,15 @@ Le récit et le contexte qui n'appartiennent à aucun ticket en particulier.
  * obligatoire, faute de quoi l'indicateur finirait par ne signifier que « lu ».
  */
 function ack() {
-  const rest = process.argv.slice(2).filter((a) => a !== '--ack');
+  // Tout ce qui suit `--ack` est sa charge utile : l'identifiant, puis la note. Les options
+  // globales se placent AVANT.
+  //
+  // ⚠️ Le code d'origine filtrait simplement `--ack` hors de la ligne de commande et prenait
+  // le premier reste comme identifiant. Avec « --dir backlog --ack EX-001 "…" », l'identifiant
+  // devenait « --dir » : l'accusé échouait sur « identifiant inconnu » et la remarque restait
+  // en attente. Invisible tant qu'on lançait l'outil depuis la racine du projet, fatal dès
+  // qu'on lui passait un dossier.
+  const rest = ARGV.slice(ARGV.indexOf('--ack') + 1);
   const [id, ...note] = rest;
   if (!id) { console.error('usage : node backlog.mjs --ack <ID> "ce qui en a été fait"'); process.exit(1); }
   try {
@@ -1681,7 +2206,95 @@ function ack() {
   }
 }
 
-if (flag('--init')) init();
+/*
+ * ── Dispatch ──────────────────────────────────────────────────────────────────
+ *
+ * ⚠️ Le piège historique : le dispatch se terminait par un `else generate()` nu. Tout
+ * drapeau non reconnu — `--help` le premier — tombait donc dans la branche par défaut,
+ * RÉÉCRIVAIT les deux fichiers, et affichait « 80 tickets · 22 épiques ». Deux dégâts :
+ * une écriture que personne n'a demandée, et surtout un message qui ne ressemble pas à
+ * une erreur mais à un résultat. Un lecteur — humain ou agent — le prend pour la réponse,
+ * n'apprend rien, et part chercher dans le code source. Un message trompeur coûte plus
+ * cher qu'un message absent.
+ *
+ * Règle : la génération est ce qu'on obtient SANS argument. Jamais par accident.
+ */
+
+const USAGE = `TicketoScope — un registre de tickets à coût marginal plat.
+
+  node backlog.mjs                       régénère BACKLOG.md + backlog.html
+  node backlog.mjs --serve               http://localhost:${PORT}, rechargement auto
+  node backlog.mjs --init                crée un dossier ${basename(DIR)}/ d'exemple
+  node backlog.mjs --ack <ID> "<note>"   marque les remarques d'un ticket prises en compte
+  node backlog.mjs --note "<texte>"      dépose une remarque SANS ticket, dans « À trancher »
+  node backlog.mjs --triage <ID> "…"     dit ce qu'une remarque de « À trancher » est devenue
+  node backlog.mjs --help                cet écran
+
+Options :
+  --dir <${basename(DIR)}>   dossier des tickets
+  --out <.>         où écrire BACKLOG.md et backlog.html
+  --port <4321>     port du mode --serve
+
+Un ticket = un fichier ${basename(DIR)}/<ID>.md. Le contrat de frontmatter est dans
+${basename(DIR)}/PROTOCOLE.md (déposé par --init).`;
+
+const KNOWN_FLAGS = new Set(['--init', '--serve', '--ack', '--note', '--triage', '--help', '-h']);
+const VALUE_OPTS = new Set(['--dir', '--out', '--port']);
+/** Drapeaux dont TOUT ce qui suit est la charge utile — donc du texte libre, pas des options. */
+const PAYLOAD_FLAGS = new Set(['--ack', '--note', '--triage']);
+
+/**
+ * Premier drapeau non reconnu, ou `null`.
+ *
+ * S'arrête au premier drapeau à charge utile (`--ack`, `--note`, `--triage`) : tout ce qui
+ * suit lui appartient, et c'est du texte libre — une note a parfaitement le droit de
+ * commencer par deux tirets. La valider reviendrait à refuser une note légitime.
+ */
+function unknownFlag() {
+  for (let i = 0; i < ARGV.length; i++) {
+    const a = ARGV[i];
+    if (PAYLOAD_FLAGS.has(a)) return null;
+    if (VALUE_OPTS.has(a)) { i++; continue; }
+    if (a.startsWith('-') && !KNOWN_FLAGS.has(a)) return a;
+  }
+  return null;
+}
+
+/** `--note "<texte>"` — dépose une remarque dans le sas, sans ticket d'accueil. */
+function note() {
+  const rest = ARGV.slice(ARGV.indexOf('--note') + 1);
+  // Rattachement facultatif : s'il est là, c'est le premier mot ET c'est un identifiant
+  // connu. Une remarque dont le premier mot est par ailleurs un identifiant existant
+  // est indiscernable — cas assez improbable pour préférer la brièveté à un drapeau de plus.
+  const ref = rest.length > 1 && knownRefs().all.has(rest[0]) ? rest.shift() : '';
+  const text = rest.join(' ');
+  try {
+    const id = addNote(text, ref);
+    console.log(`🧾 ${id} déposée dans « À trancher »`);
+    generate({ quiet: true });
+  } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
+}
+
+/** `--triage <ID> "<note>"` — dit ce qu'une remarque du sas est devenue. */
+function triage() {
+  const [id, ...note] = ARGV.slice(ARGV.indexOf('--triage') + 1);
+  if (!id) { console.error('usage : node backlog.mjs --triage <ID> "ce qui en a été fait"'); process.exit(1); }
+  try {
+    triageNote(id, note.join(' '));
+    console.log(`✓ ${id} tranchée`);
+    generate({ quiet: true });
+  } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
+}
+
+const bad = unknownFlag();
+if (flag('--help') || flag('-h')) console.log(USAGE);
+else if (bad) {
+  console.error(`✗ option inconnue : ${bad}\n\n${USAGE}`);
+  process.exit(1);
+}
+else if (flag('--init')) init();
+else if (flag('--note')) note();
+else if (flag('--triage')) triage();
 else if (flag('--ack')) ack();
 else if (flag('--serve')) serve();
 else generate();
