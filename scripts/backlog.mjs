@@ -305,6 +305,24 @@ function md(src) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // Bloc de code clôturé. Doit passer AVANT tout le reste : un ticket documente
+    // souvent un format, un message d'erreur ou une commande, et ces lignes ne sont
+    // pas du Markdown. Sans ce cas, « - x » devenait une puce et « # y » un titre —
+    // le bloc s'affichait en vrac, et les backticks restaient à l'écran.
+    const fence = line.match(/^\s*(?:```|~~~)(.*)$/);
+    if (fence) {
+      flush();
+      const close = /^\s*(?:```|~~~)\s*$/;
+      const buf = [];
+      i++;
+      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++]);
+      // i pointe sur la clôture (ou la fin : un bloc non fermé se rend quand même).
+      const lang = fence[1].trim().replace(/[^\w-]/g, '');
+      out.push(`<pre${lang ? ` data-lang="${lang}"` : ''}><code>${esc(buf.join('\n'))}</code></pre>`);
+      continue;
+    }
+
     if (!line.trim()) { flush(); continue; }
 
     const h = line.match(/^(#{2,4})\s+(.*)$/);
@@ -515,6 +533,38 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 .act .at{font-size:13px}
 .act .am{font-size:11.5px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
 .act.gone{opacity:.35;text-decoration:line-through}
+.act .chev{margin-left:auto;color:var(--muted);font-size:12px;flex:none;padding-left:8px}
+.act .wait{color:#b45309;font-weight:600}
+/* Tiroir d'action : la consigne, l'historique, et de quoi répondre. */
+.draw{border-top:1px dashed var(--line);padding:12px 4px 16px;cursor:default}
+.drawhd{display:flex;align-items:baseline;gap:10px;margin:6px 0 8px;font-size:12px}
+.drawhd b{font-size:12px;letter-spacing:.02em;text-transform:uppercase;color:var(--muted)}
+.drawhd a{margin-left:auto;font-size:11.5px}
+.drawhd .code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:5px;
+  padding:1px 6px;margin-left:2px;cursor:pointer;text-transform:none;letter-spacing:0}
+.drawhd .code:hover{border-color:var(--accent)}
+.drawbody{font-size:13px;line-height:1.5;max-height:320px;overflow:auto;
+  padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px}
+.drawbody :first-child{margin-top:0}.drawbody :last-child{margin-bottom:0}
+.jrn{display:flex;flex-direction:column;gap:8px}
+.jit{border-left:2px solid var(--line);padding:2px 0 2px 10px}
+.jit.pend{border-left-color:#f59e0b}
+.jh{display:flex;gap:8px;align-items:baseline;font-size:12px;flex-wrap:wrap}
+.jd{color:var(--muted);font-variant-numeric:tabular-nums}
+.jt{font-size:12.5px}
+.jc{font-size:13px;margin:3px 0 0;padding-left:2px}
+.jok{font-size:11.5px;color:#15803d;margin-top:3px}
+.jw{font-size:11.5px;color:#b45309;margin-top:3px}
+.cform{display:flex;flex-direction:column;gap:6px;margin-top:12px}
+.cform textarea{width:100%;font:inherit;font-size:13px;padding:8px 10px;resize:vertical;
+  background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px}
+.cform textarea:focus{outline:2px solid var(--accent);outline-offset:1px}
+.cform button{align-self:flex-start}
+.cform .meta{font-size:11px}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+  overflow-x:auto;font-size:12px;line-height:1.5;margin:10px 0}
+pre code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
 .tool{display:flex;align-items:baseline;gap:9px;margin:0 0 4px}
 .tool b{font-size:12px;letter-spacing:.08em;text-transform:uppercase}
 .tool span{color:var(--muted);font-size:11.5px}
@@ -975,20 +1025,114 @@ function renderActions(root) {
       (groups[k].length > 1 ? 's' : '') + ' — à faire d\\'un seul tenant</span>';
     box.appendChild(t);
     for (const a of groups[k]) {
+      const pend = (D.journals[a.id] || []).filter(e => e.pending).length;
       const row = el('div', 'act');
       row.innerHTML = '<input type="checkbox"' + (D.live ? '' : ' disabled') + '>' +
         '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
         '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.priority + '</span>' +
         (a.epic ? '<span>' + a.epic + '</span>' : '') +
         (a.unblocks ? '<span class="hot">débloque ' + a.unblocks + ' ticket' + (a.unblocks > 1 ? 's' : '') + '</span>'
-                    : '<span>ne débloque rien d\\'autre</span>') + '</span></span>';
-      row.querySelector('input').onchange = () => send(a, row, false);
-      row.onclick = ev => { if (ev.target.tagName !== 'INPUT') openTicket(a.id); };
-      row.title = 'Cliquer pour voir le détail · cocher la case pour marquer fait';
+                    : '<span>ne débloque rien d\\'autre</span>') +
+        (pend ? '<span class="wait">' + pend + ' remarque' + (pend > 1 ? 's' : '') + ' en attente</span>' : '') +
+        '</span></span><span class="chev">▾</span>';
+      // Cocher emporte le texte en cours de saisie : sinon on perd la remarque
+      // de celui qui écrit d'abord et coche ensuite — l'ordre le plus naturel.
+      row.querySelector('input').onchange = () => send(a, row, false, dr.pendingText && dr.pendingText());
+      const dr = drawer(a.id, a.text);
+      row.onclick = ev => {
+        if (ev.target.tagName === 'INPUT') return;
+        const open = dr.hidden;
+        dr.hidden = !open;
+        row.querySelector('.chev').textContent = open ? '▴' : '▾';
+      };
+      row.title = 'Cliquer pour dérouler · cocher la case pour marquer fait';
       box.appendChild(row);
+      box.appendChild(dr);
     }
     root.appendChild(box);
   }
+}
+
+/**
+ * Tiroir d'une action : ce qu'il faut faire, l'historique des échanges, et de quoi
+ * ajouter une remarque.
+ *
+ * Le « quoi faire » est le CORPS DU TICKET — pas un champ séparé. Une consigne qui
+ * vivrait à part finirait par contredire le ticket : une seule source, forcément à jour.
+ */
+function drawer(id, actionText) {
+  const d = el('div', 'draw');
+  d.hidden = true;
+  d.onclick = ev => ev.stopPropagation();          // cliquer dedans ne referme pas
+
+  // L'identifiant du ticket EST le code de l'action : le format n'autorise qu'une
+  // action en attente par ticket, donc « CIN-117 » la désigne sans ambiguïté. Pas de
+  // numérotation parallèle — ce serait une seconde identité à tenir synchronisée.
+  const head = el('div', 'drawhd');
+  head.innerHTML = '<b>Action <span class="code" title="Cliquer pour copier">' + id + '</span></b>' +
+    '<a href="#" class="ghost" data-goto="' + id + '">ouvrir le ticket</a>';
+  head.querySelector('.code').onclick = ev => {
+    ev.stopPropagation();
+    const c = ev.target;
+    navigator.clipboard.writeText(id).then(() => {
+      const was = c.textContent;
+      c.textContent = 'copié ✓';
+      setTimeout(() => { c.textContent = was; }, 900);
+    }).catch(() => { /* presse-papiers refusé : l'identifiant reste lisible à l'écran */ });
+  };
+  d.appendChild(head);
+  d.appendChild(el('div', 'drawbody', D.bodies[id] || '<p class="meta">(pas de consigne écrite)</p>'));
+
+  const j = (D.journals[id] || []);
+  if (j.length) {
+    d.appendChild(el('div', 'drawhd', '<b>Historique</b>'));
+    const log = el('div', 'jrn');
+    for (const e of j) {
+      const it = el('div', 'jit' + (e.pending ? ' pend' : ''));
+      let h = '<div class="jh"><span class="jk">' + (e.kind === 'action' ? '✅' : '💬') + '</span>' +
+        '<span class="jd">' + e.date + '</span><span class="jt">' + escape(e.text) + '</span></div>';
+      if (e.comment) h += '<div class="jc">' + escape(e.comment).replace(/\\n/g, '<br>') + '</div>';
+      if (e.ack) h += '<div class="jok">✓ pris en compte — ' + escape(e.ack) + '</div>';
+      else if (e.pending) h += '<div class="jw">⏳ en attente — sera marquée quand ce sera traité</div>';
+      it.innerHTML = h;
+      log.appendChild(it);
+    }
+    d.appendChild(log);
+  }
+
+  if (!D.live) {
+    d.appendChild(el('div', 'empty', 'Page statique : lance « --serve » pour commenter.'));
+    return d;
+  }
+  const form = el('div', 'cform');
+  const ta = document.createElement('textarea');
+  ta.rows = 2;
+  ta.placeholder = 'Ce que tu as constaté…';
+  ta.onclick = ev => ev.stopPropagation();
+  const btn = document.createElement('button');
+  btn.className = 'ghost'; btn.textContent = '+ ajouter un commentaire';
+  const hint = el('span', 'meta',
+    'Joint au ticket. Si tu coches l\\'action, le texte est rattaché à « ' + escape(actionText) + ' ».');
+  btn.onclick = async () => {
+    const txt = ta.value.trim();
+    if (!txt) { ta.focus(); return; }
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/comment', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: id, comment: txt }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      ta.value = '';                                 // fs.watch régénère, la page se recharge
+    } catch (e) {
+      alert('Impossible d\\'enregistrer : ' + e.message);
+    } finally { btn.disabled = false; }
+  };
+  form.appendChild(ta); form.appendChild(btn); form.appendChild(hint);
+  d.appendChild(form);
+  // Le texte saisi part avec la case si on coche sans avoir cliqué le bouton.
+  d.pendingText = () => ta.value.trim();
+  return d;
 }
 
 function doneList(root) {
@@ -1013,12 +1157,12 @@ function doneList(root) {
 }
 
 const DONE = new Set();
-async function send(a, row, undo) {
+async function send(a, row, undo, comment) {
   row.classList.toggle('gone', !undo);
   try {
     const r = await fetch(undo ? '/api/action/undo' : '/api/action/done', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: a.id }),
+      body: JSON.stringify({ id: a.id, comment: comment || '' }),
     });
     if (!r.ok) throw new Error(await r.text());
     if (undo) DONE.delete(a.id); else DONE.add(a.id);   // fs.watch régénère, la page se recharge seule
@@ -1142,13 +1286,19 @@ function renderHtml({ tickets, epics, recipes }, { live }) {
     git: gitHistory(),
     labels: STATUS_LABEL,
     actions: actions(tickets),
-    doneActions: tickets.flatMap((t) => [...t.body.matchAll(/^- ✅ (\d{4}-\d{2}-\d{2}) — (.+)$/gm)].map((m) => {
-      const i = m[2].indexOf('—');
-      return { id: t.id, icon: t.icon, date: m[1],
-        tool: i < 0 ? 'divers' : m[2].slice(0, i).trim(),
-        text: i < 0 ? m[2].trim() : m[2].slice(i + 1).trim() };
+    // Lu via `parseJournal` (donc borné à la section Journal) : un exemple de format
+    // documenté dans le corps d'un ticket ne doit pas apparaître comme action faite.
+    doneActions: tickets.flatMap((t) => parseJournal(t.body).filter((e) => e.kind === 'action').map((e) => {
+      const i = e.text.indexOf('—');
+      return { id: t.id, icon: t.icon, date: e.date,
+        tool: i < 0 ? 'divers' : e.text.slice(0, i).trim(),
+        text: i < 0 ? e.text.trim() : e.text.slice(i + 1).trim(),
+        comment: e.comment, ack: e.ack };
     })).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id)),
     live,
+    // Journal structuré par ticket : c'est lui qui porte l'état « en attente » /
+    // « pris en compte » des remarques, affiché dans le tiroir de chaque action.
+    journals: Object.fromEntries(tickets.map((t) => [t.id, parseJournal(t.body)])),
     bodies: Object.fromEntries(tickets.map((t) => [t.id, md(t.body)])),
     epicBodies: Object.fromEntries(epics.map((e) => [e.id, md(e.body)])),
   };
@@ -1215,35 +1365,210 @@ function generate({ quiet } = {}) {
   return data;
 }
 
-/** Coche une action : retire la ligne `action:` et journalise dans le corps du ticket. */
-function completeAction(id) {
+/*
+ * ── Commentaires ──────────────────────────────────────────────────────────────
+ *
+ * Deux formes, une seule section `## Journal`, en ordre chronologique :
+ *
+ *   - ✅ 2026-07-28 — navigateur — Vérifier que le compteur se remplit
+ *     > pas trouvé l'écran dans le back-office
+ *   - 💬 2026-07-28 — la couleur est bien arrivée sur la machine
+ *
+ * `✅` = une action humaine faite, avec un commentaire FACULTATIF attaché.
+ * `💬` = un commentaire libre sur le ticket, attaché à rien d'autre.
+ *
+ * Le lien est PHYSIQUE : le commentaire est écrit sous sa ligne d'action. Pas
+ * d'identifiant de commentaire, pas de table, pas de jointure — le fichier est
+ * l'enregistrement et git est l'historique. Ce qu'on ne fait volontairement pas :
+ * fils de discussion, réponses, auteurs, mentions, réactions, résolu/non résolu.
+ * Rien de tout cela ne sert à une personne seule, et chacun coûterait un schéma.
+ */
+
+/** Limite de longueur : un commentaire est une note, pas un document. */
+const COMMENT_MAX = 2000;
+
+/**
+ * Nettoie un commentaire saisi et le rend en lignes de citation Markdown.
+ *
+ * Le texte vient d'un formulaire : il ne doit jamais pouvoir casser la structure
+ * du fichier. On retire les caractères de contrôle, on borne la longueur, et on
+ * préfixe CHAQUE ligne par « > » — sans quoi un retour à la ligne suivi d'un
+ * « --- » ou d'un « ## » réécrirait le frontmatter ou inventerait une section.
+ */
+function quoteComment(text) {
+  const clean = String(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .trim()
+    .slice(0, COMMENT_MAX);
+  if (!clean) return '';
+  return clean.split('\n').map((l) => `  > ${l.trim()}`.trimEnd()).join('\n');
+}
+
+function today() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Résout l'identifiant en fichier — jamais de chemin construit depuis l'entrée. */
+function ticketFile(id) {
   const safe = readdirSync(DIR).filter((f) => f.endsWith('.md')).map((f) => basename(f, '.md'));
-  if (!safe.includes(id)) throw new Error('identifiant inconnu');   // jamais de chemin construit depuis l'entrée
-  const file = join(DIR, `${id}.md`);
+  if (!safe.includes(id)) throw new Error('identifiant inconnu');
+  return join(DIR, `${id}.md`);
+}
+
+/** Ajoute une entrée au journal, en créant la section si elle n'existe pas. */
+function appendJournal(raw, entry) {
+  return raw.trimEnd() + (raw.includes('\n## Journal') ? '' : '\n\n## Journal') + `\n\n${entry}\n`;
+}
+
+/*
+ * ── Prise en compte ───────────────────────────────────────────────────────────
+ *
+ * Une remarque écrite n'est pas une remarque traitée. Un commentaire naît donc
+ * « en attente », et seule la ligne d'accusé le fait passer à « pris en compte » :
+ *
+ *   - 💬 2026-07-28 — pas trouvé l'écran dans le back-office
+ *     ↳ ✓ 2026-07-28 — ouvert en EX-042 (l'écran n'existe pas encore)
+ *
+ * ⚠️ Règle de conception, délibérée : **l'accusé ne s'écrit QUE depuis la ligne de
+ * commande** (`--ack`), jamais depuis la page web. La page sert à CONSTATER et à
+ * COMMENTER ; décider qu'une remarque est traitée est un acte d'analyse, pas une
+ * case à cocher. Sans cette règle, « pris en compte » finirait par vouloir dire
+ * « lu », et l'indicateur ne vaudrait plus rien.
+ *
+ * Même raison pour laquelle la page ne change jamais le `status:` d'un ticket.
+ */
+
+/** Marque d'accusé. Détectée en tête de ligne, après l'indentation. */
+const ACK_MARK = '↳ ✓';
+
+/**
+ * Découpe le journal en entrées structurées.
+ *
+ * Une entrée = une ligne `- ✅ …` ou `- 💬 …`, suivie de ses lignes de
+ * continuation indentées (`>` = commentaire, `↳ ✓` = accusé).
+ */
+/**
+ * Décalage de la section `## Journal` dans un corps de ticket, ou -1.
+ *
+ * ⚠️ Indispensable, et pas une optimisation : un ticket peut **documenter** le format
+ * du journal dans un bloc de code (c'est le cas de celui qui décrit cette fonction).
+ * Balayer tout le corps ferait passer ces EXEMPLES pour de vraies entrées — et `--ack`
+ * irait écrire un accusé au milieu d'une documentation. Le journal commence à son
+ * titre, un point c'est tout.
+ */
+function journalStart(body) {
+  const m = String(body ?? '').match(/^## Journal\s*$/m);
+  return m ? m.index + m[0].length : -1;
+}
+
+function parseJournal(body) {
+  const out = [];
+  const start = journalStart(body);
+  if (start < 0) return out;
+  const lines = String(body).slice(start).split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i].match(/^- (✅|💬) (\d{4}-\d{2}-\d{2}) — (.*)$/);
+    if (!head) continue;
+    const entry = { kind: head[1] === '✅' ? 'action' : 'comment', date: head[2], text: head[3].trim(), comment: [], ack: null, line: i };
+    for (let j = i + 1; j < lines.length; j++) {
+      const cont = lines[j].match(/^ {2}(>|↳ ✓) ?(.*)$/);
+      if (!cont) break;
+      if (cont[1] === '>') entry.comment.push(cont[2]);
+      else entry.ack = cont[2].trim();
+      i = j;
+    }
+    entry.comment = entry.comment.join('\n').trim();
+    // « En attente » = porte une parole de l'exploitant et n'a pas encore d'accusé.
+    entry.pending = !entry.ack && (entry.kind === 'comment' || entry.comment !== '');
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Accuse réception des remarques en attente d'un ticket (ligne de commande).
+ *
+ * Traite TOUTES les entrées en attente du ticket avec la même note : on instruit
+ * un ticket d'un bloc, pas remarque par remarque. Pour un traitement différencié,
+ * éditer le fichier directement — il est fait pour être lu et écrit à la main.
+ */
+function ackComments(id, note) {
+  const file = ticketFile(id);
+  const raw = readFileSync(file, 'utf8');
+  const clean = String(note ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, COMMENT_MAX);
+  if (!clean) throw new Error('une note de prise en compte est obligatoire — dire « pris en compte » sans dire ce qui a été fait ne vaut rien');
+  const entries = parseJournal(raw).filter((e) => e.pending);
+  if (!entries.length) throw new Error('aucune remarque en attente sur ce ticket');
+  const lines = raw.split('\n');
+  // `parseJournal` numérote depuis le début de la SECTION ; on repasse en absolu.
+  const base = raw.slice(0, journalStart(raw)).split('\n').length - 1;
+  // De la fin vers le début : insérer par le haut décalerait les indices suivants.
+  for (const e of [...entries].reverse()) {
+    let at = base + e.line;
+    while (at + 1 < lines.length && /^ {2}>/.test(lines[at + 1])) at++;
+    lines.splice(at + 1, 0, `  ${ACK_MARK} ${today()} — ${clean}`);
+  }
+  writeFileSync(file, lines.join('\n'), 'utf8');
+  return entries.length;
+}
+
+/** Coche une action : retire la ligne `action:` et journalise dans le corps du ticket. */
+function completeAction(id, comment) {
+  const file = ticketFile(id);
   const raw = readFileSync(file, 'utf8');
   const m = raw.match(/^action: (.*)$/m);
   if (!m) throw new Error('aucune action en attente sur ce ticket');
-  const d = new Date();
-  const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const quoted = quoteComment(comment);
   let out = raw.replace(/^action: .*\n/m, '');
-  out = out.trimEnd() + (out.includes('\n## Journal') ? '' : '\n\n## Journal') +
-    `\n\n- ✅ ${today} — ${m[1].trim()}\n`;
+  out = appendJournal(out, `- ✅ ${today()} — ${m[1].trim()}` + (quoted ? `\n${quoted}` : ''));
   writeFileSync(file, out, 'utf8');
   return m[1].trim();
 }
 
-/** Décoche : retire la dernière ligne de journal et restaure la ligne `action:`. */
+/** Commentaire libre sur un ticket — n'a pas besoin d'une action en attente. */
+function commentTicket(id, comment) {
+  const file = ticketFile(id);
+  const quoted = quoteComment(comment);
+  if (!quoted) throw new Error('commentaire vide');
+  // Le commentaire libre tient sur sa ligne : on retire le préfixe de citation de
+  // la première ligne et on garde les suivantes en continuation indentée.
+  const [first, ...rest] = quoted.split('\n');
+  const entry = `- 💬 ${today()} — ${first.replace(/^ {2}> ?/, '')}` +
+    (rest.length ? `\n${rest.join('\n')}` : '');
+  writeFileSync(file, appendJournal(readFileSync(file, 'utf8'), entry), 'utf8');
+  return true;
+}
+
+/**
+ * Décoche : retire la dernière action cochée ET son commentaire, puis restaure
+ * la ligne `action:`.
+ *
+ * ⚠️ Le piège : avant les commentaires, une entrée de journal tenait sur UNE ligne.
+ * Elle peut désormais être suivie de lignes « > » qui lui appartiennent. Ne retirer
+ * que la première laisserait un commentaire orphelin, rattaché à l'entrée
+ * précédente — c'est-à-dire une fausse trace. On consomme donc la continuation.
+ */
 function undoAction(id) {
-  const safe = readdirSync(DIR).filter((f) => f.endsWith('.md')).map((f) => basename(f, '.md'));
-  if (!safe.includes(id)) throw new Error('identifiant inconnu');
-  const file = join(DIR, `${id}.md`);
+  const file = ticketFile(id);
   const raw = readFileSync(file, 'utf8');
   if (/^action: /m.test(raw)) throw new Error('ce ticket a déjà une action en attente');
-  const lines = [...raw.matchAll(/^- ✅ \d{4}-\d{2}-\d{2} — (.+)$/gm)];
+  // Même précaution que `parseJournal` : ne JAMAIS chercher hors de la section
+  // Journal, sinon un exemple documenté dans le corps passerait pour une entrée.
+  const js = journalStart(raw);
+  if (js < 0) throw new Error('aucune action cochée à annuler');
+  const lines = [...raw.slice(js).matchAll(/^- ✅ \d{4}-\d{2}-\d{2} — (.+)$/gm)]
+    .map((m) => Object.assign(m, { index: m.index + js }));
   if (!lines.length) throw new Error('aucune action cochée à annuler');
   const last = lines[lines.length - 1];
   const text = last[1].trim();
-  let out = raw.slice(0, last.index) + raw.slice(last.index + last[0].length);
+  // Étend la coupe aux lignes de commentaire qui suivent immédiatement l'entrée.
+  let end = last.index + last[0].length;
+  const after = raw.slice(end);
+  const cont = after.match(/^(\n {2}>.*)+/);
+  if (cont) end += cont[0].length;
+  let out = raw.slice(0, last.index) + raw.slice(end);
   out = out.replace(/\n## Journal\s*$/, '\n');            // journal devenu vide
   out = out.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
   out = out.replace(/^(owner: .*)$/m, `$1\naction: ${text}`);
@@ -1267,15 +1592,26 @@ function serve() {
   });
 
   createServer((req, res) => {
-    if (req.method === 'POST' && (req.url === '/api/action/done' || req.url === '/api/action/undo')) {
-      const undo = req.url.endsWith('/undo');
+    // La page web peut : cocher une action, la décocher, écrire un commentaire.
+    // Elle ne peut PAS accuser réception ni changer un statut — voir ACK_MARK.
+    const POST_ROUTES = ['/api/action/done', '/api/action/undo', '/api/comment'];
+    if (req.method === 'POST' && POST_ROUTES.includes(req.url)) {
+      const route = req.url;
       let body = '';
-      req.on('data', (c) => { body += c; if (body.length > 2000) req.destroy(); });
+      // Enveloppe JSON + commentaire (≤ COMMENT_MAX) : marge large, mais bornée.
+      req.on('data', (c) => { body += c; if (body.length > 8000) req.destroy(); });
       req.on('end', () => {
         try {
-          const id = JSON.parse(body).id;
-          const done = undo ? undoAction(id) : completeAction(id);
-          console.log(`  ${undo ? '↩︎ action décochée' : '✅ action cochée'} — ${done}`);
+          const { id, comment } = JSON.parse(body);
+          if (route === '/api/comment') {
+            commentTicket(id, comment);
+            console.log(`  💬 commentaire — ${id}`);
+          } else if (route === '/api/action/undo') {
+            console.log(`  ↩︎ action décochée — ${undoAction(id)}`);
+          } else {
+            const done = completeAction(id, comment);
+            console.log(`  ✅ action cochée — ${done}${comment ? ' (+ commentaire)' : ''}`);
+          }
           res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok');
         } catch (e) {
           res.writeHead(400, { 'content-type': 'text/plain' }); res.end(e.message);
@@ -1324,6 +1660,28 @@ Le récit et le contexte qui n'appartiennent à aucun ticket en particulier.
   console.log(`Squelette créé dans ${DIR}. Lance « node backlog.mjs --serve ».`);
 }
 
+/**
+ * `--ack <ID> "<note>"` — déclare que les remarques d'un ticket sont prises en compte.
+ *
+ * Volontairement RÉSERVÉ à la ligne de commande : accuser réception est un acte
+ * d'analyse (« qu'est-ce que j'en ai fait ? »), pas une case à cocher. La note est
+ * obligatoire, faute de quoi l'indicateur finirait par ne signifier que « lu ».
+ */
+function ack() {
+  const rest = process.argv.slice(2).filter((a) => a !== '--ack');
+  const [id, ...note] = rest;
+  if (!id) { console.error('usage : node backlog.mjs --ack <ID> "ce qui en a été fait"'); process.exit(1); }
+  try {
+    const n = ackComments(id, note.join(' '));
+    console.log(`✓ ${n} remarque${n > 1 ? 's' : ''} de ${id} marquée${n > 1 ? 's' : ''} prise${n > 1 ? 's' : ''} en compte`);
+    generate({ quiet: true });
+  } catch (e) {
+    console.error(`✗ ${e.message}`);
+    process.exit(1);
+  }
+}
+
 if (flag('--init')) init();
+else if (flag('--ack')) ack();
 else if (flag('--serve')) serve();
 else generate();
