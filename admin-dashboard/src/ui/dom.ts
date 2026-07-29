@@ -66,6 +66,19 @@ export function toast(message: string, kind: "success" | "error" = "success"): v
   }, kind === "error" ? 6000 : 3000);
 }
 
+/**
+ * Poids de fichier lisible (o / Ko / Mo binaires, séparateur décimal français).
+ *
+ * Sert de contrepoint honnête à l'absence de progression d'envoi (BUG-013) : le poids compressé
+ * réel est une information VRAIE, là où un pourcentage d'octets envoyés serait inventé.
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes)} o`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} Ko`;
+  return `${(kb / 1024).toFixed(1).replace(".", ",")} Mo`;
+}
+
 export function formatMoney(cents: number, currency = "EUR"): string {
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency }).format(cents / 100);
 }

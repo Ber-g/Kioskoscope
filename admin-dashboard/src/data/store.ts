@@ -891,7 +891,15 @@ export class FleetStore {
    * `upsert:true` écrase l'objet au même chemin → l'URL publique est stable, on la suffixe donc
    * d'une version (`?v=`) pour invalider le cache navigateur/CDN après remplacement.
    */
-  async uploadOrgAsset(orgId: string, kind: OrgAssetKind, blob: Blob): Promise<{ ok: boolean; url?: string; error?: string }> {
+  async uploadOrgAsset(
+    orgId: string,
+    kind: OrgAssetKind,
+    blob: Blob,
+    // Franchissement de l'étape « transfert terminé, écriture de la ligne » : la SEULE
+    // progression que l'on connaisse réellement (l'API `fetch` n'expose pas l'envoi d'octets).
+    // L'écran s'en sert pour son 3ᵉ cran — un signal vrai plutôt qu'un pourcentage inventé.
+    onSaving?: () => void,
+  ): Promise<{ ok: boolean; url?: string; error?: string }> {
     let url: string;
     if (this.mode === "mock") {
       // Pas de bucket en mock. Sans cette branche, la voie de SUCCÈS de l'envoi était
@@ -906,6 +914,7 @@ export class FleetStore {
       const { data: pub } = supabase.storage.from("org-assets").getPublicUrl(path);
       url = `${pub.publicUrl}?v=${Date.now()}`;
     }
+    onSaving?.();
     const draft: OrgAssetsDraft = { ...(this.orgStyles.get(orgId)?.assets ?? {}) };
     draft[ORG_ASSET_FIELD[kind]] = url;
     const res = await this.upsertOrgStyleWithAssets(orgId, draft);

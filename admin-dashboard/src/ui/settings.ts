@@ -851,7 +851,7 @@ const tabRenderers: Record<Tab, (store: FleetStore, org: OrgSummary | null, canM
   invites: invitesTab,
   roles: () => rolesTab(),
   booths: (store, org) => boothsTab(store, org),
-  styles: (store, org, canManage) => orgStyleSettingsTab(store, org, canManage),
+  styles: orgStyleSettingsTab,
   access: (store, org, canManage) => accessTab(store, org, canManage),
   billing: billingTab,
 };

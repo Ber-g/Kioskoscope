@@ -13,7 +13,8 @@ import { MOCK_BOOTHS } from "../src/data/mockFleet";
 import { computeKpis, sortBooths, statusDistribution } from "../src/ui/components";
 import type { SortKey, SortState } from "../src/ui/components";
 import { boothToRow, rowToBooth } from "../src/data/mappers";
-import { formatMoney, relativeTime } from "../src/ui/dom";
+import { formatBytes, formatMoney, relativeTime } from "../src/ui/dom";
+import { buildStyle, seedDraft } from "../src/ui/orgStyleSettings";
 import { allHealthStatuses, connectionMeta, healthMeta } from "../src/domain/status";
 import { HOME, VIEWS, formatRoute, parseRoute, sameRoute, type Route, type SettingsTab } from "../src/ui/router";
 import { designatedOrgId, resolveSettingsNav, type SettingsNavContext } from "../src/ui/settingsNav";
@@ -446,6 +447,34 @@ assertEqual(connectionMeta("lte").label, "LTE (4G)", "connectionMeta(lte).label"
       "couture : l'URL ne peut plus annoncer un onglet non affiché",
     );
   }
+}
+
+// ── 9. Assemblage du style d'org ─────────────────────────────────────────────
+// `buildStyle` décide ce qui part en base : une couleur mal normalisée ou un bloc vide posé par
+// mégarde écrase le style MAÎTRE côté cabine. Jamais couvert jusqu'ici, alors que c'est du pur.
+{
+  const built = buildStyle({ bg: "#abc", accent: "pas une couleur" }, {}, "  Le Perchoir  ");
+  assertEqual(built.palette?.bg, "#aabbcc", "buildStyle : #abc normalisé en #aabbcc");
+  assertEqual(built.palette?.accent, undefined, "buildStyle : couleur invalide ignorée");
+  assertEqual(built.title, "Le Perchoir", "buildStyle : titre trimé");
+  assert(!("fonts" in built), "buildStyle : aucun bloc vide posé (fonts absent, pas {})");
+
+  const empty = buildStyle({}, {}, "   ");
+  assert(!("palette" in empty), "buildStyle : palette absente quand aucun slot n'est renseigné");
+  assert(!("title" in empty), "buildStyle : titre vide → clé absente (retour au maître)");
+
+  // `seedDraft` : l'arbitrage « d'où viennent les valeurs affichées ». C'est la charnière de
+  // BUG-006 — un brouillon perdu, ce sont des couleurs saisies qui disparaissent en silence.
+  const existing = { palette: { bg: "#111111" }, title: "Base" } as const;
+  assertEqual(seedDraft(existing, { draft: null }).palette.bg, "#111111", "seedDraft : sans brouillon → vérité du store");
+  assertEqual(seedDraft(existing, { draft: null }).title, "Base", "seedDraft : sans brouillon → titre du store");
+  const draft = { palette: { bg: "#ff0000" }, fonts: {}, title: "En cours" };
+  assertEqual(seedDraft(existing, { draft }).palette.bg, "#ff0000", "seedDraft : le brouillon l'emporte (BUG-006)");
+  assertEqual(seedDraft(null, { draft: null }).title, "", "seedDraft : brouillon purgé et store vide → champs vides");
+
+  assertEqual(formatBytes(512), "512 o", "formatBytes : sous le kilo-octet");
+  assertEqual(formatBytes(145000), "142 Ko", "formatBytes : kilo-octets arrondis");
+  assertEqual(formatBytes(2400000), "2,3 Mo", "formatBytes : méga-octets, virgule française");
 }
 
 // ── Verdict ──────────────────────────────────────────────────────────────────
