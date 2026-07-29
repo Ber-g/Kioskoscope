@@ -5,13 +5,16 @@ import { healthBadge, connectionBadge, indicatorChips } from "./components";
 import { timeSeriesChart } from "./chart";
 import { openBoothForm } from "./drawer";
 import { openAccessModal, accessStatus, OPERATOR_ROLE_LABELS } from "./settings";
+import type { HubTab } from "./router";
 
 // Hub de gestion d'UNE cabine (CIN-045). Réponse au JTBD « tout gérer pour une cabine au
 // même endroit » : on garde les vues flotte (globales), et on AJOUTE cette surface par
 // cabine. Chaque onglet est scopé à la borne, en réutilisant les données/méthodes du store —
 // aucune duplication de la logique métier des vues globales.
 
-export type HubTab = "synthese" | "maj" | "acces" | "fiche" | "medias" | "revenus";
+// CIN-118 : les clés d'onglet viennent du routeur (un onglet est aussi une adresse). Ré-exportées
+// ici pour que les appelants historiques n'aient pas à savoir d'où elles viennent.
+export type { HubTab };
 
 /**
  * Menu de gestion d'une cabine — SOURCE UNIQUE (ordre + libellés). Consommé par le hub (onglets)
