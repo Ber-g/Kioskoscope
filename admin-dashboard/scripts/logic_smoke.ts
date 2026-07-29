@@ -15,6 +15,8 @@ import type { SortKey, SortState } from "../src/ui/components";
 import { boothToRow, rowToBooth } from "../src/data/mappers";
 import { formatMoney, relativeTime } from "../src/ui/dom";
 import { allHealthStatuses, connectionMeta, healthMeta } from "../src/domain/status";
+import { HOME, VIEWS, formatRoute, parseRoute, sameRoute, type Route, type SettingsTab } from "../src/ui/router";
+import { designatedOrgId, resolveSettingsNav, type SettingsNavContext } from "../src/ui/settingsNav";
 import { setLang } from "../src/i18n";
 
 // DÉTERMINISME : ce test vérifie des libellés FRANÇAIS (relativeTime, healthMeta…). La langue par
@@ -252,6 +254,199 @@ assertEqual(healthMeta("error").color, "red", "healthMeta(error).color = red");
 assertEqual(healthMeta("operational").label, "Opérationnel", "healthMeta(operational).label (fr)");
 assertEqual(connectionMeta("wifi").label, "Wi-Fi", "connectionMeta(wifi).label");
 assertEqual(connectionMeta("lte").label, "LTE (4G)", "connectionMeta(lte).label");
+
+// ── 7. Routage (CIN-118) ─────────────────────────────────────────────────────
+// La grammaire d'URL est exactement le genre de code qui casse SANS BRUIT : une route mal lue
+// n'affiche pas d'erreur, elle affiche la mauvaise page. D'où une couverture serrée ici.
+{
+  const p = (h: string): Route | null => parseRoute(h);
+  const view = (h: string): string => p(h)?.view ?? "∅";
+
+  // Accueil et vues simples
+  assertEqual(view(""), "overview", "parseRoute('') : accueil (URL nue au premier chargement)");
+  assertEqual(view("#/"), "overview", "parseRoute('#/') : accueil");
+  assertEqual(view("#"), "overview", "parseRoute('#') : accueil");
+  assertEqual(p("#/map")?.overviewMode, "map", "parseRoute('#/map') : vue d'ensemble en carte");
+  assertEqual(p("#/")?.overviewMode, "list", "parseRoute('#/') : vue d'ensemble en liste");
+  assertEqual(view("#/sessions"), "sessions", "parseRoute('#/sessions')");
+  assertEqual(view("#/organizations"), "organizations", "parseRoute('#/organizations') : le roster");
+
+  // Onglets par défaut — implicites dans l'URL, explicites dans la route
+  assertEqual(p("#/settings")?.settingsTab, "general", "parseRoute('#/settings') : onglet Général par défaut");
+  assertEqual(p("#/settings/styles")?.settingsTab, "styles", "parseRoute('#/settings/styles')");
+  assertEqual(p("#/booths/abc")?.boothId, "abc", "parseRoute('#/booths/abc') : identifiant de cabine");
+  assertEqual(p("#/booths/abc")?.boothTab, "synthese", "parseRoute('#/booths/abc') : onglet Synthèse par défaut");
+  assertEqual(p("#/booths/abc/medias")?.boothTab, "medias", "parseRoute('#/booths/abc/medias') : deep-link CIN-045");
+
+  // Administration d'un client depuis le roster (CIN-091 b)
+  assertEqual(view("#/organizations/org-7"), "settings", "parseRoute('#/organizations/org-7') : hub d'administration");
+  assertEqual(p("#/organizations/org-7")?.adminOrgId, "org-7", "parseRoute('#/organizations/org-7') : org ciblée");
+  assertEqual(p("#/organizations/org-7/members")?.settingsTab, "members", "parseRoute('#/organizations/org-7/members')");
+  assertEqual(p("#/settings")?.adminOrgId, null, "parseRoute('#/settings') : aucune org ciblée (la sienne)");
+
+  // Ce qui doit être REFUSÉ. `null` et pas un repli silencieux : l'appelant doit pouvoir
+  // remplacer l'entrée d'historique, sinon le bouton Retour retraverse l'URL fautive.
+  assertEqual(p("#/nope"), null, "parseRoute : vue inconnue refusée");
+  assertEqual(p("#/booths"), null, "parseRoute : cabine sans identifiant refusée");
+  assertEqual(p("#/booths/abc/nope"), null, "parseRoute : onglet de cabine inconnu refusé");
+  assertEqual(p("#/settings/nope"), null, "parseRoute : onglet d'organisation inconnu refusé");
+  assertEqual(p("#/sessions/extra"), null, "parseRoute : segment surnuméraire refusé");
+  assertEqual(p("#/booths/a/b/c"), null, "parseRoute : profondeur excessive refusée");
+  assertEqual(p("#/map/extra"), null, "parseRoute : '#/map' n'accepte pas de segment");
+  // Une URL malformée ne doit pas faire LEVER (`decodeURIComponent` sur un '%' isolé). Elle
+  // reste une route BIEN FORMÉE dont l'identifiant ne résoudra simplement aucune cabine : le hub
+  // répond « Cabine introuvable », ce qui est la réponse honnête à un lien cassé — bien meilleure
+  // qu'une redirection muette vers l'accueil, qui laisserait croire que le lien était bon.
+  {
+    let threw = false;
+    let parsed: Route | null = null;
+    try {
+      parsed = p("#/booths/%");
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "parseRoute : échappement invalide ne fait pas lever");
+    assertEqual(parsed?.boothId, "%", "parseRoute : segment indécodable conservé tel quel");
+  }
+
+  // Aller-retour : formater puis relire doit redonner la même adresse.
+  const roundTrip = (r: Route, expected: string, label: string): void => {
+    const href = formatRoute(r);
+    assertEqual(href, expected, `formatRoute : ${label}`);
+    const back = parseRoute(href);
+    assert(back !== null && sameRoute(back, r), `aller-retour : ${label}`);
+  };
+  roundTrip(HOME, "#/", "accueil");
+  roundTrip({ ...HOME, overviewMode: "map" }, "#/map", "carte");
+  roundTrip({ ...HOME, view: "sessions" }, "#/sessions", "vue simple");
+  roundTrip({ ...HOME, view: "settings" }, "#/settings", "mon organisation");
+  roundTrip({ ...HOME, view: "settings", settingsTab: "billing" }, "#/settings/billing", "onglet d'organisation");
+  roundTrip({ ...HOME, view: "settings", adminOrgId: "org-7" }, "#/organizations/org-7", "administration d'un client");
+  roundTrip({ ...HOME, view: "settings", adminOrgId: "org-7", settingsTab: "roles" }, "#/organizations/org-7/roles", "client + onglet");
+  roundTrip({ ...HOME, view: "booth", boothId: "booth-1" }, "#/booths/booth-1", "hub cabine");
+  roundTrip({ ...HOME, view: "booth", boothId: "booth-1", boothTab: "revenus" }, "#/booths/booth-1/revenus", "hub cabine + onglet");
+
+  // Identifiants exotiques : un id à barre oblique casserait la grammaire s'il n'était pas échappé.
+  {
+    const r: Route = { ...HOME, view: "booth", boothId: "a/b c" };
+    const back = parseRoute(formatRoute(r));
+    assertEqual(back?.boothId, "a/b c", "aller-retour : identifiant échappé (slash + espace)");
+  }
+
+  // `formatRoute` n'émet QUE ce qui concerne la vue : un champ résiduel ne doit pas fuiter
+  // dans l'URL — c'est ce qui rend `sameRoute` fiable comme garde anti-boucle.
+  assertEqual(
+    formatRoute({ ...HOME, view: "sessions", boothId: "x", settingsTab: "billing", adminOrgId: "org-7" }),
+    "#/sessions",
+    "formatRoute : les champs hors-sujet n'apparaissent pas dans l'URL",
+  );
+  assert(
+    sameRoute({ ...HOME, view: "sessions", boothId: "x" }, { ...HOME, view: "sessions", settingsTab: "roles" }),
+    "sameRoute : même adresse malgré des champs hors-sujet différents",
+  );
+  assert(!sameRoute(HOME, { ...HOME, overviewMode: "map" }), "sameRoute : liste ≠ carte");
+
+  // Une vue `booth` sans identifiant n'est pas adressable — repli sur l'accueil plutôt qu'une
+  // URL `#/booths/` que personne ne saurait relire.
+  assertEqual(formatRoute({ ...HOME, view: "booth" }), "#/", "formatRoute : cabine sans identifiant → accueil");
+
+  // Toute vue déclarée doit produire une adresse relisible : garde-fou pour la prochaine vue
+  // ajoutée à `VIEWS` sans segment d'URL correspondant.
+  for (const v of VIEWS) {
+    const r: Route = { ...HOME, view: v, boothId: v === "booth" ? "booth-1" : null };
+    const back = parseRoute(formatRoute(r));
+    assertEqual(back?.view, v, `toute vue est adressable : ${v}`);
+  }
+}
+
+// ── 8. Navigation du menu Organisation ───────────────────────────────────────
+// Le repli d'org et le repli d'onglet étaient séparés par le rendu : l'URL était publiée entre
+// les deux, donc elle pouvait annoncer un onglet que l'écran n'affichait pas. Ces assertions
+// tiennent la règle qui les réunit — et la COUTURE avec le routeur, qui est le vrai gain :
+// c'est l'accord entre l'adresse et l'écran qui casse en silence, jamais chacun pris à part.
+{
+  const ctx = (over: Partial<SettingsNavContext> = {}): SettingsNavContext => ({
+    orgIds: ["org-a", "org-b"],
+    accountOrgId: "org-a",
+    targetOrgId: null,
+    isGlobalAdmin: false,
+    ...over,
+  });
+  const nav = (tab: SettingsTab, orgId: string | null): { tab: SettingsTab; orgId: string | null } => ({ tab, orgId });
+
+  assertEqual(resolveSettingsNav(nav("general", "org-b"), ctx()).orgId, "org-b", "resolveSettingsNav : org valide conservée");
+  assertEqual(
+    resolveSettingsNav(nav("general", "org-disparue"), ctx({ targetOrgId: "org-b" })).orgId,
+    "org-b",
+    "resolveSettingsNav : org supprimée → repli sur la cible",
+  );
+  assertEqual(resolveSettingsNav(nav("general", null), ctx()).orgId, "org-a", "resolveSettingsNav : ni requête ni cible → org du compte");
+  assertEqual(
+    resolveSettingsNav(nav("general", null), ctx({ accountOrgId: null, isGlobalAdmin: true })).orgId,
+    "org-a",
+    "resolveSettingsNav : global_admin sans org de compte → première org visible",
+  );
+  assertEqual(
+    resolveSettingsNav(nav("general", null), ctx({ orgIds: [], accountOrgId: null, isGlobalAdmin: true })).orgId,
+    null,
+    "resolveSettingsNav : aucune org visible → null (sans lever)",
+  );
+  assertEqual(
+    resolveSettingsNav(nav("subscription", "org-a"), ctx({ accountOrgId: null, isGlobalAdmin: true })).tab,
+    "subscription",
+    "resolveSettingsNav : onglet plateforme conservé pour un global_admin",
+  );
+  {
+    const r = resolveSettingsNav(nav("subscription", "org-a"), ctx());
+    assertEqual(r.tab, "general", "resolveSettingsNav : onglet plateforme masqué → repli sur Général");
+    assert(r.changed, "resolveSettingsNav : le repli d'onglet est signalé (changed) — sinon l'URL garde l'ancien onglet");
+  }
+  assert(!resolveSettingsNav(nav("members", "org-a"), ctx()).changed, "resolveSettingsNav : état déjà résolu → changed faux");
+  {
+    // Idempotence : re-résoudre un état résolu ne doit RIEN bouger, sinon la boucle
+    // rendu → publication d'URL → rendu ne se stabiliserait jamais.
+    const c = ctx({ targetOrgId: "org-b" });
+    const once = resolveSettingsNav(nav("subscription", "org-disparue"), c);
+    const twice = resolveSettingsNav(nav(once.tab, once.orgId), c);
+    assertEqual(twice.tab, once.tab, "resolveSettingsNav : idempotent (onglet)");
+    assertEqual(twice.orgId, once.orgId, "resolveSettingsNav : idempotent (org)");
+    assert(!twice.changed, "resolveSettingsNav : idempotent (rien à republier au second passage)");
+  }
+  assertEqual(
+    resolveSettingsNav(nav("members", "org-b"), ctx({ accountOrgId: null, isGlobalAdmin: true })).tab,
+    "members",
+    "resolveSettingsNav : changer d'org ne change pas l'onglet",
+  );
+
+  assertEqual(designatedOrgId("org-b", null), "org-b", "designatedOrgId : global_admin → toute org affichée est désignée");
+  assertEqual(designatedOrgId("org-a", "org-a"), null, "designatedOrgId : super_user sur SON org → pas de désignation");
+  assertEqual(designatedOrgId("org-b", "org-a"), "org-b", "designatedOrgId : super_user sur une AUTRE org → désignée");
+  assertEqual(designatedOrgId(null, "org-a"), null, "designatedOrgId : aucune org affichée → null");
+
+  // Couture avec le routeur : l'adresse est dérivée de la résolution, jamais saisie à part.
+  const settingsHref = (tab: SettingsTab, orgId: string | null, c: SettingsNavContext): string => {
+    const r = resolveSettingsNav(nav(tab, orgId), c);
+    return formatRoute({ ...HOME, view: "settings", settingsTab: r.tab, adminOrgId: designatedOrgId(r.orgId, c.accountOrgId) });
+  };
+  assertEqual(
+    settingsHref("general", null, ctx({ accountOrgId: null, isGlobalAdmin: true })),
+    "#/organizations/org-a",
+    "couture : un global_admin sur « Mon organisation » obtient l'adresse d'un CLIENT",
+  );
+  assertEqual(settingsHref("general", null, ctx()), "#/settings", "couture : un super_user sur son org reste sur #/settings");
+  {
+    // Bout en bout : une adresse d'onglet plateforme lue par un non-admin ne peut pas survivre.
+    const parsed = parseRoute("#/settings/subscription");
+    assert(parsed?.settingsTab === "subscription", "couture : #/settings/subscription est bien lu");
+    const r = resolveSettingsNav(nav(parsed!.settingsTab, null), ctx());
+    assertEqual(r.tab, "general", "couture : onglet plateforme refusé à un non-admin");
+    assertEqual(
+      formatRoute({ ...HOME, view: "settings", settingsTab: r.tab, adminOrgId: designatedOrgId(r.orgId, "org-a") }),
+      "#/settings",
+      "couture : l'URL ne peut plus annoncer un onglet non affiché",
+    );
+  }
+}
 
 // ── Verdict ──────────────────────────────────────────────────────────────────
 const total = passed + failed;
