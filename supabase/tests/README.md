@@ -72,9 +72,23 @@ ISO_DEVICE_EMAIL='…' ISO_DEVICE_PASSWORD='…' node supabase/tests/isolation.m
 
 Ce que la sortie garantit désormais :
 
-- **Ce qui n'a pas tourné est annoncé** (`▸ Bloc org-vs-org NON EXÉCUTÉ`). Un total partiel qui ne
-  se déclare pas partiel se lit comme une preuve complète — c'est ce qui avait laissé le bloc
-  device inexécuté pendant cinq jours sous un « 79/79 OK » exact et trompeur.
+- **Ce qui n'a pas tourné est annoncé** (`▸ Bloc org-vs-org NON EXÉCUTÉ`, `▸ Bloc device NON
+  EXÉCUTÉ`). Un total partiel qui ne se déclare pas partiel se lit comme une preuve complète —
+  c'est ce qui avait laissé le bloc device inexécuté pendant cinq jours sous un « 79/79 OK »
+  exact et trompeur. **Un bloc sauté n'incrémente aucun compteur** : jusqu'au 2026-07-29 le saut
+  du bloc device s'écrivait `assert(true, …)`, donc il gonflait le dénominateur en plus de se
+  lire comme un succès. Le « 79/79 » historique valait en réalité 78.
+
+### Totaux attendus — à comparer à chaque run
+
+| Suites lancées | Total attendu |
+|---|---|
+| org-vs-org seule | **78** (39 vérifications × 2 sens) |
+| device seule | **10** |
+| les deux ensemble | **88** |
+
+Un total qui ne figure pas dans ce tableau veut dire qu'un bloc a été sauté, ou qu'un bloc a été
+ajouté sans mettre ce tableau à jour. Les deux méritent qu'on s'arrête.
 - **Le compte de test doit appartenir à une org qui a du contenu.** Toutes les vérifications de
   la suite device sont des négations (« 0 ligne de l'org adverse », « écriture refusée ») : un
   compte qui ne lit RIEN les passe toutes, trivialement. Un **contrôle positif** échoue donc

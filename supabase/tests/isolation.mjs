@@ -482,11 +482,16 @@ async function main() {
 async function runDeviceSuite(url, anon) {
   const email = process.env.ISO_DEVICE_EMAIL;
   const password = process.env.ISO_DEVICE_PASSWORD;
-  console.log(`\n▸ Device (compte borne « nu »)`);
   if (!email || !password) {
-    assert(true, `bloc device ignoré (ISO_DEVICE_EMAIL / ISO_DEVICE_PASSWORD non fournis)`);
+    // Le saut s'annonçait par un `assert(true, "bloc device ignoré")` : un ✓ vert au milieu
+    // d'autres ✓ verts, ET une unité de plus au total. C'est le symptôme même que CIN-122
+    // décrit — un contrôle non exécuté qui se lit comme un contrôle réussi, et qui gonfle le
+    // dénominateur dont on se sert pour croire la preuve complète. Même traitement que le bloc
+    // org-vs-org : on l'annonce comme NON EXÉCUTÉ, et on ne compte rien.
+    console.log("\n▸ Bloc device NON EXÉCUTÉ (ISO_DEVICE_EMAIL / ISO_DEVICE_PASSWORD non fournis)");
     return;
   }
+  console.log(`\n▸ Device (compte borne « nu »)`);
   const client = createClient(url, anon, { auth: { persistSession: false, autoRefreshToken: false } });
   const { error: signErr } = await client.auth.signInWithPassword({ email, password });
   if (signErr) {
