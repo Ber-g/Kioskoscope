@@ -24,7 +24,6 @@ import { execFileSync } from 'node:child_process';
 // ─────────────────────────────────────────────────────────── configuration
 
 const ARGV = process.argv.slice(2);
-const flag = (name) => ARGV.includes(name);
 const opt = (name, fallback) => {
   const i = ARGV.indexOf(name);
   return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : fallback;
@@ -1212,7 +1211,7 @@ function drawer(id, actionText) {
   d.onclick = ev => ev.stopPropagation();          // cliquer dedans ne referme pas
 
   // L'identifiant du ticket EST le code de l'action : le format n'autorise qu'une
-  // action en attente par ticket, donc « EX-117 » la désigne sans ambiguïté. Pas de
+  // action en attente par ticket, donc « CIN-117 » la désigne sans ambiguïté. Pas de
   // numérotation parallèle — ce serait une seconde identité à tenir synchronisée.
   const head = el('div', 'drawhd');
   head.innerHTML = '<b>Action <span class="code" title="Cliquer pour copier">' + id + '</span></b>' +
@@ -2127,19 +2126,25 @@ on travaille. 300 tickets coûtent alors autant par opération que 30.
 
 ## Remarques et prise en compte
 
-Une remarque s'écrit depuis la page web, sous l'action ou le ticket qu'elle concerne — le lien
-est **physique**, il n'y a ni identifiant de commentaire ni jointure. Elle naît « en attente »
-et remonte en tête de \`BACKLOG.md\` tant qu'elle n'est pas instruite.
+Une remarque s'écrit depuis la page web ou en ligne de commande, sous l'action ou le ticket
+qu'elle concerne — le lien est **physique**, il n'y a ni identifiant de commentaire ni jointure.
+Elle naît « en attente » et remonte en tête de \`BACKLOG.md\` tant qu'elle n'est pas instruite.
 
 | Geste | Page web | Ligne de commande |
 |---|---|---|
-| Cocher une action faite | ✅ | — |
-| Écrire une remarque | ✅ | — |
+| Cocher une action faite | ✅ | \`--done <ID> ["…"]\` |
+| Décocher la dernière action | ✅ | \`--undo <ID>\` |
+| Écrire une remarque | ✅ | \`--comment <ID> "…"\` |
 | Déclarer « pris en compte » | ❌ | \`--ack <ID> "…"\` |
 | Changer le \`status:\` d'un ticket | ❌ | ✅ (édition du fichier) |
 
+Les deux premières lignes sont **le même geste sur deux surfaces** : ce qui se coche d'un clic se
+coche aussi sans écran. Les deux dernières ne sont **pas** un geste de la page, et c'est
+délibéré — ce sont des actes d'analyse.
+
 La note de \`--ack\` est **obligatoire** et doit dire **ce qui a été fait**, pas « vu ». Sans
-cette séparation, « pris en compte » finirait par vouloir dire « lu ».
+cette séparation, « pris en compte » finirait par vouloir dire « lu ». Celle de \`--done\` est
+facultative : l'action porte déjà son libellé, rien ne se perd si on coche sans commenter.
 
 Instruire une remarque, c'est **trancher** : soit elle clôt son ticket, soit elle en ouvre un
 nouveau. Une remarque sans accusé reste affichée en attente, et l'indicateur perd son sens.
@@ -2225,6 +2230,9 @@ const USAGE = `TicketoScope — un registre de tickets à coût marginal plat.
   node backlog.mjs                       régénère BACKLOG.md + backlog.html
   node backlog.mjs --serve               http://localhost:${PORT}, rechargement auto
   node backlog.mjs --init                crée un dossier ${basename(DIR)}/ d'exemple
+  node backlog.mjs --done <ID> ["…"]     coche l'action en attente (commentaire FACULTATIF)
+  node backlog.mjs --undo <ID>           décoche la dernière action cochée et la remet en attente
+  node backlog.mjs --comment <ID> "…"    écrit une remarque dans le journal d'un ticket
   node backlog.mjs --ack <ID> "<note>"   marque les remarques d'un ticket prises en compte
   node backlog.mjs --note "<texte>"      dépose une remarque SANS ticket, dans « À trancher »
   node backlog.mjs --triage <ID> "…"     dit ce qu'une remarque de « À trancher » est devenue
@@ -2238,17 +2246,24 @@ Options :
 Un ticket = un fichier ${basename(DIR)}/<ID>.md. Le contrat de frontmatter est dans
 ${basename(DIR)}/PROTOCOLE.md (déposé par --init).`;
 
-const KNOWN_FLAGS = new Set(['--init', '--serve', '--ack', '--note', '--triage', '--help', '-h']);
+const KNOWN_FLAGS = new Set(['--init', '--serve', '--ack', '--note', '--triage',
+  '--done', '--undo', '--comment', '--help', '-h']);
 const VALUE_OPTS = new Set(['--dir', '--out', '--port']);
-/** Drapeaux dont TOUT ce qui suit est la charge utile — donc du texte libre, pas des options. */
-const PAYLOAD_FLAGS = new Set(['--ack', '--note', '--triage']);
+/**
+ * Drapeaux dont TOUT ce qui suit est la charge utile — donc du texte libre, pas des options.
+ *
+ * `--undo` n'en fait PAS partie : il ne prend qu'un identifiant, rien qui ressemble à du
+ * texte libre, donc les options qui le suivent restent validables.
+ */
+const PAYLOAD_FLAGS = new Set(['--ack', '--note', '--triage', '--done', '--comment']);
 
 /**
  * Premier drapeau non reconnu, ou `null`.
  *
- * S'arrête au premier drapeau à charge utile (`--ack`, `--note`, `--triage`) : tout ce qui
- * suit lui appartient, et c'est du texte libre — une note a parfaitement le droit de
- * commencer par deux tirets. La valider reviendrait à refuser une note légitime.
+ * S'arrête au premier drapeau à charge utile (`--ack`, `--note`, `--triage`, `--done`,
+ * `--comment`) : tout ce qui suit lui appartient, et c'est du texte libre — une note a
+ * parfaitement le droit de commencer par deux tirets. La valider reviendrait à refuser
+ * une note légitime.
  */
 function unknownFlag() {
   for (let i = 0; i < ARGV.length; i++) {
@@ -2256,6 +2271,25 @@ function unknownFlag() {
     if (PAYLOAD_FLAGS.has(a)) return null;
     if (VALUE_OPTS.has(a)) { i++; continue; }
     if (a.startsWith('-') && !KNOWN_FLAGS.has(a)) return a;
+  }
+  return null;
+}
+
+/**
+ * Le drapeau de commande retenu : le PREMIER rencontré, ou `null` pour la génération.
+ *
+ * ⚠️ Le dispatch testait `ARGV.includes('--undo')` & co. Ça suffisait tant que les charges
+ * utiles étaient des notes ; ça ne suffit plus depuis `--comment`, car le texte libre d'un
+ * commentaire parle couramment de l'outil lui-même :
+ * `--comment TKS-001 "il faudrait un --undo en ligne de commande"` aurait déclenché `--undo`
+ * et écrit dans le fichier au lieu de commenter. Même règle qu'`unknownFlag()` : on s'arrête
+ * au premier drapeau à charge utile, tout ce qui suit lui appartient.
+ */
+function command() {
+  for (let i = 0; i < ARGV.length; i++) {
+    const a = ARGV[i];
+    if (VALUE_OPTS.has(a)) { i++; continue; }
+    if (KNOWN_FLAGS.has(a)) return a === '-h' ? '--help' : a;
   }
   return null;
 }
@@ -2286,15 +2320,71 @@ function triage() {
   } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
 }
 
+/*
+ * ── Les trois gestes que la page web savait déjà faire ────────────────────────
+ *
+ * `completeAction`, `undoAction` et `commentTicket` n'étaient joignables que par un POST
+ * sur 127.0.0.1. L'asymétrie inverse — `--ack` et `--triage` interdits au web — est
+ * délibérée et argumentée (trancher est un acte d'analyse, pas un clic). Celle-ci ne
+ * l'était pas : rien nulle part ne justifiait qu'il faille un navigateur pour cocher.
+ * Voir TKS-015.
+ */
+
+/**
+ * `--done <ID> ["<note>"]` — coche l'action en attente d'un ticket.
+ *
+ * La note est FACULTATIVE, contrairement à celle de `--ack` : l'action porte déjà son
+ * propre libellé, que le journal recopie tel quel — rien ne se perd si on coche sans
+ * commenter. La page web le permet ; deux surfaces ne peuvent pas dire deux règles
+ * différentes pour le même geste.
+ */
+function done() {
+  const [id, ...note] = ARGV.slice(ARGV.indexOf('--done') + 1);
+  if (!id) { console.error('usage : node backlog.mjs --done <ID> ["ce qu\'on en a appris"]'); process.exit(1); }
+  const comment = note.join(' ');
+  try {
+    const action = completeAction(id, comment);
+    console.log(`✅ ${id} — action cochée : ${action}${comment.trim() ? ' (+ commentaire)' : ''}`);
+    generate({ quiet: true });
+  } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
+}
+
+/** `--undo <ID>` — décoche la dernière action cochée et la remet en attente. */
+function undo() {
+  const [id] = ARGV.slice(ARGV.indexOf('--undo') + 1);
+  if (!id) { console.error('usage : node backlog.mjs --undo <ID>'); process.exit(1); }
+  try {
+    const action = undoAction(id);
+    console.log(`↩︎ ${id} — action décochée : ${action}`);
+    generate({ quiet: true });
+  } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
+}
+
+/** `--comment <ID> "<texte>"` — écrit une remarque dans le journal d'un ticket. */
+function comment() {
+  const [id, ...text] = ARGV.slice(ARGV.indexOf('--comment') + 1);
+  if (!id) { console.error('usage : node backlog.mjs --comment <ID> "ce qu\'on a constaté"'); process.exit(1); }
+  try {
+    // Un commentaire vide est refusé par `commentTicket` — comme une note d'`--ack` vide.
+    commentTicket(id, text.join(' '));
+    console.log(`💬 remarque écrite sur ${id} — en attente de prise en compte`);
+    generate({ quiet: true });
+  } catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
+}
+
 const bad = unknownFlag();
-if (flag('--help') || flag('-h')) console.log(USAGE);
+const cmd = command();
+if (cmd === '--help') console.log(USAGE);
 else if (bad) {
   console.error(`✗ option inconnue : ${bad}\n\n${USAGE}`);
   process.exit(1);
 }
-else if (flag('--init')) init();
-else if (flag('--note')) note();
-else if (flag('--triage')) triage();
-else if (flag('--ack')) ack();
-else if (flag('--serve')) serve();
+else if (cmd === '--init') init();
+else if (cmd === '--note') note();
+else if (cmd === '--triage') triage();
+else if (cmd === '--ack') ack();
+else if (cmd === '--done') done();
+else if (cmd === '--undo') undo();
+else if (cmd === '--comment') comment();
+else if (cmd === '--serve') serve();
 else generate();
