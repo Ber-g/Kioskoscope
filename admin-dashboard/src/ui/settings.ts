@@ -6,15 +6,20 @@ import { PERMISSION_MATRIX, ROLE_HINTS, ROLE_LABELS, ROLE_ORDER } from "../domai
 import { el, icon, toast } from "./dom";
 import { MODULES, SUBSCRIPTION_TYPES } from "../domain/modules";
 import { orgStyleSettingsTab } from "./orgStyleSettings";
+import type { SettingsTab } from "./router";
+import { ADMIN_ONLY_SETTINGS_TABS, designatedOrgId, resolveSettingsNav } from "./settingsNav";
 
 // Menu Organisation (hub à onglets, patterns SaaS classiques) : Général, Membres,
 // Invitations, Rôles & permissions, Kiosks, Mes styles, Paiement. La gestion (écriture) est
 // réservée au super_user (aligné sur la RLS 0006) ; les autres voient en lecture.
 
-type Tab = "general" | "members" | "invites" | "roles" | "booths" | "styles" | "access" | "billing" | "subscription";
-// `adminOnly` : onglet de pilotage PLATEFORME (l'org le subit, ne le règle pas). Masqué —
-// pas grisé — hors global_admin : un client n'a pas à savoir qu'un écran d'attribution existe.
-const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly?: boolean }> = [
+// CIN-118 : les clés viennent du routeur — un onglet est aussi une adresse. Ce sens de
+// dépendance garde `router.ts` sans DOM, donc testable hors navigateur.
+type Tab = SettingsTab;
+// `adminOnly` est DÉRIVÉ de `ADMIN_ONLY_SETTINGS_TABS`, jamais écrit à la main ici : un futur
+// onglet de pilotage plateforme ne peut donc pas être déclaré côté écran sans l'être côté
+// résolveur — c'est ce décalage qui laissait une URL nommer un onglet devenu invisible.
+const TAB_LABELS: ReadonlyArray<{ key: Tab; label: string }> = [
   { key: "general", label: "Général" },
   { key: "members", label: "Membres" },
   { key: "invites", label: "Invitations" },
@@ -23,8 +28,12 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly?: boolean }> = [
   { key: "styles", label: "Mes styles" },
   { key: "access", label: "Accès opérateur" },
   { key: "billing", label: "Paiement" },
-  { key: "subscription", label: "Souscription & modules", adminOnly: true },
+  { key: "subscription", label: "Souscription & modules" },
 ];
+const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly: boolean }> = TAB_LABELS.map((t) => ({
+  ...t,
+  adminOnly: ADMIN_ONLY_SETTINGS_TABS.includes(t.key),
+}));
 
 /**
  * Navigation de la page (onglet actif + org affichée), conservée HORS du cycle de rendu.
@@ -44,14 +53,21 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; adminOnly?: boolean }> = [
 const NAV: { tab: Tab; orgId: string | null } = { tab: "general", orgId: null };
 
 /**
- * Réinitialise la navigation du menu Organisation.
+ * Impose la navigation du menu Organisation (CIN-118 : appelé par le routeur).
  *
- * À appeler à l'ENTRÉE EXPLICITE dans la page (clic de menu, ouverture d'une org depuis le
- * roster) — jamais depuis un re-render, sinon on réintroduit exactement le bug ci-dessus.
+ * À appeler UNIQUEMENT sur une navigation — clic de menu, ouverture d'une org depuis le roster,
+ * bouton Retour du navigateur — jamais depuis un re-render, sinon on réintroduit exactement le
+ * bug documenté ci-dessus. Depuis CIN-118 c'est l'URL qui porte cet état : `#/settings` remet
+ * l'onglet sur « Général » par le seul fait que c'est ce que l'URL demande, sans règle séparée.
  */
-export function resetSettingsNav(): void {
-  NAV.tab = "general";
-  NAV.orgId = null;
+export function setSettingsNav(tab: Tab, orgId: string | null): void {
+  NAV.tab = tab;
+  NAV.orgId = orgId;
+}
+
+/** Navigation courante, pour que le routeur puisse la refléter dans l'URL. */
+export function getSettingsNav(): { tab: Tab; orgId: string | null } {
+  return { tab: NAV.tab, orgId: NAV.orgId };
 }
 
 /** Rôles attribuables à un accès opérateur cabine (global_admin = plateforme, non créé ici). */
@@ -91,24 +107,38 @@ const ROLE_SUFFIX: Record<OperatorRole, string> = {
  * « Organisations » en cliquant un client. Sans lui, on retombe sur l'org active du compte —
  * le cas de l'opérateur, qui n'administre que la sienne. Le global_admin n'a PAS d'org active
  * (`activeOrganizationId: null`) : c'est précisément ce paramètre qui lui donne un contexte.
+ *
+ * TROIS rôles, trois noms, à ne jamais confondre :
+ *   • `targetOrgId` — l'org DEMANDÉE par l'adresse (graine, peut être périmée) ;
+ *   • `NAV.orgId`   — l'org AFFICHÉE (résolue, toujours visible) ;
+ *   • `designatedOrgId(...)` — la DÉSIGNATION : « on administre l'org de quelqu'un d'autre ».
+ *
+ * ⚠️ `onNavChange` publie l'adresse et ne doit JAMAIS rendre : il est appelé DEPUIS le rendu de
+ * cette page, un rendu en retour serait une récursion. `push` empile une entrée d'historique —
+ * réservé au changement d'org (un autre client est un autre LIEU) ; un onglet remplace.
  */
 export function settingsPage(
   store: FleetStore,
   onChanged: () => void,
   targetOrgId: string | null = null,
   onBack?: () => void,
+  onNavChange?: (push?: boolean) => void,
 ): HTMLElement {
   const orgs = store.organizations();
-  // On ne fait confiance à `targetOrgId` que s'il désigne une org réellement visible : un id
-  // périmé (org supprimée entre-temps) ne doit pas produire une page vide et muette.
-  const target = targetOrgId && orgs.some((o) => o.id === targetOrgId) ? targetOrgId : null;
-  // Navigation persistée hors du rendu (voir `NAV`). `resetSettingsNav()` l'a remise à zéro si
-  // l'on ARRIVE sur la page ; ici on ne fait que compléter ce qui n'est pas encore résolu.
+  const accountOrgId = store.current?.activeOrganizationId ?? null;
+  // Navigation persistée hors du rendu (voir `NAV`). `setSettingsNav()` l'a posée si l'on ARRIVE
+  // sur la page ; ici on ne fait que compléter ce qui n'est pas encore résolu.
   const state = NAV;
-  // Une org mémorisée qui n'existe plus (supprimée, ou droits perdus depuis) ne doit pas
-  // produire une page vide et muette : on retombe sur la résolution par défaut.
-  if (state.orgId && !orgs.some((o) => o.id === state.orgId)) state.orgId = null;
-  state.orgId ??= target ?? store.current?.activeOrganizationId ?? orgs[0]?.id ?? null;
+  // Les DEUX replis (org disparue, onglet devenu invisible) sont pris d'un seul tenant, AVANT de
+  // construire quoi que ce soit. Ils vivaient de part et d'autre du rendu : l'URL était publiée
+  // entre les deux, donc elle pouvait annoncer un onglet que l'écran n'affichait pas, et rien
+  // ne la resynchronisait ensuite.
+  const resolved = resolveSettingsNav(state, { orgIds: orgs.map((o) => o.id), accountOrgId, targetOrgId, isGlobalAdmin: store.isGlobalAdmin });
+  state.tab = resolved.tab;
+  state.orgId = resolved.orgId;
+  // Publier l'adresse UNIQUEMENT si la résolution a bougé quelque chose. À chaque rendu, c'était
+  // du bruit ; et surtout, c'était fait AVANT le repli d'onglet — donc l'URL gardait l'ancien.
+  if (resolved.changed) onNavChange?.();
 
   const container = el("div", {}, []);
   const render = (): void => {
@@ -122,6 +152,9 @@ export function settingsPage(
             const sel = el("select", { class: "form-select w-auto" }, orgs.map((o) => el("option", { value: o.id, ...(o.id === state.orgId ? { selected: "selected" } : {}) }, [o.name]))) as HTMLSelectElement;
             sel.addEventListener("change", () => {
               state.orgId = sel.value;
+              // L'org affichée fait partie de l'adresse (CIN-118), et changer de CLIENT est un
+              // changement de lieu : on empile, pour que Retour ramène au client précédent.
+              onNavChange?.(true);
               render();
             });
             return el("div", { class: "ms-auto d-flex align-items-center gap-2" }, [el("span", { class: "text-secondary" }, ["Organisation :"]), sel]);
@@ -133,10 +166,8 @@ export function settingsPage(
     const stylesGated = org ? !store.hasModule(org.id, "personalization") && !store.isGlobalAdmin : false;
     const lockPath = "M6 11V7a4 4 0 0 1 8 0v4M5 11h10a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1H5a1 1 0 0 1 -1 -1v-6a1 1 0 0 1 1 -1z";
 
+    // Le repli d'onglet a déjà été tranché par `resolveSettingsNav` — plus haut, hors du rendu.
     const visibleTabs = TABS.filter((t) => !t.adminOnly || store.isGlobalAdmin);
-    // L'onglet mémorisé peut avoir disparu entre-temps (perte du rôle global_admin sur un onglet
-    // `adminOnly`) : sans ce garde-fou, la page afficherait un contenu sans onglet actif visible.
-    if (!visibleTabs.some((t) => t.key === state.tab)) state.tab = "general";
     const tabsNav = el(
       "ul",
       { class: "nav nav-tabs mb-3" },
@@ -148,6 +179,7 @@ export function settingsPage(
         link.addEventListener("click", (e) => {
           e.preventDefault();
           state.tab = t.key;
+          onNavChange?.(); // CIN-118 : l'onglet est dans l'URL (remplacé, pas empilé)
           render();
         });
         return el("li", { class: "nav-item" }, [link]);
@@ -162,7 +194,11 @@ export function settingsPage(
     // Arrivé depuis le roster « Organisations » : la page administre le client DÉSIGNÉ, pas la
     // sienne. Le titre porte donc son nom, et un retour explicite ramène au roster — sans quoi
     // on se retrouve « dans une org » sans savoir comment en sortir (ambiguïté visée par CIN-091).
-    const fromRoster = target !== null && onBack !== undefined;
+    //
+    // Recalculé À CHAQUE rendu, et non figé à l'entrée de la page : le sélecteur d'org change
+    // l'org affichée sans repasser par l'entrée. Figé, le lien « Organisations » disparaissait
+    // alors que l'URL, elle, annonçait toujours qu'on administrait un client.
+    const fromRoster = designatedOrgId(state.orgId, accountOrgId) !== null && onBack !== undefined;
     const backLink = (() => {
       if (!fromRoster) return el("span", {}, []);
       const b = el("button", { class: "btn btn-link p-0 mb-1 d-inline-flex align-items-center gap-1", type: "button" }, [

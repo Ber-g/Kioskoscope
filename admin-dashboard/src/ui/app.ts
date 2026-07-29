@@ -12,29 +12,16 @@ import { revenuePage } from "./revenue";
 import { maintenancePage } from "./maintenance";
 import { rightsPage } from "./rights";
 import { sessionsPage } from "./sessions";
-import { settingsPage, resetSettingsNav } from "./settings";
+import { settingsPage, setSettingsNav, getSettingsNav } from "./settings";
+import { designatedOrgId } from "./settingsNav";
 import { fleetPage } from "./fleet";
 import { organizationsPage } from "./organizations";
 import { boothHubPage, type HubTab } from "./boothHub";
 import { mapPage, mountFleetMap } from "./mapView";
+import { HOME, formatRoute, parseRoute, sameRoute, type Route, type View } from "./router";
 import { t, getLang, setLang, LANGS, onLangChange } from "../i18n";
 
 const THEME_KEY = "kioskoscope.admin.theme.v1";
-
-// Vues du back-office. « fleet » = le PARC DE MACHINES (tous les comptes, scopé) ;
-// « organizations » = le roster de CLIENTS (super-admin). Ces deux mots ont été confondus
-// jusqu'à CIN-091 — les garder distincts ici est ce qui empêche la confusion de revenir.
-type View =
-  | "overview"
-  | "media"
-  | "revenue"
-  | "rights"
-  | "sessions"
-  | "maintenance"
-  | "settings"
-  | "fleet"
-  | "organizations"
-  | "booth";
 
 interface FilterState {
   readonly statuses: readonly HealthStatus[];
@@ -50,8 +37,9 @@ export class App {
   private filter: FilterState | null = null;
   private sort: SortState = { key: "health", dir: "asc" };
   private view: View = "overview";
-  // CIN-091 : org ciblée par la page d'administration (menu « Organisations » → clic sur une
-  // org). `null` = le compte administre sa propre org (cas de l'opérateur, qui n'a que la sienne).
+  // CIN-091 : org DEMANDÉE par l'adresse (menu « Organisations » → clic sur une org). C'est une
+  // GRAINE, pas la vérité : l'org réellement affichée est résolue par l'écran (`getSettingsNav`),
+  // et la désignation en est dérivée (`displayedAdminOrgId`). `null` = aucune org demandée.
   private adminOrgId: string | null = null;
   // CIN-045 : hub de gestion d'une cabine (vue dédiée, scopée à une borne).
   private selectedBoothId: string | null = null;
@@ -81,6 +69,12 @@ export class App {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") this.autoRefresh();
     });
+    // CIN-118 : les DEUX événements, délibérément. `popstate` couvre Retour/Suivant ; `hashchange`
+    // couvre l'URL modifiée à la main dans la barre d'adresse. Certains navigateurs émettent les
+    // deux pour un même geste — `onUrlChange` est idempotent (il ne fait rien si l'adresse
+    // demandée est déjà celle affichée), donc le doublon est sans effet.
+    window.addEventListener("popstate", () => this.onUrlChange());
+    window.addEventListener("hashchange", () => this.onUrlChange());
   }
 
   // ── Rafraîchissement automatique (CIN-117) ────────────────────────────────────
@@ -130,8 +124,143 @@ export class App {
     });
   }
 
-  /** Point d'entrée : lance le chargement (async) puis rend. */
+  // ── Routage (CIN-118) ─────────────────────────────────────────────────────────
+  /**
+   * Une seule normalisation d'URL au démarrage — les vues sous condition (module, rôle) ne
+   * peuvent être arbitrées qu'une fois l'identité connue, donc pas au premier rendu.
+   */
+  private routeSettled = false;
+
+  /**
+   * Org à faire figurer dans l'adresse et dans le surlignage du menu — la DÉSIGNATION.
+   *
+   * Trois notions distinctes, longtemps confondues sous le seul `adminOrgId` :
+   *   • `this.adminOrgId` — l'org DEMANDÉE par l'adresse (graine, transmise à `settingsPage`) ;
+   *   • `getSettingsNav().orgId` — l'org AFFICHÉE (résolue par l'écran, toujours visible) ;
+   *   • cette méthode — la désignation, dérivée des deux précédentes.
+   *
+   * Le calcul précédent (`this.adminOrgId ?? …`) GELAIT l'URL sur la première org : arrivé depuis
+   * le roster, changer d'org au sélecteur changeait l'écran mais pas l'adresse. Partir de l'org
+   * affichée supprime la question.
+   */
+  private displayedAdminOrgId(): string | null {
+    return designatedOrgId(getSettingsNav().orgId, this.store.current?.activeOrganizationId ?? null);
+  }
+
+  /** L'état de navigation courant, vu comme une adresse. */
+  private currentRoute(): Route {
+    return {
+      view: this.view,
+      overviewMode: this.overviewMode,
+      settingsTab: getSettingsNav().tab,
+      // L'adresse nomme l'org RÉELLEMENT affichée. Pour un global_admin il n'y a pas d'org
+      // « sienne » (`activeOrganizationId` vaut null) : toute org affichée est donc désignée.
+      adminOrgId: this.displayedAdminOrgId(),
+      boothId: this.selectedBoothId,
+      boothTab: this.boothTab,
+    };
+  }
+
+  /** Adresse → état. N'écrit RIEN dans l'historique et ne rend pas : les appelants s'en chargent. */
+  private applyRoute(r: Route): void {
+    this.view = r.view;
+    this.overviewMode = r.overviewMode;
+    this.adminOrgId = r.view === "settings" ? r.adminOrgId : null;
+    this.selectedBoothId = r.view === "booth" ? r.boothId : null;
+    this.boothTab = r.boothTab;
+    // BUG-006 : cet état vit HORS du cycle de rendu, et n'est écrit qu'ici — c'est-à-dire sur une
+    // navigation, jamais sur un re-render. C'est la même règle qu'avant, mais elle n'a plus
+    // besoin d'être énoncée séparément : l'URL dit l'onglet, donc arriver sur `#/settings` remet
+    // « Général » par construction.
+    if (r.view === "settings") setSettingsNav(r.settingsTab, r.adminOrgId);
+  }
+
+  /**
+   * Va à une adresse : écrit l'URL, applique, rend.
+   *
+   * `replace` empile ou non une entrée d'historique. La règle : **une vue est un lieu, un onglet
+   * est une facette du même lieu.** Changer de vue empile (le Retour doit y ramener) ; changer
+   * d'onglet dans un hub remplace — sinon sortir d'une fiche cabine demanderait six appuis sur
+   * Retour, ce qui détruirait le geste au lieu de le réparer. Dans les deux cas l'URL est à jour,
+   * donc un lien vers un onglet précis reste partageable.
+   */
+  private navigate(r: Route, replace = false): void {
+    const href = formatRoute(r);
+    if (href !== location.hash) {
+      if (replace) history.replaceState(null, "", href);
+      else history.pushState(null, "", href);
+    }
+    this.applyRoute(r);
+    this.render();
+  }
+
+  /** L'URL a changé sans nous (Retour/Suivant, barre d'adresse). */
+  private onUrlChange(): void {
+    const r = parseRoute(location.hash);
+    if (!r) {
+      // URL illisible : on la remplace au lieu de l'empiler. Une entrée d'historique qui redirige
+      // à chaque visite rendrait le bouton Retour inutilisable — il faudrait la traverser.
+      this.navigate(HOME, true);
+      return;
+    }
+    if (sameRoute(r, this.currentRoute())) return; // déjà là : ne pas re-rendre pour rien
+    this.applyRoute(r);
+    this.render();
+    this.autoRefresh(); // arriver sur une vue est un bon moment pour rafraîchir (CIN-117)
+  }
+
+  /** Écrit l'état courant dans l'URL sans toucher à l'historique. Idempotent. */
+  private syncUrl(): void {
+    const href = formatRoute(this.currentRoute());
+    if (href !== location.hash) history.replaceState(null, "", href);
+  }
+
+  /**
+   * Publie l'état du menu Organisation dans l'URL. **Ne rend jamais** : appelé depuis le rendu de
+   * `settingsPage`, un rendu en retour serait une récursion.
+   *
+   * `push` : changer de CLIENT au sélecteur est un changement de lieu (Retour doit y ramener) ;
+   * changer d'onglet reste une facette du même lieu, donc un simple remplacement.
+   */
+  private publishSettingsUrl(push: boolean): void {
+    if (!push) {
+      this.syncUrl();
+      return;
+    }
+    const href = formatRoute(this.currentRoute());
+    if (href !== location.hash) history.pushState(null, "", href);
+  }
+
+  /**
+   * Arbitre une fois, à l'ouverture, ce que le premier rendu ne pouvait pas savoir : la vue
+   * demandée est-elle seulement accessible à ce compte ?
+   *
+   * Sans ça, `#/revenue` sur une org sans facturation afficherait la vue d'ensemble avec une URL
+   * qui annonce « Revenus » — une adresse qui ment. On remplace donc l'entrée par l'accueil.
+   *
+   * ⚠️ Cas volontairement NON traité : `#/booths/<id>` vers une cabine inconnue. Le hub affiche
+   * « Cabine introuvable », et c'est la bonne réponse — rediriger en silence vers l'accueil
+   * laisserait croire que le lien reçu était valide.
+   */
+  private settleRoute(): void {
+    if (this.routeSettled) return;
+    this.routeSettled = true;
+    const available =
+      this.view === "revenue" || this.view === "rights"
+        ? this.store.activeHasModule(this.view)
+        : this.view === "organizations"
+          ? this.store.isGlobalAdmin
+          : true;
+    if (!available) this.applyRoute(HOME);
+    this.syncUrl();
+  }
+
+  /** Point d'entrée : lit l'adresse, rend, puis lance le chargement (async). */
   start(): void {
+    // L'adresse est lue AVANT le premier rendu : un lien profond partagé ou un F5 doivent ouvrir
+    // la page demandée, pas la vue d'ensemble. L'arbitrage des vues sous condition attend
+    // `settleRoute()` — l'identité n'est pas encore connue à cet instant.
+    this.applyRoute(parseRoute(location.hash) ?? HOME);
     this.render();
     void this.store.init();
   }
@@ -160,6 +289,9 @@ export class App {
       this.root.replaceChildren(App.loadingScreen());
       return;
     }
+    // L'identité est connue : c'est ici, et une seule fois, qu'on peut arbitrer si l'adresse
+    // demandée est accessible. `settleRoute` ne rend pas — il ajuste l'état avant construction.
+    this.settleRoute();
     this.maybeAcceptInvite();
     const page =
       this.view === "media"
@@ -173,13 +305,13 @@ export class App {
               : this.view === "maintenance"
                 ? maintenancePage(this.store, () => this.render(), (id) => this.openDrawer(id))
                 : this.view === "settings"
-                  ? settingsPage(this.store, () => this.render(), this.adminOrgId, () => this.setView("organizations"))
+                  ? settingsPage(this.store, () => this.render(), this.adminOrgId, () => this.setView("organizations"), (push) => this.publishSettingsUrl(push === true))
                   : this.view === "fleet"
                     ? fleetPage(this.store, (id) => this.openBoothHub(id))
                     : this.view === "organizations"
                     ? (this.store.isGlobalAdmin ? organizationsPage(this.store, (id) => this.openBoothHub(id), (id) => this.openOrgAdmin(id)) : this.overview())
                     : this.view === "booth" && this.selectedBoothId
-                    ? boothHubPage(this.store, this.selectedBoothId, () => this.setView("overview"), () => this.render(), this.boothTab, (tab) => { this.boothTab = tab; }, () => this.setView("media"))
+                    ? boothHubPage(this.store, this.selectedBoothId, () => this.setView("overview"), () => this.render(), this.boothTab, (tab) => { this.boothTab = tab; this.syncUrl(); }, () => this.setView("media"))
                     : this.overview();
     this.root.replaceChildren(
       this.sidebar(),
@@ -196,25 +328,21 @@ export class App {
     }
   }
 
+  /**
+   * Navigation par le menu. `#/settings` n'emporte aucune cible d'administration : y revenir par
+   * le menu rouvre SA propre org, pas la dernière org inspectée en super-admin (CIN-091).
+   */
   private setView(v: View): void {
-    this.view = v;
-    // Quitter le menu « Organisation » relâche la cible d'administration : y revenir plus tard
-    // par le menu doit rouvrir SA propre org, pas la dernière org inspectée en super-admin.
-    if (v !== "settings") this.adminOrgId = null;
-    // BUG-006 : la navigation du menu Organisation survit désormais aux re-renders. Elle doit
-    // donc être remise à zéro ICI — sur une navigation EXPLICITE — et nulle part ailleurs.
-    else resetSettingsNav();
-    this.render();
+    this.navigate({ ...HOME, view: v });
     // CIN-117 : changer de vue est un bon moment pour rafraîchir (on quitte ce qu'on éditait).
     this.autoRefresh();
   }
 
   /** Ouvre la page d'administration d'une organisation (CIN-091 b) : le hub `settings` ciblé. */
   private openOrgAdmin(orgId: string): void {
-    this.adminOrgId = orgId;
-    this.view = "settings";
-    resetSettingsNav(); // arrivée explicite depuis le roster → on ouvre sur « Général »
-    this.render();
+    // Arrivée explicite depuis le roster → onglet « Général », comme avant : c'est ce que dit
+    // l'adresse `#/organizations/<id>` sans onglet.
+    this.navigate({ ...HOME, view: "settings", adminOrgId: orgId });
   }
 
   /** Accepte une invitation présente dans l'URL (`?invite=token`), une seule fois. */
@@ -225,13 +353,14 @@ export class App {
     const token = new URLSearchParams(location.search).get("invite");
     if (!token) return;
     void this.store.acceptInvitation(token).then((res) => {
+      // `new URL` conserve le hash : retirer le jeton de la query ne détruit pas la route
+      // courante (le routeur de CIN-118 vit dans le fragment, jamais dans la query).
       const url = new URL(location.href);
       url.searchParams.delete("invite");
       history.replaceState({}, "", url.toString());
       window.setTimeout(() => {
         if (res.ok) {
-          this.view = "settings";
-          this.render();
+          this.setView("settings");
           alert("Invitation acceptée — vous avez rejoint l'organisation.");
         } else {
           alert("Invitation : " + (res.error ?? "échec"));
@@ -249,6 +378,31 @@ export class App {
     return sortBooths(list, this.sort);
   }
 
+  /**
+   * Entrée de menu vers une vue simple : libellé, adresse, actif et navigation d'un seul tenant.
+   */
+  private menuItem(key: string, view: View, iconPath: string): HTMLElement {
+    return navItem(t(key), formatRoute({ ...HOME, view }), iconPath, this.highlightedView() === view, () => this.setView(view));
+  }
+
+  /**
+   * Vue mise en évidence dans le menu — pas toujours `this.view`.
+   *
+   * Administrer un CLIENT depuis le roster ouvre techniquement la vue `settings`, et le menu
+   * surlignait donc « Mon organisation » alors qu'on administre celle de quelqu'un d'autre.
+   * Constat de Beranger sur CIN-084 : *« quand on clique sur une org on entre dans le menu "mon
+   * org", c'est pas hyper clair »*. Il a raison, et c'est un défaut de vocabulaire, pas de goût :
+   * ces deux mots ont été séparés exprès en CIN-091, le menu les reconfondait.
+   *
+   * L'URL tranchait déjà — `#/organizations/<id>` et non `#/settings` (CIN-118). Le menu s'aligne
+   * simplement sur ce que l'adresse dit déjà.
+   */
+  private highlightedView(): View {
+    // Même source que l'adresse (`displayedAdminOrgId`), sans quoi les deux se contredisent en
+    // miroir : URL `#/organizations/<id>` d'un côté, menu surlignant « Mon organisation » de l'autre.
+    return this.view === "settings" && this.displayedAdminOrgId() ? "organizations" : this.view;
+  }
+
   // ── Barre latérale (responsive : toggler + collapse) ──────────────────────
   private sidebar(): HTMLElement {
     return el("aside", { class: "navbar navbar-vertical navbar-expand-lg", "data-bs-theme": "dark" }, [
@@ -264,27 +418,27 @@ export class App {
             //   Sessions) · TECHNIQUE (Maintenance) · ADMINISTRATION (Mon organisation,
             //   Organisations). « Flotte » suit immédiatement la vue d'ensemble : même objet
             //   — les machines — vues de loin puis de près.
-            navItem(t("nav.overview"), "M4 21v-13l8 -4l8 4v13M9 21v-6h6v6", this.view === "overview", () => this.setView("overview")),
-            navItem(t("nav.fleet"), "M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8", this.view === "fleet", () => this.setView("fleet")),
-            navItem(t("nav.media"), "M4 5h16v14H4zM4 9h16M10 13l3 2l-3 2z", this.view === "media", () => this.setView("media")),
+            this.menuItem("nav.overview", "overview", "M4 21v-13l8 -4l8 4v13M9 21v-6h6v6"),
+            this.menuItem("nav.fleet", "fleet", "M4 8l0 8M8 4l0 16M12 8l0 8M16 4l0 16M20 8l0 8"),
+            this.menuItem("nav.media", "media", "M4 5h16v14H4zM4 9h16M10 13l3 2l-3 2z"),
             // Revenus (CIN-099) : MASQUÉ — pas grisé — si l'org ne facture pas au spectateur
             // (forfaitaire/festival). Un cadenas « Revenus » proposerait d'acheter une fonction
             // structurellement sans objet pour ces orgs : c'est du bruit, pas de l'upsell
             // (@design). Contraste avec « Droits », vrai module optionnel → cadenas conservé.
             ...(this.store.activeHasModule("revenue")
-              ? [navItem(t("nav.revenue"), "M12 3v18M8 7h6a2 2 0 0 1 0 4h-4a2 2 0 0 0 0 4h6", this.view === "revenue", () => this.setView("revenue"))]
+              ? [this.menuItem("nav.revenue", "revenue", "M12 3v18M8 7h6a2 2 0 0 1 0 4h-4a2 2 0 0 0 0 4h6")]
               : []),
             this.store.activeHasModule("rights")
-              ? navItem(t("nav.rights"), "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", this.view === "rights", () => this.setView("rights"))
-              : navItem(t("nav.rights"), "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", false, undefined, true),
-            navItem(t("nav.sessions"), "M8 4v16M16 4v16M4 8h16M4 16h16", this.view === "sessions", () => this.setView("sessions")),
-            navItem(t("nav.maintenance"), "M12 3l1.5 3.5l3.5 1.5l-3.5 1.5l-1.5 3.5l-1.5 -3.5l-3.5 -1.5l3.5 -1.5zM6 14l.7 1.8l1.8 .7l-1.8 .7l-.7 1.8l-.7 -1.8l-1.8 -.7l1.8 -.7z", this.view === "maintenance", () => this.setView("maintenance")),
-            navItem(t("nav.organization"), "M3 21h18M9 8h1M9 12h1M9 16h1M14 8h1M14 12h1M14 16h1M5 21V5a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v16", this.view === "settings", () => this.setView("settings")),
+              ? this.menuItem("nav.rights", "rights", "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z")
+              : navItem(t("nav.rights"), "#", "M9 5h6a2 2 0 0 1 2 2v12l-5 -3l-5 3v-12a2 2 0 0 1 2 -2z", false, undefined, true),
+            this.menuItem("nav.sessions", "sessions", "M8 4v16M16 4v16M4 8h16M4 16h16"),
+            this.menuItem("nav.maintenance", "maintenance", "M12 3l1.5 3.5l3.5 1.5l-3.5 1.5l-1.5 3.5l-1.5 -3.5l-3.5 -1.5l3.5 -1.5zM6 14l.7 1.8l1.8 .7l-1.8 .7l-.7 1.8l-.7 -1.8l-1.8 -.7l1.8 -.7z"),
+            this.menuItem("nav.organization", "settings", "M3 21h18M9 8h1M9 12h1M9 16h1M14 8h1M14 12h1M14 16h1M5 21V5a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v16"),
             // Organisations (ex-« Flotte », CIN-084 → renommée CIN-091) : roster des CLIENTS,
             // pilotage plateforme — réservé au global_admin (un client ne voit jamais cette
             // entrée). La RLS refuse en plus toute écriture non-admin (défense en profondeur).
             ...(this.store.isGlobalAdmin
-              ? [navItem(t("nav.organizations"), "M3 21h18M5 21V7l7 -4l7 4v14M10 12h4M10 16h4M10 8h4", this.view === "organizations", () => this.setView("organizations"))]
+              ? [this.menuItem("nav.organizations", "organizations", "M3 21h18M5 21V7l7 -4l7 4v14M10 12h4M10 16h4M10 8h4")]
               : []),
           ]),
         ]),
@@ -378,10 +532,9 @@ export class App {
     // CIN-044 : bascule Liste / Carte (la carte n'a plus de menu dédié).
     const segBtn = (label: string, mode: "list" | "map"): HTMLElement => {
       const b = el("button", { class: `btn ${this.overviewMode === mode ? "btn-primary" : ""}`, type: "button" }, [label]);
-      b.addEventListener("click", () => {
-        this.overviewMode = mode;
-        this.render();
-      });
+      // Liste et carte sont deux LIEUX (on envoie « regarde la carte »), pas deux facettes d'un
+      // même écran : la bascule empile donc une entrée, et Retour ramène à l'autre mode.
+      b.addEventListener("click", () => this.navigate({ ...HOME, overviewMode: mode }));
       return b;
     };
     const modeToggle = el("div", { class: "btn-group ms-auto", role: "group" }, [segBtn(t("nav.overview"), "list"), segBtn(t("nav.map"), "map")]);
@@ -453,10 +606,7 @@ export class App {
 
   /** Ouvre le hub de gestion d'une cabine (CIN-045), éventuellement sur un onglet précis (deep-link tiroir). */
   private openBoothHub(id: string, tab: HubTab = "synthese"): void {
-    this.selectedBoothId = id;
-    this.boothTab = tab;
-    this.view = "booth";
-    this.render();
+    this.navigate({ ...HOME, view: "booth", boothId: id, boothTab: tab });
   }
 
   // ── Gridstack : montage responsive + persistance ──────────────────────────
@@ -533,7 +683,16 @@ export class App {
 }
 
 // ── Helpers de navigation ────────────────────────────────────────────────────
-function navItem(label: string, path: string, active: boolean, onClick?: () => void, locked?: boolean): HTMLElement {
+/**
+ * Entrée de menu.
+ *
+ * `href` porte la VRAIE adresse (CIN-118) et non plus `#` : un clic milieu ou ⌘-clic ouvre
+ * l'écran dans un nouvel onglet, et « Copier l'adresse du lien » donne quelque chose d'utile.
+ * Le clic simple reste piloté à la main pour passer par `navigate()` — un seul chemin d'écriture
+ * de l'historique — mais les clics modifiés sont laissés au navigateur, sans quoi on lui
+ * reprendrait un comportement qu'il fait mieux que nous.
+ */
+function navItem(label: string, href: string, path: string, active: boolean, onClick?: () => void, locked?: boolean): HTMLElement {
   // Module non accordé (CIN-080) : item visible mais GRISÉ + cadenas (upsell), non cliquable.
   if (locked) {
     const lockPath = "M6 11V7a4 4 0 0 1 8 0v4M5 11h10a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1H5a1 1 0 0 1 -1 -1v-6a1 1 0 0 1 1 -1z";
@@ -545,12 +704,14 @@ function navItem(label: string, path: string, active: boolean, onClick?: () => v
     link.addEventListener("click", (e) => e.preventDefault());
     return el("li", { class: "nav-item" }, [link]);
   }
-  const link = el("a", { class: `nav-link ${active ? "active" : ""}`, href: "#" }, [
+  const link = el("a", { class: `nav-link ${active ? "active" : ""}`, href }, [
     el("span", { class: "nav-link-icon" }, [icon(path, 20)]),
     el("span", { class: "nav-link-title" }, [label]),
   ]);
   if (onClick) {
     link.addEventListener("click", (e) => {
+      // ⌘/Ctrl-clic, clic milieu, Maj-clic : laisser le navigateur ouvrir onglet ou fenêtre.
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
       e.preventDefault();
       onClick();
     });
