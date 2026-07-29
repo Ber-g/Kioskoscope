@@ -60,6 +60,30 @@ le test à tort. Il prouve que le test sait distinguer *refusé* de *autorisé*.
 Se connecter au dashboard avec `iso-a@…` : ne doit afficher que Le Perchoir.
 Se reconnecter avec `iso-b@…` : ne doit afficher que Le Comptoir Général.
 
+## Lancer le bloc device SEUL (CIN-122)
+
+Depuis le 2026-07-29, `isolation.mjs` contient **deux suites indépendantes**, chacune activée par
+ses propres identifiants. Au moins une est requise ; les deux peuvent tourner ensemble.
+
+```bash
+# device seul — plus besoin de ISO_A_* / ISO_B_*
+ISO_DEVICE_EMAIL='…' ISO_DEVICE_PASSWORD='…' node supabase/tests/isolation.mjs
+```
+
+Ce que la sortie garantit désormais :
+
+- **Ce qui n'a pas tourné est annoncé** (`▸ Bloc org-vs-org NON EXÉCUTÉ`). Un total partiel qui ne
+  se déclare pas partiel se lit comme une preuve complète — c'est ce qui avait laissé le bloc
+  device inexécuté pendant cinq jours sous un « 79/79 OK » exact et trompeur.
+- **Le compte de test doit appartenir à une org qui a du contenu.** Toutes les vérifications de
+  la suite device sont des négations (« 0 ligne de l'org adverse », « écriture refusée ») : un
+  compte qui ne lit RIEN les passe toutes, trivialement. Un **contrôle positif** échoue donc
+  bruyamment si l'org du device est indéterminable — ce n'est pas une fuite, c'est une preuve non
+  concluante, et le message le distingue.
+
+Codes de sortie : `0` prouvé · `1` échec (fuite **ou** preuve non concluante) · `2` configuration
+incomplète · `3` erreur inattendue.
+
 ## Compte device (CIN-002) — durcir l'auth Kiosk
 
 Objectif : la borne n'utilise plus un compte super_user mais un **compte device dédié** aux

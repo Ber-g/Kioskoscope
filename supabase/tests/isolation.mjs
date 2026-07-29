@@ -15,9 +15,17 @@
 //   3. Variables d'environnement : ISO_A_EMAIL/ISO_A_PASSWORD, ISO_B_EMAIL/ISO_B_PASSWORD.
 //      URL + clé anon lues depuis admin-dashboard/.env (ou VITE_SUPABASE_* dans l'env).
 //
+// DEUX SUITES INDÉPENDANTES (CIN-122). Chacune s'active par ses propres identifiants, et
+// l'absence d'une suite est ANNONCÉE dans la sortie — un total partiel qui ne se déclare pas
+// partiel se lit comme une preuve complète, ce qui est pire que pas de preuve du tout :
+//   • org-vs-org : ISO_A_EMAIL/ISO_A_PASSWORD + ISO_B_EMAIL/ISO_B_PASSWORD
+//   • device     : ISO_DEVICE_EMAIL/ISO_DEVICE_PASSWORD  (compte borne « nu », sans rôle)
+// Au moins une des deux est requise ; les deux peuvent tourner ensemble.
+//
 // Lancement :
 //   ISO_A_EMAIL=… ISO_A_PASSWORD=… ISO_B_EMAIL=… ISO_B_PASSWORD=… \
 //     node supabase/tests/isolation.mjs
+//   ISO_DEVICE_EMAIL=… ISO_DEVICE_PASSWORD=… node supabase/tests/isolation.mjs   (device seul)
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -375,48 +383,92 @@ async function main() {
     console.error("✖ VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY introuvables (env ou admin-dashboard/.env).");
     process.exit(2);
   }
-  const aEmail = requireEnv("ISO_A_EMAIL");
-  const aPass = requireEnv("ISO_A_PASSWORD");
-  const bEmail = requireEnv("ISO_B_EMAIL");
-  const bPass = requireEnv("ISO_B_PASSWORD");
+  // ── Deux suites INDÉPENDANTES, chacune activée par ses propres identifiants ────────────────
+  //
+  // CIN-122. Jusqu'ici les quatre variables ISO_A_*/ISO_B_* étaient exigées même pour ne lancer
+  // que le bloc device — alors que celui-ci est autonome : il DÉDUIT son org de ce qu'il lit,
+  // sans rien supposer de a1/a2. Cette exigence a eu un coût réel : le bloc device, écrit le
+  // 2026-07-24, n'a JAMAIS tourné, et le total « 79/79 OK » affiché sans lui était exact et
+  // trompeur. Un prérequis qui empêche de lancer la seule suite dont on a les identifiants est
+  // un prérequis de trop.
+  const TENANT_VARS = ["ISO_A_EMAIL", "ISO_A_PASSWORD", "ISO_B_EMAIL", "ISO_B_PASSWORD"];
+  const DEVICE_VARS = ["ISO_DEVICE_EMAIL", "ISO_DEVICE_PASSWORD"];
+  const missing = (vars) => vars.filter((v) => !process.env[v]);
 
-  const opts = { auth: { persistSession: false, autoRefreshToken: false } };
-  const clientA = createClient(url, anon, opts);
-  const clientB = createClient(url, anon, opts);
+  const hasTenant = missing(TENANT_VARS).length === 0;
+  const hasDevice = missing(DEVICE_VARS).length === 0;
+
+  // Une paire ENTAMÉE mais incomplète est presque toujours une faute de frappe, pas un choix :
+  // le dire, plutôt que d'annoncer « aucune suite » à quelqu'un qui vient d'en demander une.
+  const startedTenant = TENANT_VARS.some((v) => process.env[v]);
+  const startedDevice = DEVICE_VARS.some((v) => process.env[v]);
+  if ((startedTenant && !hasTenant) || (startedDevice && !hasDevice)) {
+    if (startedTenant && !hasTenant) console.error(`✖ Suite org-vs-org incomplète — manque : ${missing(TENANT_VARS).join(", ")}`);
+    if (startedDevice && !hasDevice) console.error(`✖ Suite device incomplète — manque : ${missing(DEVICE_VARS).join(", ")}`);
+    process.exit(2);
+  }
+
+  if (!hasTenant && !hasDevice) {
+    console.error("✖ Aucune suite à lancer : fournis au moins une des deux paires d'identifiants.");
+    console.error("  • org-vs-org : ISO_A_EMAIL / ISO_A_PASSWORD + ISO_B_EMAIL / ISO_B_PASSWORD");
+    console.error("  • device     : ISO_DEVICE_EMAIL / ISO_DEVICE_PASSWORD");
+    console.error("  Les deux peuvent être fournies ensemble. Voir README.md.");
+    process.exit(2);
+  }
 
   console.log("Kioskoscope — preuve d'isolation multi-org (RLS)");
   console.log(`Projet   : ${url}`);
-  console.log(`Org A    : ${ORG_A}\nOrg B    : ${ORG_B}`);
 
-  const signIn = async (client, email, password, who) => {
-    const { error } = await client.auth.signInWithPassword({ email, password });
-    if (error) {
-      console.error(`✖ Connexion ${who} (${email}) échouée : ${error.message}`);
-      console.error("  Le compte existe-t-il et son email est-il confirmé ? (voir README.md)");
-      process.exit(2);
-    }
-  };
-  await signIn(clientA, aEmail, aPass, "user A");
-  await signIn(clientB, bEmail, bPass, "user B");
+  if (hasTenant) {
+    const aEmail = requireEnv("ISO_A_EMAIL");
+    const aPass = requireEnv("ISO_A_PASSWORD");
+    const bEmail = requireEnv("ISO_B_EMAIL");
+    const bPass = requireEnv("ISO_B_PASSWORD");
 
-  // Garde-fou : si un compte de test est global_admin, il bypasse la RLS → test invalide.
-  for (const [client, who] of [[clientA, "A"], [clientB, "B"]]) {
-    const { data } = await client.from("users").select("is_global_admin").limit(1);
-    if (data?.[0]?.is_global_admin) {
-      console.error(`✖ Le compte de test ${who} est global_admin — il bypasse la RLS, test invalide.`);
-      console.error("  Utilise des comptes NON global_admin pour cette preuve.");
-      process.exit(2);
+    const opts = { auth: { persistSession: false, autoRefreshToken: false } };
+    const clientA = createClient(url, anon, opts);
+    const clientB = createClient(url, anon, opts);
+
+    console.log(`Org A    : ${ORG_A}\nOrg B    : ${ORG_B}`);
+
+    const signIn = async (client, email, password, who) => {
+      const { error } = await client.auth.signInWithPassword({ email, password });
+      if (error) {
+        console.error(`✖ Connexion ${who} (${email}) échouée : ${error.message}`);
+        console.error("  Le compte existe-t-il et son email est-il confirmé ? (voir README.md)");
+        process.exit(2);
+      }
+    };
+    await signIn(clientA, aEmail, aPass, "user A");
+    await signIn(clientB, bEmail, bPass, "user B");
+
+    // Garde-fou : si un compte de test est global_admin, il bypasse la RLS → test invalide.
+    for (const [client, who] of [[clientA, "A"], [clientB, "B"]]) {
+      const { data } = await client.from("users").select("is_global_admin").limit(1);
+      if (data?.[0]?.is_global_admin) {
+        console.error(`✖ Le compte de test ${who} est global_admin — il bypasse la RLS, test invalide.`);
+        console.error("  Utilise des comptes NON global_admin pour cette preuve.");
+        process.exit(2);
+      }
     }
+
+    await runTenantSuite("User A", clientA, ORG_A, ORG_B);
+    await runTenantSuite("User B", clientB, ORG_B, ORG_A);
+  } else {
+    // Dire ce qui n'a PAS tourné est le point entier de CIN-122 : un total partiel qui ne
+    // s'annonce pas comme partiel se lit comme une preuve complète.
+    console.log("\n▸ Bloc org-vs-org NON EXÉCUTÉ (ISO_A_* / ISO_B_* non fournis)");
   }
-
-  await runTenantSuite("User A", clientA, ORG_A, ORG_B);
-  await runTenantSuite("User B", clientB, ORG_B, ORG_A);
 
   await runDeviceSuite(url, anon);
 
   console.log(`\n── Résultat : ${checks - failures}/${checks} vérifications OK ──`);
   if (failures > 0) {
-    console.error(`✖ ISOLATION COMPROMISE : ${failures} vérification(s) en échec.`);
+    // « ÉCHEC » et non « ISOLATION COMPROMISE » : un contrôle positif qui tombe signale une
+    // preuve NON CONCLUANTE (compte de test sans données), pas une fuite. Crier à la fuite dans
+    // ce cas serait une fausse alerte — et une alerte à laquelle on cesse de croire ne protège
+    // plus de rien. Le détail au-dessus dit lequel des deux c'est.
+    console.error(`✖ ÉCHEC : ${failures} vérification(s) en échec — fuite RLS, ou preuve non concluante (voir le détail).`);
     process.exit(1);
   }
   console.log("✓ ISOLATION PROUVÉE : aucune fuite cross-org (lecture ni écriture).");
@@ -451,7 +503,30 @@ async function runDeviceSuite(url, anon) {
   const rows = media.data ?? [];
   const orgs = [...new Set(rows.map((r) => r.organization_id))];
   assert(orgs.length <= 1, `device : catalogue d'UNE SEULE org (${orgs.length} org(s) vue(s))`);
-  const deviceOrg = orgs[0] ?? ORG_A; // repli si catalogue vide
+
+  // ⚠️ CONTRÔLE POSITIF — sans lui, cette suite se prouve elle-même fausse.
+  //
+  // Toutes les vérifications qui suivent sont des NÉGATIONS (« 0 ligne de l'org adverse »,
+  // « écriture refusée »). Un compte qui ne lit RIEN les passe donc toutes, trivialement. C'est
+  // exactement ce que l'en-tête de ce fichier interdit pour la suite tenant : « un contrôle
+  // positif garantit que le test détecte aussi les autorisations légitimes — sinon une base
+  // "deny all" passerait à tort ». La suite device n'avait pas le sien, et son ancien repli
+  // `orgs[0] ?? ORG_A` masquait le problème en inventant une org quand il n'en voyait aucune.
+  //
+  // Constaté le 2026-07-29 : sur 4 comptes borne, 3 appartiennent à des orgs sans contenu et
+  // obtenaient « 9/9 OK » sans avoir rien prouvé du tout.
+  //
+  // On déduit l'org de `media` OU de `org_styles` — deux tables que la borne lit réellement.
+  // Si aucune ne renvoie de ligne, on ne peut RIEN affirmer : on échoue, on ne devine pas.
+  const styles = await client.from("org_styles").select("organization_id");
+  const styleOrgs = [...new Set((styles.data ?? []).map((r) => r.organization_id))];
+  const deviceOrg = orgs[0] ?? styleOrgs[0] ?? null;
+  assert(
+    deviceOrg !== null,
+    `device : contrôle positif — le compte lit au moins une donnée de SON org ` +
+      `(${deviceOrg === null ? "AUCUNE : org indéterminable, cette suite ne prouve rien sur ce compte — prendre un compte borne d'une org qui a du contenu" : "ok"})`,
+  );
+  if (deviceOrg === null) return; // continuer produirait des « ✓ » qui ne veulent rien dire
   const adverseOrg = deviceOrg === ORG_A ? ORG_B : ORG_A;
 
   // Aucune fuite d'une AUTRE org (sonde directe).
