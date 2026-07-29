@@ -386,6 +386,10 @@ export class FleetStore {
   async signIn(email: string, password: string): Promise<{ ok: boolean; error?: string }> {
     const { error } = await supabase!.auth.signInWithPassword({ email, password });
     if (error) return { ok: false, error: error.message };
+    // BUG-015 : une connexion est aussi une transition. Sans ça, un chargement lancé pour le
+    // compte PRÉCÉDENT et encore en vol pourrait publier ses données par-dessus la nouvelle
+    // session — c'est-à-dire montrer l'organisation de quelqu'un d'autre.
+    this.authGeneration++;
     await this.loadFromSupabase();
     return { ok: true };
   }
@@ -405,15 +409,43 @@ export class FleetStore {
     await this.loadFromSupabase();
   }
 
+  /**
+   * Génération d'authentification — incrémentée à CHAQUE transition (connexion, déconnexion).
+   *
+   * BUG-015. `loadFromSupabase()` dure longtemps : une quinzaine de requêtes réseau enchaînées.
+   * Elle pose `identity` au début et `authed = true` **à la fin**. Une déconnexion survenue
+   * pendant ce trajet était donc écrasée par la fin du chargement : `identity` restait `null`
+   * (remis par `signOut`) mais `authed` repassait à `true` — combinaison qui ne correspond à
+   * AUCUN écran (`needsAuth` faux, `current` nul) et bloquait sur « Chargement… » jusqu'à un F5.
+   *
+   * Un chargement capture la génération à son entrée et **refuse de publier** ses résultats si
+   * elle a changé entre-temps. Une réponse tardive ne peut plus décider de l'état courant.
+   */
+  private authGeneration = 0;
+
   async signOut(): Promise<void> {
-    await supabase!.auth.signOut();
+    // AVANT l'await : tout chargement déjà en vol est périmé dès l'instant du clic, pas à
+    // l'instant où le serveur répond.
+    this.authGeneration++;
     this.authed = false;
     this.identity = null;
     this.booths = [];
-    this.emit();
+    this.media = [];
+    this.orgs = [];
+    this.emit(); // écran de connexion IMMÉDIAT : ne pas faire attendre le réseau pour partir
+    try {
+      await supabase!.auth.signOut();
+    } catch (e) {
+      // La session locale est déjà oubliée ; l'échec de révocation côté serveur ne doit pas
+      // laisser l'utilisateur sur un écran connecté. On journalise et on reste déconnecté.
+      console.error("[dashboard] révocation de session échouée —", e);
+    }
   }
 
   private async loadFromSupabase(): Promise<void> {
+    // BUG-015 : génération capturée à l'entrée. Toute écriture d'état en aval doit la vérifier —
+    // sans quoi une réponse arrivée après une déconnexion ressusciterait la session.
+    const gen = this.authGeneration;
     // `getUser()` est un appel RÉSEAU. Il échoue sur une coupure, un timeout ou un 5xx — et
     // renvoie alors `user: undefined`, exactement comme une absence de session.
     //
@@ -433,11 +465,13 @@ export class FleetStore {
         console.error("loadFromSupabase : vérification d'identité indisponible, session conservée —", userErr?.message ?? "raison inconnue");
         return; // ne touche NI à `authed`, NI à `identity`, NI aux caches
       }
+      if (gen !== this.authGeneration) return; // déconnexion entre-temps : elle fait autorité
       this.authed = false;
       this.identity = null; // sans ça, l'identité périmée survivait à la déconnexion
       this.emit();
       return;
     }
+    if (gen !== this.authGeneration) return; // idem avant de publier une identité
     // Profil + appartenances (la RLS n'expose que ce qui est autorisé).
     const { data: profile } = await supabase!.from("users").select("*").eq("id", uid).maybeSingle();
     const { data: memberships } = await supabase!.from("memberships").select("*").eq("user_id", uid);
@@ -561,6 +595,15 @@ export class FleetStore {
       log: String(r.log ?? ""), error: String(r.error ?? ""),
     }));
     await this.enrichBooths();
+    // Dernière porte, la plus importante : c'est CETTE ligne qui ressuscitait une session
+    // déconnectée (BUG-015). Les caches remplis au-dessus le sont peut-être pour rien ; ils ne
+    // sont jamais affichés hors session, et la prochaine connexion les réécrit entièrement.
+    if (gen !== this.authGeneration) {
+      this.booths = [];
+      this.media = [];
+      this.orgs = [];
+      return;
+    }
     this.authed = true;
     this.emit();
   }
@@ -726,13 +769,35 @@ export class FleetStore {
   }
 
   /**
+   * Projection LOCALE d'une ligne `org_styles` — remplace un `loadFromSupabase()` complet.
+   *
+   * Écrire une ligne déclenchait une quinzaine de requêtes réseau pour recharger tout le parc,
+   * juste pour rafraîchir un objet que l'on connaît déjà. Le coût n'était pas que la latence :
+   * ce rechargement `emit()`, donc il reconstruisait l'écran EN PLEIN GESTE — c'est la mécanique
+   * qui rendait la réinitialisation apparemment sans effet.
+   *
+   * La projection est FIDÈLE parce que la migration 0018 n'a ni trigger ni colonne calculée : les
+   * colonnes stockées sont exactement celles qu'on vient d'envoyer, le serveur n'a rien à en dire
+   * de plus. Si un trigger y était ajouté un jour, cette hypothèse tomberait — et il faudrait
+   * relire la ligne écrite plutôt que de la projeter.
+   *
+   * `row === null` = pas de ligne = style maître Kioskoscope.
+   */
+  private setOrgStyleLocal(orgId: string, row: Record<string, unknown> | null): void {
+    if (row === null) this.orgStyles.delete(orgId);
+    else this.orgStyles.set(orgId, rowToOrgStyle(row));
+    this.emit();
+  }
+
+  /**
    * Upsert du style d'une org. Le dashboard (F19 v1) possède palette/fontes/titre ; ces trois
    * champs reflètent EXACTEMENT le patch (une valeur vide/omise → null = retour au maître pour
    * ce slot). Les `assets` (v2, upload) ne sont pas édités ici : on préserve l'existant.
    */
   async upsertOrgStyle(orgId: string, patch: OrgStyle): Promise<{ ok: boolean; error?: string }> {
-    if (!supabase) return { ok: false, error: "hors ligne" };
     const current = this.orgStyles.get(orgId);
+    // Une seule définition de la ligne pour les deux modes : ce que le mock affiche est
+    // exactement ce que la base recevrait.
     const row = {
       organization_id: orgId,
       palette: patch.palette ?? null,
@@ -741,18 +806,27 @@ export class FleetStore {
       title: patch.title ?? null,
       updated_at: new Date().toISOString(),
     };
+    if (this.mode === "mock") {
+      this.setOrgStyleLocal(orgId, row);
+      return { ok: true };
+    }
+    if (!supabase) return { ok: false, error: "hors ligne" };
     const { error } = await supabase.from("org_styles").upsert(row, { onConflict: "organization_id" });
     if (error) return { ok: false, error: error.message };
-    await this.loadFromSupabase();
+    this.setOrgStyleLocal(orgId, row);
     return { ok: true };
   }
 
   /** Réinitialise au style maître : supprime la ligne (absence de surcharge). */
   async resetOrgStyle(orgId: string): Promise<{ ok: boolean; error?: string }> {
+    if (this.mode === "mock") {
+      this.setOrgStyleLocal(orgId, null);
+      return { ok: true };
+    }
     if (!supabase) return { ok: false, error: "hors ligne" };
     const { error } = await supabase.from("org_styles").delete().eq("organization_id", orgId);
     if (error) return { ok: false, error: error.message };
-    await this.loadFromSupabase();
+    this.setOrgStyleLocal(orgId, null);
     return { ok: true };
   }
 
@@ -788,12 +862,22 @@ export class FleetStore {
 
   /** Réinitialise PLUSIEURS orgs au style maître (supprime leurs lignes `org_styles`). */
   async resetOrgStylesBatch(orgIds: readonly string[]): Promise<{ ok: boolean; error?: string }> {
-    if (!supabase) return { ok: false, error: "hors ligne" };
     if (orgIds.length === 0) return { ok: true };
+    if (this.mode === "mock") {
+      this.forgetOrgStylesLocal(orgIds);
+      return { ok: true };
+    }
+    if (!supabase) return { ok: false, error: "hors ligne" };
     const { error } = await supabase.from("org_styles").delete().in("organization_id", [...orgIds]);
     if (error) return { ok: false, error: error.message };
-    await this.loadFromSupabase();
+    this.forgetOrgStylesLocal(orgIds);
     return { ok: true };
+  }
+
+  /** Pendant par lot de `setOrgStyleLocal(id, null)` : un SEUL rendu pour tout le lot. */
+  private forgetOrgStylesLocal(orgIds: readonly string[]): void {
+    for (const id of orgIds) this.orgStyles.delete(id);
+    this.emit();
   }
 
   // ── Assets de marque (F19 v2, bucket PUBLIC `org-assets`, migration 0019) ─────
@@ -808,12 +892,20 @@ export class FleetStore {
    * d'une version (`?v=`) pour invalider le cache navigateur/CDN après remplacement.
    */
   async uploadOrgAsset(orgId: string, kind: OrgAssetKind, blob: Blob): Promise<{ ok: boolean; url?: string; error?: string }> {
-    if (!supabase) return { ok: false, error: "hors ligne" };
-    const path = `${orgId}/${kind}.webp`;
-    const up = await supabase.storage.from("org-assets").upload(path, blob, { upsert: true, contentType: "image/webp" });
-    if (up.error) return { ok: false, error: `Téléversement échoué : ${up.error.message}` };
-    const { data: pub } = supabase.storage.from("org-assets").getPublicUrl(path);
-    const url = `${pub.publicUrl}?v=${Date.now()}`;
+    let url: string;
+    if (this.mode === "mock") {
+      // Pas de bucket en mock. Sans cette branche, la voie de SUCCÈS de l'envoi était
+      // invérifiable au navigateur (tout finissait sur « hors ligne ») — donc jamais recettée.
+      // Une URL d'objet local est une URL publique parfaitement valable pour cet usage.
+      url = URL.createObjectURL(blob);
+    } else {
+      if (!supabase) return { ok: false, error: "hors ligne" };
+      const path = `${orgId}/${kind}.webp`;
+      const up = await supabase.storage.from("org-assets").upload(path, blob, { upsert: true, contentType: "image/webp" });
+      if (up.error) return { ok: false, error: `Téléversement échoué : ${up.error.message}` };
+      const { data: pub } = supabase.storage.from("org-assets").getPublicUrl(path);
+      url = `${pub.publicUrl}?v=${Date.now()}`;
+    }
     const draft: OrgAssetsDraft = { ...(this.orgStyles.get(orgId)?.assets ?? {}) };
     draft[ORG_ASSET_FIELD[kind]] = url;
     const res = await this.upsertOrgStyleWithAssets(orgId, draft);
@@ -826,10 +918,13 @@ export class FleetStore {
    * dans `org_styles.assets` (les autres assets sont préservés).
    */
   async removeOrgAsset(orgId: string, kind: OrgAssetKind): Promise<{ ok: boolean; error?: string }> {
-    if (!supabase) return { ok: false, error: "hors ligne" };
-    const path = `${orgId}/${kind}.webp`;
-    const { error } = await supabase.storage.from("org-assets").remove([path]);
-    if (error) return { ok: false, error: `Suppression échouée : ${error.message}` };
+    // En mock il n'y a pas d'objet storage à retirer : seule la référence dans `assets` compte.
+    if (this.mode !== "mock") {
+      if (!supabase) return { ok: false, error: "hors ligne" };
+      const path = `${orgId}/${kind}.webp`;
+      const { error } = await supabase.storage.from("org-assets").remove([path]);
+      if (error) return { ok: false, error: `Suppression échouée : ${error.message}` };
+    }
     const draft: OrgAssetsDraft = { ...(this.orgStyles.get(orgId)?.assets ?? {}) };
     delete draft[ORG_ASSET_FIELD[kind]];
     return this.upsertOrgStyleWithAssets(orgId, draft);
