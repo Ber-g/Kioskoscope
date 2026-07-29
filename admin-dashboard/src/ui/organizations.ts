@@ -5,6 +5,7 @@ import { el, icon } from "./dom";
 import { boothLabelEl } from "./components";
 import { allHealthStatuses, healthMeta } from "../domain/status";
 import { MODULES, SUBSCRIPTION_TYPES } from "../domain/modules";
+import { forgetOrgStyleUi } from "./orgStyleSettings";
 
 // Vue « Organisations » (CIN-084, renommée CIN-091) — pilotage PLATEFORME, réservé au
 // global_admin. Roster par ORGANISATION (filtrable) + actions par lot : souscription/modules
@@ -288,6 +289,10 @@ function openSubscriptionModal(store: FleetStore, orgIds: readonly string[], org
 function runReset(store: FleetStore, orgIds: readonly string[], orgNames: readonly string[]): void {
   const n = orgIds.length;
   if (!confirm(`Réinitialiser ${n} organisation${n > 1 ? "s" : ""} au style maître Kioskoscope ?\n\n${orgNames.join(", ")}\n\nLeurs couleurs, fontes, titres et logos personnalisés seront supprimés — leurs cabines reviendront au visuel par défaut. Action irréversible.`)) return;
+  // AVANT l'appel, et non après : un brouillon laissé sur une org réinitialisée par lot
+  // ressusciterait à la réouverture de son onglet « Mes styles » et ré-appliquerait les couleurs
+  // que ce geste vient d'effacer — même bug que la réinitialisation unitaire, autre porte.
+  forgetOrgStyleUi(orgIds);
   void store.resetOrgStylesBatch(orgIds).then((res) => {
     // Le store a déjà rechargé + réémis (la page s'est reconstruite, badges → « Maître »).
     // On confirme donc via une alerte, indépendante du DOM détaché.
