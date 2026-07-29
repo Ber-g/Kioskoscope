@@ -303,6 +303,7 @@ export function playerScreen(
   skip.addEventListener("click", () => finishOnce("skipped"));
 
   let intervalId: number | undefined;
+  let timeoutId: number | undefined;
   let videoEl: HTMLVideoElement | undefined;
   let stage: HTMLElement;
   let subtitleControls: HTMLElement | undefined;
@@ -369,9 +370,27 @@ export function playerScreen(
     tryPlay();
 
     stage = el("div", { class: "player__videostage" }, [videoEl, overlay]);
+  } else if (isKioskLocked()) {
+    // GARDE-FOU ULTIME (BUG-017). La lecture simulée est un OUTIL DE DÉVELOPPEMENT : 12 s de barre
+    // de progression, aucune image, aucun son. Sur une borne réelle, c'est une séance payée contre
+    // du vide — le symptôme exact rapporté par l'exploitant (« aucune vidéo ne joue »).
+    //
+    // En principe on n'arrive jamais ici : `loadCatalog` écarte désormais tout média sans fichier,
+    // et une borne sans identifiants a un catalogue vide. C'est justement pour ça que la garde
+    // existe — elle couvre le chemin qu'on n'a pas prévu (import USB à venir, film ajouté par
+    // `addFilm`, régression future). On ne simule pas : on le DIT et on rend la main tout de suite.
+    const failure = el("div", { class: "player__stage" }, [
+      el("h2", {}, ["Ce film n'est pas disponible"]),
+      el("p", { class: "muted" }, ["Le fichier est introuvable sur cette borne. Choisissons-en un autre."]),
+    ]);
+    stage = failure;
+    // `error` et non `ended` : ce n'est PAS un achèvement (F21 — ne jamais gonfler un taux
+    // d'achèvement destiné à des ayants droit avec un fichier qu'on n'a pas su lire).
+    timeoutId = window.setTimeout(() => finishOnce("error"), 3000);
   } else {
     // Lecture SIMULÉE : progression accélérée (~12 s) pour tester le parcours. La barre n'existe QUE
-    // dans ce mode (repère de dev) — jamais sur une vraie vidéo.
+    // dans ce mode (repère de dev) — jamais sur une vraie vidéo, et jamais sur une borne verrouillée
+    // (cf. branche ci-dessus).
     const SIM_MS = 12000;
     const bar = el("div", { class: "progress__bar" }, []);
     progress = el("div", { class: "progress" }, [bar]);
@@ -449,6 +468,7 @@ export function playerScreen(
     dispose: () => {
       disposed = true;
       if (intervalId !== undefined) clearInterval(intervalId);
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
       if (volumeTimer !== undefined) clearTimeout(volumeTimer);
       if (videoEl) {
         videoEl.pause();

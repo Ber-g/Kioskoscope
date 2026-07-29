@@ -1061,3 +1061,64 @@ h2 {
 .op-status-k {
   color: var(--text-muted);
 }
+
+/* ── Bandeau d'état de la borne (BUG-017) ────────────────────────────────────
+   Surface de DIAGNOSTIC, pas de parcours : famille UI (sans-serif), au-dessus de
+   tout sauf du menu opérateur, et TRANSPARENTE aux appuis (elle ne doit jamais
+   voler un contact destiné au parcours ni au hotspot opérateur). */
+.booth-status {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 950; /* au-dessus du parcours, sous l'overlay opérateur (1000) */
+  pointer-events: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 16px;
+  padding: 12px 20px;
+  font-family: var(--font-ui);
+  font-size: 0.95rem;
+  line-height: 1.35;
+}
+
+.booth-status__title {
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.booth-status__detail {
+  flex: 1 1 260px;
+}
+
+.booth-status__code {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.75rem;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+/* Défaut de déploiement : rouge plein, non ambigu, lisible à 2 m. La borne ne peut
+   RIEN proposer dans cet état — le bandeau doit donc être impossible à confondre
+   avec une notification passagère. */
+.booth-status--fault {
+  background: var(--color-danger);
+  color: #ffffff;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* Bac à sable de développement : discret mais permanent. Sert à ce qu'une capture
+   d'écran ou une démo ne puisse JAMAIS être prise pour une borne réelle. */
+.booth-status--demo {
+  background: transparent;
+  color: var(--text-muted);
+  justify-content: flex-end;
+  border-bottom: 1px solid var(--line);
+}
+
+.booth-status--demo .booth-status__detail {
+  flex: 0 1 auto;
+}

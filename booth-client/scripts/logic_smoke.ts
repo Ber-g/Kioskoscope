@@ -7,7 +7,8 @@
 import { RuleBasedRecommender } from "../src/reco/RuleBasedRecommender";
 import type { RecoContext } from "../src/reco/Recommender";
 import { SessionManager } from "../src/session/SessionManager";
-import { FACTICE_CATALOG } from "../src/domain/catalog";
+import { FACTICE_CATALOG, auditCatalog, type CatalogEntry } from "../src/domain/catalog";
+import { normalizeDeviceError } from "../src/setup/kioskAgent";
 import type { Film, Play } from "../src/domain/types";
 
 let passed = 0;
@@ -300,12 +301,156 @@ function testSession(): void {
   }
 }
 
+// ── CATALOGUE JOUABLE (BUG-017) ─────────────────────────────────────────────
+// Invariant protégé : un média sans fichier lisible ne doit JAMAIS être proposé. Il était
+// recommandé puis « joué » en lecture simulée — une séance payée contre une barre de progression.
+function testPlayableCatalog(): void {
+  const entry = (overrides: Partial<Film>, declaredPath: string | null): CatalogEntry => ({
+    film: makeFilm(overrides),
+    declaredPath,
+  });
+
+  console.log("C1. Un média SANS fichier déclaré est écarté (donnée incomplète)");
+  {
+    const e = entry({ storageUrl: null, title: "Vertige" }, null);
+    const a = auditCatalog([e]);
+    assert(a.playable.length === 0, "aucun média jouable si storage_url est nul");
+    assert(a.withoutFile.length === 1, "le média sans fichier est classé 'withoutFile'");
+    assert(a.unresolved.length === 0, "sans fichier déclaré, ce n'est PAS un incident de signature");
+  }
+
+  console.log("C2. Un média AVEC fichier déclaré mais URL non résolue est écarté (incident)");
+  {
+    const e = entry({ storageUrl: null }, "org/media/film.mp4");
+    const a = auditCatalog([e]);
+    assert(a.playable.length === 0, "URL de signature échouée → média non jouable");
+    assert(a.unresolved.length === 1, "classé 'unresolved' — c'est un incident, pas une fiche à compléter");
+    assert(a.withoutFile.length === 0, "un fichier était bien déclaré : pas 'withoutFile'");
+  }
+
+  console.log("C3. Un média avec URL résolue passe");
+  {
+    const e = entry({ storageUrl: "https://signed.example/film.mp4?token=x" }, "org/media/film.mp4");
+    const a = auditCatalog([e]);
+    assert(a.playable.length === 1, "média avec URL résolue → jouable");
+    assert(a.playable[0].storageUrl !== null, "l'URL résolue est conservée sur le film jouable");
+  }
+
+  console.log("C4. Chaînes vides traitées comme absentes (jamais comme une URL valide)");
+  {
+    const declaredBlank = auditCatalog([entry({ storageUrl: "https://ok/x.mp4" }, "   ")]);
+    assert(declaredBlank.withoutFile.length === 1, "chemin déclaré blanc = aucun fichier rattaché");
+    const resolvedBlank = auditCatalog([entry({ storageUrl: "" }, "org/media/film.mp4")]);
+    assert(resolvedBlank.unresolved.length === 1, "URL résolue vide = non résolue, jamais jouable");
+  }
+
+  console.log("C5. Catalogue mixte : seuls les jouables sortent, les autres sont tracés");
+  {
+    const a = auditCatalog([
+      entry({ storageUrl: "https://signed/a.mp4" }, "a.mp4"),
+      entry({ storageUrl: null, title: "Vertige" }, null),
+      entry({ storageUrl: null }, "c.mp4"),
+      entry({ storageUrl: "https://signed/d.mp4" }, "d.mp4"),
+    ]);
+    assert(a.playable.length === 2, "2 médias jouables sur 4");
+    assert(a.withoutFile.length === 1 && a.unresolved.length === 1, "les 2 exclus sont classés par CAUSE distincte");
+    assert(
+      a.playable.length + a.withoutFile.length + a.unresolved.length === 4,
+      "partition totale : aucun média perdu ni compté deux fois",
+    );
+  }
+
+  console.log("C6. Catalogue entièrement injouable → catalogue VIDE (règle BUG-011)");
+  {
+    const a = auditCatalog([entry({ storageUrl: null }, null), entry({ storageUrl: null }, "b.mp4")]);
+    assert(a.playable.length === 0, "aucun repli : un catalogue vide est un état honnête");
+  }
+
+  console.log("C7. Le catalogue FACTICE est intégralement injouable (aucun fichier)");
+  {
+    // Garde de non-régression : si un jour un film factice recevait une URL, la lecture simulée
+    // cesserait d'être le seul chemin possible pour lui — et cette hypothèse doit rester vraie.
+    const a = auditCatalog(FACTICE_CATALOG.map((f) => ({ film: f, declaredPath: f.storageUrl })));
+    assert(a.playable.length === 0, "aucun film de démonstration n'est jouable");
+    assert(a.withoutFile.length === FACTICE_CATALOG.length, "tous les films factices sont 'sans fichier'");
+  }
+
+  console.log("C8. Entrée vide → partition vide sans crash");
+  {
+    const a = auditCatalog([]);
+    assert(a.playable.length === 0 && a.withoutFile.length === 0 && a.unresolved.length === 0, "[] → tout vide");
+  }
+}
+
+// ── DIAGNOSTIC DE PROVISIONNEMENT (BUG-017) ─────────────────────────────────
+// Invariant protégé : une borne mal provisionnée ne doit jamais pouvoir passer pour un poste de
+// développement légitime — c'est ce qui la faisait démarrer en mode démo sans que personne le voie.
+function testDeviceError(): void {
+  console.log("D1. Chaque cause servie par la borne est conservée telle quelle");
+  {
+    assert(normalizeDeviceError({ kind: "absent" }, false).kind === "absent", "'absent' préservé");
+    assert(normalizeDeviceError({ kind: "incomplete" }, true).kind === "incomplete", "'incomplete' préservé");
+    assert(normalizeDeviceError({ kind: "unreadable" }, true).kind === "unreadable", "'unreadable' préservé");
+  }
+
+  console.log("D2. Un bloc device présent mais refusé ⇒ 'incomplete', jamais 'absent'");
+  {
+    // Cas d'un serveur local d'une version antérieure : il sert un `device` partiel sans
+    // `deviceError`. Le confondre avec « pas provisionné » rouvrirait exactement le trou.
+    const e = normalizeDeviceError(undefined, true);
+    assert(e.kind === "incomplete", "device présent mais invalide → erreur de déploiement");
+    const none = normalizeDeviceError(undefined, false);
+    assert(none.kind === "absent", "aucun bloc device et aucune erreur → poste non provisionné");
+  }
+
+  console.log("D3. `kind` inconnu ou forgé n'est jamais recopié");
+  {
+    const e = normalizeDeviceError({ kind: "tout_va_bien" }, true);
+    assert(e.kind === "incomplete", "valeur hors énumération → repli sur la cause déduite");
+    assert(!["tout_va_bien"].includes(e.kind as string), "aucune chaîne arbitraire ne devient un 'kind'");
+  }
+
+  console.log("D4. `missing` filtré sur la liste blanche des NOMS de champs");
+  {
+    const e = normalizeDeviceError({ kind: "incomplete", missing: ["orgId", "<img src=x>", "boothId", 42] }, true);
+    assert(e.missing?.length === 2, "seuls les noms de champs connus sont retenus");
+    assert(e.missing?.includes("orgId") === true && e.missing?.includes("boothId") === true, "noms légitimes conservés");
+    assert(e.missing?.some((m) => m.includes("<")) !== true, "aucune chaîne arbitraire ne part vers le DOM");
+  }
+
+  console.log("D5. Le nom `devicePassword` circule, jamais sa valeur");
+  {
+    // On diagnostique un mot de passe MANQUANT : c'est le NOM du champ qui est utile. Le contrat
+    // interdit toute valeur — la structure ne porte d'ailleurs aucun champ pour en transporter une.
+    const e = normalizeDeviceError({ kind: "incomplete", missing: ["devicePassword"], value: "hunter2" }, true);
+    assert(e.missing?.[0] === "devicePassword", "le nom du champ manquant est diagnostiquable");
+    assert(!Object.values(e).flat().includes("hunter2"), "aucune valeur du fichier device ne traverse");
+  }
+
+  console.log("D6. `reason` borné en longueur (pas de bandeau noyé par une chaîne hostile)");
+  {
+    const e = normalizeDeviceError({ kind: "unreadable", reason: "x".repeat(5000) }, true);
+    assert((e.reason?.length ?? 0) <= 120, "motif tronqué à 120 caractères");
+  }
+
+  console.log("D7. Charge utile absurde → cause déduite, aucun crash");
+  {
+    assert(normalizeDeviceError(null, true).kind === "incomplete", "null + device refusé → incomplete");
+    assert(normalizeDeviceError("bonjour", false).kind === "absent", "chaîne → absent");
+    assert(normalizeDeviceError({ missing: "orgId" }, true).missing === undefined, "missing non-tableau ignoré");
+  }
+}
+
 function main(): void {
   console.log("=== RECO : RuleBasedRecommender ===");
   testReco();
   console.log("\n=== SESSION : SessionManager ===");
   testSession();
-  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session)`);
+  console.log("\n=== CATALOGUE JOUABLE : auditCatalog ===");
+  testPlayableCatalog();
+  console.log("\n=== PROVISIONNEMENT : normalizeDeviceError ===");
+  testDeviceError();
+  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement)`);
 }
 
 try {

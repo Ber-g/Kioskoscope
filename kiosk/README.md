@@ -124,6 +124,25 @@ provisionné, un objet `device` (`boothId`/`orgId`/`deviceEmail`/`devicePassword
 `/etc/kioskoscope/device.json` (0600). Le `booth-client` n'embarque donc PLUS ces creds dans le
 bundle : un build public reste **inerte** (mode mock). En dev, repli sur `.env` (`import.meta.env.DEV`).
 
+**Provisionnement manquant = dit explicitement (BUG-017).** La réponse porte **soit** `device`,
+**soit** `deviceError` — jamais rien d'implicite. Le client ne doit pas avoir à déduire d'un champ
+absent s'il tourne sur un poste de dev ou sur une borne cassée :
+
+| `deviceError.kind` | Situation | Réaction borne |
+|---|---|---|
+| `absent` | `/etc/kioskoscope/device.json` inexistant | jamais provisionnée |
+| `incomplete` | fichier présent, champ(s) vide(s) → `missing: ["orgId", …]` | **erreur de déploiement** |
+| `unreadable` | droits (`EACCES`) ou JSON invalide → `reason` | **erreur de déploiement** |
+
+Dans les trois cas, l'agent détecté + aucun identifiant ⇒ le `booth-client` **vide le catalogue**
+(aucune séance, donc aucun paiement possible) et affiche un **bandeau de diagnostic plein écran** :
+sur une machine sans clavier, un `console.info` n'est pas un signal. ⚠️ Ni le serveur ni le bandeau
+ne journalisent la **valeur** de `devicePassword` — seulement le **nom** du champ manquant.
+
+Le serveur **ne refuse pas de démarrer** dans ces cas, délibérément : sans lui, Chromium affiche
+une page d'erreur réseau du navigateur et le **menu opérateur** (Wi-Fi, réglages, redémarrage)
+disparaît — or c'est par lui qu'on rattrape une borne mal déployée sur place.
+
 ## État
 
 - ✅ Agent local (Wi-Fi/power/display/volume/system-info + os-update) + systemd + provisioning + sécurité.

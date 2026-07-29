@@ -192,3 +192,47 @@ export function availableMoods(catalog: readonly Film[] = runtimeCatalog): reado
 export function filmById(id: string, catalog: readonly Film[] = runtimeCatalog): Film | undefined {
   return catalog.find((f) => f.id === id);
 }
+
+// ── Jouabilité : un film sans fichier n'est PAS un film (BUG-017) ────────────
+// Un média dont l'URL de lecture est nulle passait quand même dans le catalogue, était recommandé,
+// et « se jouait » via la lecture SIMULÉE de l'écran lecteur (barre de progression, aucune image,
+// aucun son). Un visiteur pouvait donc payer pour un fichier qui n'existe pas. Règle : on ne
+// propose que ce qu'on peut réellement projeter.
+
+/** Un média du catalogue réel, avec le chemin de fichier DÉCLARÉ en base (avant résolution). */
+export interface CatalogEntry {
+  /** Le film tel qu'il sera servi au parcours (`storageUrl` = URL résolue, ou null si échec). */
+  readonly film: Film;
+  /** Chemin storage déclaré en base (`media.storage_url`). null = aucun fichier rattaché. */
+  readonly declaredPath: string | null;
+}
+
+/**
+ * Tri du catalogue réel en trois tas. La distinction entre les deux tas d'exclusion est
+ * intentionnelle : ils n'appellent pas la même réaction.
+ *  - `withoutFile` : la fiche existe, aucun fichier n'a jamais été rattaché → DONNÉE INCOMPLÈTE,
+ *    c'est au back-office de la compléter. Normal sur un catalogue en cours de constitution.
+ *  - `unresolved`  : un fichier est déclaré mais son URL n'a pas pu être résolue (signature
+ *    refusée, objet absent du bucket, droits) → INCIDENT. Le média existe et devrait être jouable :
+ *    quelque chose est cassé côté stockage ou policies, et ça mérite une alerte, pas un haussement
+ *    d'épaules.
+ * Dans les deux cas le média SORT du catalogue : mieux vaut aucune séance qu'un faux film payant
+ * (règle posée par BUG-011, ici étendue au média sans fichier).
+ */
+export function auditCatalog(entries: readonly CatalogEntry[]): {
+  readonly playable: readonly Film[];
+  readonly withoutFile: readonly Film[];
+  readonly unresolved: readonly Film[];
+} {
+  const playable: Film[] = [];
+  const withoutFile: Film[] = [];
+  const unresolved: Film[] = [];
+  for (const { film, declaredPath } of entries) {
+    const declared = typeof declaredPath === "string" && declaredPath.trim() !== "";
+    const resolved = typeof film.storageUrl === "string" && film.storageUrl.trim() !== "";
+    if (!declared) withoutFile.push(film);
+    else if (!resolved) unresolved.push(film);
+    else playable.push(film);
+  }
+  return { playable, withoutFile, unresolved };
+}

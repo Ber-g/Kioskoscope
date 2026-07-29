@@ -10,6 +10,7 @@ import { SessionJournal } from "./data/sessionJournal";
 import { setCatalog } from "./domain/catalog";
 import type { Play, Session } from "./domain/types";
 import { App } from "./ui/app";
+import { showBoothStatus } from "./ui/boothStatus";
 import { WifiManager, type WifiAdapter } from "./setup/wifi";
 import { AgentWifiAdapter, KioskAgentClient, createAgentSettings, loadKioskConfig } from "./setup/kioskAgent";
 import { enableKioskLockdown } from "./setup/kioskLockdown";
@@ -118,9 +119,60 @@ async function main(): Promise<void> {
     // sans réseau (F22 / CIN-112). Ça supprime seulement le scénario trompeur en attendant.
     setCatalog([]);
     console.warn("[booth] backend injoignable : catalogue VIDÉ (aucune séance proposée). Les films de démonstration ne sont jamais servis sur une borne configurée.");
+  } else if (kioskConfig) {
+    // ⚠️ TROISIÈME PORTE (BUG-017) — AGENT LOCAL PRÉSENT + AUCUN IDENTIFIANT DEVICE.
+    //
+    // C'est une VRAIE borne mal déployée : le serveur local de la borne répond, le verrouillage
+    // kiosque vient d'être activé (l'app est plein écran, inéchappable)… mais aucun compte device.
+    // `backend.isConfigured` est faux, donc AUCUNE des deux branches ci-dessus ne s'exécutait et
+    // le catalogue restait sur FACTICE_CATALOG : la borne servait « Vertige » & co, films inventés
+    // sans fichier, à des visiteurs payants. Le seul signal était un console.info que personne ne
+    // lit sur une machine sans clavier.
+    //
+    // DÉCISION : le bandeau ne suffit PAS, on refuse aussi le catalogue factice. Le bac à sable
+    // n'a de sens que là où quelqu'un peut le reconnaître comme tel — devant un écran de dev. Dès
+    // que l'agent local est là, la machine est en exploitation : y afficher des films de démo,
+    // même estampillés, c'est offrir un bouton « payer » sur du vide. Un bandeau seul laisserait
+    // le parcours d'achat ouvert derrière lui.
+    //
+    // Les deux ensemble, donc : catalogue vidé (→ écran « aucune séance disponible », pas de
+    // déverrouillage possible, même règle que BUG-011) + diagnostic à l'écran pour que la
+    // personne sur place sache que c'est réparable et comment le dire.
+    setCatalog([]);
+    const err = kioskConfig.deviceError;
+    const isBroken = err?.kind === "incomplete" || err?.kind === "unreadable";
+    showBoothStatus({
+      level: "fault",
+      title: "Borne non configurée",
+      // Deux registres : `incomplete`/`unreadable` = quelqu'un a provisionné et ça a raté (le plus
+      // grave, ça se répare tout de suite) ; `absent` = jamais provisionné.
+      detail: isBroken
+        ? "Les identifiants de cette borne sont incomplets ou illisibles. Aucune séance ne peut être proposée tant que le provisionnement n'est pas refait."
+        : "Cette borne n'a pas encore été provisionnée. Aucune séance ne peut être proposée.",
+      // Dictable au téléphone. Uniquement des NOMS de champs — jamais une valeur (F17).
+      code: [
+        `device: ${err?.kind ?? "absent"}`,
+        err?.missing?.length ? `manquants: ${err.missing.join(",")}` : "",
+        err?.reason ? `motif: ${err.reason}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    });
+    console.error(
+      `[booth] BORNE NON CONFIGURÉE (device: ${err?.kind ?? "absent"}` +
+        (err?.missing?.length ? `, champs manquants : ${err.missing.join(", ")}` : "") +
+        ") — catalogue VIDÉ, aucun film de démonstration servi.",
+    );
   } else {
-    // Dev / déploiement public sans identifiants : le catalogue factice est ICI légitime,
-    // c'est le mode bac à sable qui permet de parcourir l'expérience sans backend.
+    // Dev / déploiement public sans agent local : le catalogue factice est ICI légitime, c'est le
+    // bac à sable qui permet de parcourir l'expérience sans backend. Un badge permanent (discret)
+    // suffit à ce niveau — mais il est obligatoire : une capture d'écran ou une démo ne doit jamais
+    // pouvoir passer pour une borne réelle, c'est exactement la confusion qui a produit BUG-017.
+    showBoothStatus({
+      level: "demo",
+      title: "Mode démonstration",
+      detail: "Films fictifs · lecture simulée · aucune séance enregistrée",
+    });
     console.info("[booth] mode démo (aucun identifiant borne) — catalogue factice, sessions en mémoire");
   }
 

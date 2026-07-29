@@ -2,6 +2,7 @@ import type { OrgStyle, Subtitle } from "@kioskoscope/domain";
 import type { Film, Play, Session } from "../domain/types";
 import type { AccessLogEntry } from "../setup/accessCache";
 import type { AccessEntry, AccessTable, OperatorRole } from "../setup/auth";
+import { auditCatalog, type CatalogEntry } from "../domain/catalog";
 import { supabase } from "./supabase";
 
 // Adaptateur backend de la Kiosk : lit le catalogue réel (médias de son org) et
@@ -187,7 +188,13 @@ export class BoothBackend {
    * Catalogue réel de l'org (médias actifs, scoping RLS) + sous-titres VÉRIFIÉS (F12).
    * Le bucket `media` étant PRIVÉ, les chemins storage (vidéo ET sous-titres) sont résolus ici en
    * **URLs signées** — la borne (device) y a accès via la policy `media_read_device` (0022). Un
-   * chemin non signable (fichier absent) retombe à `null` (vidéo → lecture simulée ; sous-titre → retiré).
+   * sous-titre non signable est simplement retiré (le film reste jouable, sans cette langue).
+   *
+   * ⚠️ BUG-017 — le catalogue RENVOYÉ ne contient QUE des médias réellement projetables : un média
+   * sans `storage_url`, ou dont l'URL n'a pas pu être signée, est EXCLU. Avant, il retombait à
+   * `storageUrl: null` et l'écran lecteur basculait en lecture simulée : une séance payée pour une
+   * barre de progression. Le catalogue peut donc revenir VIDE — c'est l'état honnête attendu
+   * (écran « aucune séance disponible »), pas une panne à masquer.
    */
   async loadCatalog(): Promise<Film[]> {
     if (!supabase) return [];
@@ -226,11 +233,30 @@ export class BoothBackend {
       subsByMedia.set(mid, list);
     }
 
-    return mediaRows.map((row) => {
+    const entries: CatalogEntry[] = mediaRows.map((row) => {
       const film = rowToFilm(row, subsByMedia.get(String(row.id)) ?? []);
-      // Chemin storage privé → URL signée (ou null → lecture simulée, jamais de crash).
-      return { ...film, storageUrl: film.storageUrl ? (signed.get(film.storageUrl) ?? null) : null };
+      const declaredPath = film.storageUrl && film.storageUrl.trim() !== "" ? film.storageUrl : null;
+      // Chemin storage privé → URL signée. Non signable → null, et le média sera écarté ci-dessous.
+      return { film: { ...film, storageUrl: declaredPath ? (signed.get(declaredPath) ?? null) : null }, declaredPath };
     });
+
+    const { playable, withoutFile, unresolved } = auditCatalog(entries);
+    // Deux journaux DIFFÉRENTS parce que ce sont deux problèmes différents (cf. auditCatalog) :
+    // une fiche sans fichier est un catalogue à finir de remplir ; une URL non résolue est une
+    // panne (bucket, policy, objet supprimé) sur un média censé être jouable.
+    if (withoutFile.length > 0) {
+      console.warn(
+        `[booth] ${withoutFile.length} média(s) écarté(s) — aucun fichier vidéo rattaché : ` +
+          withoutFile.map((f) => f.title).join(", "),
+      );
+    }
+    if (unresolved.length > 0) {
+      console.error(
+        `[booth] INCIDENT — ${unresolved.length} média(s) écarté(s) : fichier déclaré mais URL non résolue ` +
+          `(bucket/policy/objet manquant) : ` + unresolved.map((f) => f.title).join(", "),
+      );
+    }
+    return [...playable];
   }
 
   /**

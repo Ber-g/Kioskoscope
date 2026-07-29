@@ -20,20 +20,62 @@ export interface KioskDeviceConfig {
   readonly devicePassword: string;
 }
 
+/**
+ * Pourquoi la borne n'a PAS d'identifiants (BUG-017). `absent` = jamais provisionné (poste de dev) ;
+ * `incomplete`/`unreadable` = quelqu'un a bien déposé un fichier de provisionnement mais il est
+ * cassé → erreur de déploiement, jamais un choix. La distinction pilote le message affiché.
+ */
+export type KioskDeviceErrorKind = "absent" | "incomplete" | "unreadable";
+
+export interface KioskDeviceError {
+  readonly kind: KioskDeviceErrorKind;
+  /** Noms des champs manquants/vides (jamais de valeur — surtout pas le mot de passe). */
+  readonly missing?: readonly string[];
+  readonly reason?: string;
+}
+
 export interface KioskConfig {
   readonly agentUrl: string;
   readonly agentToken: string;
   /** Creds device, servis localement par la borne. Absent = build public inerte (mock). */
   readonly device?: KioskDeviceConfig;
+  /** Renseigné dès que `device` manque : dit POURQUOI. Toujours présent si `device` est absent. */
+  readonly deviceError?: KioskDeviceError;
 }
+
+const DEVICE_FIELDS = ["boothId", "orgId", "deviceEmail", "devicePassword"] as const;
 
 function parseDevice(d: unknown): KioskDeviceConfig | undefined {
   if (!d || typeof d !== "object") return undefined;
   const o = d as Record<string, unknown>;
-  const ok = ["boothId", "orgId", "deviceEmail", "devicePassword"].every((k) => typeof o[k] === "string" && o[k] !== "");
+  const ok = DEVICE_FIELDS.every((k) => typeof o[k] === "string" && (o[k] as string).trim() !== "");
   return ok
     ? { boothId: String(o.boothId), orgId: String(o.orgId), deviceEmail: String(o.deviceEmail), devicePassword: String(o.devicePassword) }
     : undefined;
+}
+
+/**
+ * Normalise le `deviceError` servi par le serveur local. On ne recopie JAMAIS tel quel une chaîne
+ * venue du réseau vers l'écran : `kind` est ramené à l'énumération connue et `missing` est filtré
+ * sur la liste blanche des noms de champs. `reason` est borné en longueur.
+ *
+ * Exporté pour être testé (logique PURE, sans réseau ni DOM) — pas pour être appelé ailleurs.
+ */
+export function normalizeDeviceError(raw: unknown, hadDeviceBlock: boolean): KioskDeviceError {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const kinds: readonly KioskDeviceErrorKind[] = ["absent", "incomplete", "unreadable"];
+  const kind = kinds.find((k) => k === o.kind);
+  const missing = Array.isArray(o.missing)
+    ? (o.missing as unknown[]).filter((m): m is string => DEVICE_FIELDS.some((f) => f === m))
+    : undefined;
+  const reason = typeof o.reason === "string" ? o.reason.slice(0, 120) : undefined;
+  return {
+    // Serveur local d'une version antérieure (pas de `deviceError`) : un bloc `device` présent mais
+    // refusé par `parseDevice` reste une configuration INCOMPLÈTE — jamais un « absent » anodin.
+    kind: kind ?? (hadDeviceBlock ? "incomplete" : "absent"),
+    ...(missing && missing.length > 0 ? { missing } : {}),
+    ...(reason ? { reason } : {}),
+  };
 }
 
 /** Charge la config locale de la borne (jeton + creds device, hors bundle). null = pas de borne (dev). */
@@ -41,10 +83,16 @@ export async function loadKioskConfig(): Promise<KioskConfig | null> {
   try {
     const res = await fetch("/kiosk-config.json", { cache: "no-store" });
     if (!res.ok) return null;
-    const cfg = (await res.json()) as Partial<KioskConfig>;
+    const cfg = (await res.json()) as Record<string, unknown>;
     if (typeof cfg.agentUrl === "string" && typeof cfg.agentToken === "string") {
       const device = parseDevice(cfg.device);
-      return { agentUrl: cfg.agentUrl, agentToken: cfg.agentToken, ...(device ? { device } : {}) };
+      return device
+        ? { agentUrl: cfg.agentUrl, agentToken: cfg.agentToken, device }
+        : {
+            agentUrl: cfg.agentUrl,
+            agentToken: cfg.agentToken,
+            deviceError: normalizeDeviceError(cfg.deviceError, cfg.device !== undefined),
+          };
     }
     return null;
   } catch {
