@@ -5,6 +5,21 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>Votre séance Kioskoscope</title>
+  <!-- Teinte de l'interface du navigateur (CIN-120 §2). Volontairement la couleur de la page
+       elle-même, PAS celle de l'organisation : exposer la couleur d'un lieu sur un lien
+       transmissible apprendrait à un tiers où la personne est allée. Voir le ticket. -->
+  <meta name="theme-color" content="#0e0f13">
+  <!-- Aperçu de lien (messageries). DÉLIBÉRÉMENT GÉNÉRIQUE : ces balises sont statiques, donc
+       elles ne peuvent pas contenir la séance — et c'est la propriété qu'on veut. Coller le lien
+       dans une conversation fait déjà chercher un aperçu par le serveur de la messagerie ; on lui
+       donne une carte correcte sans rien lui apprendre de plus que ce que le lien donne déjà.
+       Pas d'`og:image` : ce serait une ressource externe à héberger, et une ligne de plus dans
+       une CSP qu'on tient fermée. -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Kioskoscope">
+  <meta property="og:title" content="Une séance Kioskoscope">
+  <meta property="og:description" content="Le récap des films d'une séance en cabine.">
+  <meta name="twitter:card" content="summary">
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -23,10 +38,17 @@
     .dir { color: #9aa0ab; font-size: 14px; }
     .tag { display: inline-block; margin-left: 8px; font-size: 11px; padding: 2px 8px; border-radius: 999px;
       background: #1f2a44; color: #9db4e6; vertical-align: middle; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .cta { display: inline-block; background: #f2f3f5; color: #0e0f13; text-decoration: none; font-weight: 600;
-      padding: 12px 20px; border-radius: 10px; }
+      padding: 12px 20px; border-radius: 10px; font: inherit; font-weight: 600; border: 0; cursor: pointer; }
+    /* Partager est une action SECONDAIRE : l'export Letterboxd reste l'action principale de la
+       page. Même gabarit, poids visuel moindre — un contour au lieu d'un aplat. */
+    .cta.ghost { background: transparent; color: #f2f3f5; border: 1px solid #3a3f4a; }
+    .cta:focus-visible { outline: 2px solid #9db4e6; outline-offset: 2px; }
     .foot { margin-top: 34px; color: #6b7079; font-size: 12px; }
-    .msg { text-align: center; color: #9aa0ab; padding: 60px 0; }
+    .msg { text-align: center; color: #9aa0ab; padding: 60px 18px; }
+    .hint { margin-top: 10px; color: #6b7079; font-size: 14px; max-width: 34em;
+      margin-left: auto; margin-right: auto; }
   </style>
 </head>
 <body>
@@ -47,10 +69,14 @@
       var parts = location.pathname.split("/").filter(Boolean);
       return parts.length ? parts[parts.length - 1] : "";
     }
-    function message(txt) {
+    // Un message d'erreur nomme UNE cause. Le titre dit ce qui se passe, la ligne suivante dit
+    // quoi faire — sans quoi le lecteur invente une explication, et la sienne est souvent fausse.
+    function message(txt, hint) {
       var app = document.getElementById("app");
       app.textContent = "";
-      var m = el("div", "msg", txt);
+      var m = el("div", "msg");
+      m.appendChild(el("div", null, txt));
+      if (hint) m.appendChild(el("div", "hint", hint));
       app.appendChild(m);
     }
     function render(data, token) {
@@ -74,21 +100,112 @@
       var a = el("a", "cta", "Exporter vers Letterboxd (CSV)");
       a.href = API_BASE + "/s/" + encodeURIComponent(token) + ".csv";
       a.setAttribute("download", "kioskoscope-seance.csv");
-      app.appendChild(a);
+      var actions = el("div", "actions");
+      actions.appendChild(a);
+      var share = shareButton();
+      if (share) actions.appendChild(share);
+      app.appendChild(actions);
       app.appendChild(el("div", "foot",
         "Lien privé, non indexé. Aucune donnée personnelle n'est stockée sur cette page."));
     }
 
+    // ── Partager (CIN-120 §4) ────────────────────────────────────────────────
+    // Deux capacités, dans cet ordre : la feuille de partage native du téléphone, sinon la copie
+    // du lien. Les deux exigent HTTPS ; si AUCUNE n'est disponible, on ne rend PAS le bouton —
+    // un bouton qui ne fait rien est pire que pas de bouton (et le lien reste dans la barre
+    // d'adresse, qui est le partage universel).
+    //
+    // On partage l'URL et un titre, PAS la liste des films : le destinataire ouvre le lien pour
+    // les voir. Pré-écrire les titres dans le message les ferait apparaître dans un aperçu que
+    // l'émetteur n'a pas forcément relu.
+    function canShare() { return typeof navigator.share === "function"; }
+    function canCopy() { return !!(navigator.clipboard && typeof navigator.clipboard.writeText === "function"); }
+
+    function shareButton() {
+      if (!canShare() && !canCopy()) return null;
+      var label = canShare() ? "Partager" : "Copier le lien";
+      var b = el("button", "cta ghost", label);
+      b.type = "button";
+      // Le retour de la copie est un changement de texte : sans région « live », un lecteur
+      // d'écran ne l'annoncerait pas — l'action serait silencieuse pour qui ne voit pas.
+      b.setAttribute("aria-live", "polite");
+      b.addEventListener("click", function () {
+        var url = location.href;
+        if (canShare()) {
+          navigator.share({ title: "Ma séance Kioskoscope", url: url }).catch(function () {
+            // Annulation de la feuille de partage = geste normal, pas une erreur à signaler.
+          });
+          return;
+        }
+        navigator.clipboard.writeText(url).then(
+          function () { flash(b, "Lien copié", label); },
+          function () { flash(b, "Copie impossible", label); }
+        );
+      });
+      return b;
+    }
+
+    function flash(node, temporary, original) {
+      node.textContent = temporary;
+      setTimeout(function () { node.textContent = original; }, 2000);
+    }
+
+    // ── Chargement ───────────────────────────────────────────────────────────
+    // ⚠️ L'ancienne version affichait « Ce lien de séance n'existe pas ou a expiré » pour TOUTES
+    // les issues : réseau injoignable, 404, séance vide. Deux défauts, et le second est le pire :
+    //
+    // 1. Elle confondait « le serveur ne répond pas » (réessayer marche) avec « ce jeton est
+    //    inconnu » (réessayer ne sert à rien) — donc elle ne disait jamais quoi faire.
+    // 2. « ou a expiré » était **inventé** : `share_token` n'a AUCUNE expiration, nulle part dans
+    //    le schéma. Un message d'erreur qui propose une cause fictive envoie le lecteur — y compris
+    //    nous, en diagnostic — sur une piste qui n'existe pas. Ne jamais réintroduire ce mot ici.
+    //
+    // Cause réelle d'un 404 sur un jeton bien formé : la séance **n'a pas encore été remontée**.
+    // La cabine joue hors ligne et se synchronise après coup ; le QR s'affiche à la fin de la
+    // séance, sans attendre que la remontée ait abouti. Il existe donc une fenêtre — quelques
+    // secondes en ligne, jusqu'à la prochaine reconnexion hors ligne — pendant laquelle le QR est
+    // scannable mais la séance introuvable. Voir BUG-014.
     (function () {
       var token = tokenFromUrl();
-      if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) { message("Lien de séance invalide."); return; }
+      if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) {
+        message("Lien de séance invalide.", "L'adresse est incomplète ou a été tronquée en la recopiant.");
+        return;
+      }
       fetch(API_BASE + "/s/" + encodeURIComponent(token) + "?format=json")
-        .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(
+          function (r) {
+            if (r.ok) return r.json();
+            // Statut HTTP reçu = le serveur a répondu. On distingue « inconnu » du reste.
+            return Promise.reject({ status: r.status });
+          },
+          function () {
+            // La promesse `fetch` ne rejette que si la requête n'a pas abouti : hors ligne,
+            // DNS, TLS, CORS. Rien à voir avec le contenu du jeton.
+            return Promise.reject({ status: 0 });
+          }
+        )
         .then(function (data) {
-          if (!data.films || !data.films.length) { message("Séance introuvable."); return; }
+          if (!data.films || !data.films.length) {
+            message("Cette séance est vide.", "Aucun film n'y a été enregistré.");
+            return;
+          }
           render(data, token);
         })
-        .catch(function () { message("Ce lien de séance n'existe pas ou a expiré."); });
+        .catch(function (e) {
+          var status = e && e.status;
+          if (status === 0) {
+            message("Impossible de joindre le serveur.", "Vérifiez votre connexion, puis rechargez la page.");
+          } else if (status === 404) {
+            message(
+              "Cette séance n'est pas encore enregistrée.",
+              "Si elle vient de se terminer, la cabine ne l'a peut-être pas encore transmise. Rechargez la page dans quelques minutes."
+            );
+          } else if (status === 429) {
+            message("Trop de requêtes.", "Patientez une minute, puis rechargez la page.");
+          } else {
+            message("Le serveur n'a pas pu répondre.", "Réessayez dans un instant.");
+          }
+        });
     })();
   </script>
 </body>

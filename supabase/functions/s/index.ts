@@ -76,6 +76,20 @@ function isoDate(ts: string): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
+/**
+ * Repli HTML sans JavaScript.
+ *
+ * ⚠️ **Ce n'est PAS la page que voient les visiteurs.** Le QR encode
+ * `https://my.kioskoscope.com/s/{token}`, servi par Cloudflare Pages
+ * (`share-page/index.html`), qui appelle cette fonction en `?format=json`. On n'arrive ici qu'en
+ * tapant l'URL de la fonction à la main.
+ *
+ * Elle reste **volontairement plus pauvre**, et la raison est dans les en-têtes : la CSP de cette
+ * fonction n'autorise **aucun script** (`default-src 'none'` sans `script-src`). Le bouton de
+ * partage natif (CIN-120 §4) exige du JS : il ne peut donc pas exister ici, et c'est le bon
+ * arbitrage — on ne va pas ouvrir la CSP d'une réponse d'API pour un chemin que personne
+ * n'emprunte. Ne pas « aligner » les deux pages : elles n'ont pas le même rôle.
+ */
 function htmlPage(rows: RecapRow[], token: string): string {
   const date = rows.length ? isoDate(rows[0].started_at) : "";
   const items = rows
@@ -89,6 +103,7 @@ function htmlPage(rows: RecapRow[], token: string): string {
   return `<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0e0f13">
 <title>Votre séance Kioskoscope</title>
 <style>
   :root { color-scheme: dark; }
@@ -149,11 +164,17 @@ function notFound(wantJson: boolean): Response {
       headers: { ...SECURITY_HEADERS, ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8" },
     });
   }
+  // ⚠️ Ne PAS écrire « ou a expiré » : `share_token` n'a aucune expiration, nulle part dans le
+  // schéma. Proposer une cause fictive envoie le lecteur — et le diagnostic — sur une piste qui
+  // n'existe pas. La vraie cause d'un 404 sur un jeton bien formé, c'est une séance pas encore
+  // remontée par la cabine (elle joue hors ligne et synchronise après coup). Voir BUG-014.
   const body = `<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Séance introuvable</title>
-<body style="font:16px system-ui;background:#0e0f13;color:#f2f3f5;display:grid;place-items:center;height:100vh;margin:0">
-<div style="text-align:center"><div style="letter-spacing:.16em;text-transform:uppercase;color:#8a8f9a;font-size:13px">Kioskoscope</div>
-<p>Ce lien de séance n'existe pas ou a expiré.</p></div>`;
+<body style="font:16px/1.5 system-ui;background:#0e0f13;color:#f2f3f5;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px">
+<div style="text-align:center;max-width:34em"><div style="letter-spacing:.16em;text-transform:uppercase;color:#8a8f9a;font-size:13px">Kioskoscope</div>
+<p>Cette séance n'est pas encore enregistrée.</p>
+<p style="color:#6b7079;font-size:14px">Si elle vient de se terminer, la cabine ne l'a peut-être pas encore transmise. Rechargez la page dans quelques minutes.</p></div>`;
   return new Response(body, { status: 404, headers: { ...SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8" } });
 }
 
