@@ -3,6 +3,7 @@ import type { Film, Play, Session } from "../domain/types";
 import type { AccessLogEntry } from "../setup/accessCache";
 import type { AccessEntry, AccessTable, OperatorRole } from "../setup/auth";
 import { auditCatalog, localMediaUrl, type CatalogEntry } from "../domain/catalog";
+import { reconcileDeviceIdentity, type DeviceIdentity, type IdentityDriftField } from "../domain/deviceIdentity";
 import { supabase } from "./supabase";
 
 // Adaptateur backend de la Kiosk : lit le catalogue réel (médias de son org) et
@@ -20,6 +21,24 @@ interface BoothConfig {
   readonly devicePassword: string;
 }
 
+/**
+ * Résultat de `BoothBackend.init()` (CIN-098 / BUG-007).
+ *
+ * Un booléen ne suffisait pas : « pas branché » recouvrait *le réseau est coupé*, *le mot de passe
+ * device est refusé* et *ce compte device n'est rattaché à aucune borne*. Trois pannes, trois
+ * réparations différentes, un seul message — donc une session entière perdue à chercher.
+ * Le motif remonte jusqu'au bandeau : sur une borne sans clavier, un diagnostic non affiché
+ * n'existe pas.
+ */
+export type BoothInitResult =
+  | { readonly ok: true; readonly drift: readonly IdentityDriftField[] }
+  | {
+      readonly ok: false;
+      readonly reason: "not-configured" | "unreachable" | "auth-failed" | "unlinked-device";
+      readonly detail: string;
+    };
+
+
 // DEV UNIQUEMENT : creds depuis le .env local. En PRODUCTION, les identifiants device
 // viennent du RUNTIME (/kiosk-config.json servi par la borne), jamais du bundle — sinon un
 // build public embarquerait le mot de passe device en clair (finding sécu 2026-07-08).
@@ -29,7 +48,10 @@ function readDevConfig(): BoothConfig | null {
   const orgId = import.meta.env.VITE_ORG_ID as string | undefined;
   const deviceEmail = import.meta.env.VITE_DEVICE_EMAIL as string | undefined;
   const devicePassword = import.meta.env.VITE_DEVICE_PASSWORD as string | undefined;
-  if (boothId && orgId && deviceEmail && devicePassword) return { boothId, orgId, deviceEmail, devicePassword };
+  // CIN-098 : `VITE_BOOTH_ID` / `VITE_ORG_ID` ne sont plus REQUIS — l'identité vient du compte
+  // device (résolue par `init()`). Ils ne restent qu'un repli, utile avant l'authentification
+  // (et seulement en dev) ; une valeur dérivée sera écrasée, pas obéie.
+  if (deviceEmail && devicePassword) return { boothId: boothId ?? "", orgId: orgId ?? "", deviceEmail, devicePassword };
   return null;
 }
 
@@ -66,7 +88,7 @@ function rowToFilm(row: Record<string, unknown>, subs: readonly Subtitle[] = [])
 }
 
 export class BoothBackend {
-  private readonly cfg: BoothConfig | null;
+  private cfg: BoothConfig | null;
 
   /** `runtime` = creds fournis par la borne (/kiosk-config.json). Repli .env en DEV seulement. */
   constructor(runtime?: BoothConfig) {
@@ -92,15 +114,70 @@ export class BoothBackend {
     return this.cfg?.devicePassword ?? "";
   }
 
-  /** Authentifie le device. `false` si non configuré ou échec (→ mode mock). */
-  async init(): Promise<boolean> {
-    if (!this.cfg || !supabase) return false;
+  /**
+   * Identité de la borne telle que le SERVEUR la connaît : `current_device_booth()` et
+   * `device_org()` (migration 0009, `security definer`) résolvent la borne à partir de
+   * `auth.uid()`, c'est-à-dire du compte device qui vient de s'authentifier.
+   *
+   * Pourquoi une RPC et pas un `select` sur `booths` : les policies device n'accordent au device
+   * qu'un UPDATE sur sa propre ligne (heartbeat), jamais un SELECT. Un `select` renverrait zéro
+   * ligne — silencieusement, comme toujours avec la RLS.
+   *
+   * `null` = ce compte n'est rattaché à AUCUNE borne. Ce n'est pas une panne réseau : c'est un
+   * provisionnement incomplet (`booths.device_user_id` non renseigné).
+   */
+  private async resolveIdentity(): Promise<DeviceIdentity | null> {
+    if (!supabase) return null;
+    const [booth, org] = await Promise.all([supabase.rpc("current_device_booth"), supabase.rpc("device_org")]);
+    if (booth.error) console.error("[booth] current_device_booth() :", booth.error.message);
+    if (org.error) console.error("[booth] device_org() :", org.error.message);
+    const boothId = typeof booth.data === "string" ? booth.data : "";
+    const orgId = typeof org.data === "string" ? org.data : "";
+    if (!boothId || !orgId) return null;
+    return { boothId, orgId };
+  }
+
+  /**
+   * Authentifie le device, PUIS lui fait dire au serveur qui il est (CIN-098).
+   *
+   * Avant : `boothId`/`orgId` venaient de l'environnement. Une valeur dérivée (borne recréée,
+   * `.env` copié d'une autre machine) produisait une borne qui s'authentifie très bien, lit son
+   * catalogue… et dont chaque INSERT de séance est refusé par la RLS (`booth_id =
+   * current_device_booth()` ne matche pas) — donc des stats figées sans une seule erreur visible
+   * côté exploitant (BUG-008). L'identité n'est plus déclarée par la borne : elle est constatée
+   * par le serveur, qui est le seul à faire autorité dessus.
+   */
+  async init(): Promise<BoothInitResult> {
+    if (!this.cfg || !supabase) return { ok: false, reason: "not-configured", detail: "aucun identifiant device" };
     const { error } = await supabase.auth.signInWithPassword({ email: this.cfg.deviceEmail, password: this.cfg.devicePassword });
     if (error) {
-      console.error("[booth] authentification device échouée :", error.message);
-      return false;
+      // BUG-007 : le motif remonte à l'appelant. « mot de passe refusé » et « Supabase
+      // injoignable » se réparent différemment ; les confondre coûte une session de diagnostic.
+      //
+      // Comment on les sépare : un `status` HTTP signifie que le serveur a RÉPONDU — donc qu'il a
+      // bel et bien refusé ces identifiants. Pas de status (fetch avorté) = personne au bout du
+      // câble. C'est le seul signal fiable ici ; le libellé du message, lui, est traduit et change.
+      const unreachable = !error.status;
+      console.error(`[booth] authentification device échouée (${unreachable ? "backend injoignable" : "identifiants refusés"}) :`, error.message);
+      return { ok: false, reason: unreachable ? "unreachable" : "auth-failed", detail: error.message };
     }
-    return true;
+    const identity = await this.resolveIdentity();
+    if (!identity) {
+      // On refuse de continuer avec les valeurs d'environnement : elles produiraient exactement
+      // la panne muette que ce ticket ferme. Une borne qui ne sait pas qui elle est ne joue pas.
+      console.error("[booth] compte device rattaché à aucune borne (booths.device_user_id) — identité non résolue.");
+      return { ok: false, reason: "unlinked-device", detail: "compte device non rattaché à une borne" };
+    }
+    const { drift } = reconcileDeviceIdentity(this.cfg, identity);
+    // L'identité résolue GAGNE toujours sur la configuration locale — et le reste du backend lit
+    // `this.cfg`, donc la corriger ici corrige d'un coup les 12 appels qui s'en servent.
+    this.cfg = { ...this.cfg, boothId: identity.boothId, orgId: identity.orgId };
+    if (drift.length > 0) {
+      // Jamais les VALEURS (un identifiant de borne n'a rien à faire dans une trace lisible par
+      // qui passe devant l'écran) — seulement les NOMS des champs qui ont dérivé.
+      console.error(`[booth] dérive de configuration corrigée depuis le serveur : ${drift.join(", ")} — le provisionnement est à refaire.`);
+    }
+    return { ok: true, drift };
   }
 
   /** Remonte l'état vivant de la Kiosk : version logicielle + dernier contact (F3). */

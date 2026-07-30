@@ -67,9 +67,12 @@ async function main(): Promise<void> {
    * Fire-and-forget, et volontairement : un visiteur est peut-être devant la borne à cet instant.
    */
   const persistCatalogSnapshot = async (films: readonly Film[]): Promise<void> => {
-    const device = kioskConfig?.device;
-    if (!agent || !device) return;
-    await agent.saveCatalogSnapshot({ orgId: device.orgId, boothId: device.boothId, films });
+    if (!agent || !backend.isConfigured) return;
+    // CIN-098 : on estampille l'instantané avec l'identité RÉSOLUE par le serveur, pas avec celle
+    // du fichier de config. Les deux ne divergent que si le provisionnement a dérivé — et dans ce
+    // cas, au prochain boot hors ligne, le rapprochement échouera (catalogue vide + bandeau) au
+    // lieu de servir le catalogue d'une AUTRE org. Un refus visible vaut mieux qu'une confusion.
+    await agent.saveCatalogSnapshot({ orgId: backend.organizationId, boothId: backend.boothId, films });
   };
   let boothId = FALLBACK_BOOTH_ID;
   let organizationId = FALLBACK_ORG_ID;
@@ -79,7 +82,10 @@ async function main(): Promise<void> {
   // hors ligne — on bufferise en localStorage et on rejoue à la reconnexion. Absent en dev/mock.
   const sessionJournal = backend.isConfigured ? new SessionJournal() : undefined;
 
-  if (backend.isConfigured && (await backend.init())) {
+  // CIN-098 / BUG-007 : `init()` ne répond plus par oui/non mais par un MOTIF, utilisé plus bas
+  // pour que le bandeau dise laquelle des trois pannes s'est produite.
+  const initResult = backend.isConfigured ? await backend.init() : null;
+  if (initResult?.ok) {
     online = true;
     boothId = backend.boothId;
     organizationId = backend.organizationId;
@@ -125,6 +131,27 @@ async function main(): Promise<void> {
       `[booth] branché Supabase · org ${organizationId} · ${playable.length} film(s)` +
         (blocked.size > 0 ? ` (${blocked.size} exclu(s) : droits/plafond)` : ""),
     );
+  } else if (initResult && !initResult.ok && (initResult.reason === "auth-failed" || initResult.reason === "unlinked-device")) {
+    // BORNE RÉELLE QUE LE SERVEUR A REFUSÉE (BUG-007 / CIN-098). Ce n'est PAS le cas hors ligne :
+    // le serveur a répondu, et il a dit non. Deux formes : identifiants device rejetés, ou compte
+    // device rattaché à aucune borne (`booths.device_user_id` vide).
+    //
+    // On ne restaure PAS le catalogue hors ligne ici, contrairement à la coupure réseau. Une
+    // coupure se répare toute seule : les séances bufferisées repartiront. Un refus, non — rien ne
+    // remontera JAMAIS. Servir des films dans cet état, c'est encaisser des séances qui
+    // n'existeront dans aucune comptabilité. Catalogue vide, et on dit pourquoi.
+    setCatalog([]);
+    const refused = initResult.reason === "auth-failed";
+    showBoothStatus({
+      level: "fault",
+      title: refused ? "Borne refusée" : "Borne non rattachée",
+      detail: refused
+        ? "Le serveur a rejeté les identifiants de cette borne. Aucune séance ne peut être proposée tant que le provisionnement n'est pas refait."
+        : "Le compte de cette borne n'est rattaché à aucune borne enregistrée. Rattachez-la dans le back-office (Maintenance), puis redémarrez.",
+      // Noms d'états seulement — jamais un identifiant ni un fragment de secret (F17).
+      code: `device · ${initResult.reason}`,
+    });
+    console.error(`[booth] démarrage refusé par le serveur (${initResult.reason}) — catalogue VIDÉ : ${initResult.detail}`);
   } else if (backend.isConfigured) {
     // BORNE RÉELLE dont le backend n'a pas répondu (réseau coupé, Supabase injoignable).
     //

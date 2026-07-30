@@ -10,6 +10,7 @@ import { SessionManager } from "../src/session/SessionManager";
 import { FACTICE_CATALOG, auditCatalog, localMediaUrl, type CatalogEntry } from "../src/domain/catalog";
 import { normalizeDeviceError, normalizeMediaLibrary } from "../src/setup/kioskAgent";
 import { restoreOfflineCatalog, describeOfflineCatalog } from "../src/domain/offlineCatalog";
+import { reconcileDeviceIdentity } from "../src/domain/deviceIdentity";
 import type { Film, Play } from "../src/domain/types";
 
 let passed = 0;
@@ -490,6 +491,30 @@ function testLocalMedia(): void {
 }
 
 // ── Catalogue de secours hors ligne (CIN-112 lot 2) ────────────────────────────
+// ── CIN-098 : l'identité de la borne se constate, elle ne se déclare pas ────────────────────
+function testDeviceIdentity(): void {
+  const RESOLVED = { boothId: "booth-vrai", orgId: "org-vrai" };
+
+  // Cas nominal : la config locale ne porte plus d'identité (elle n'est plus requise).
+  const nu = reconcileDeviceIdentity({}, RESOLVED);
+  assert(nu.identity.boothId === "booth-vrai" && nu.identity.orgId === "org-vrai", "config vide → l'identité vient du serveur");
+  assert(nu.drift.length === 0, "config vide → aucune dérive signalée (absence ≠ contradiction)");
+
+  // Config saine : elle dit la même chose que le serveur.
+  const sain = reconcileDeviceIdentity({ ...RESOLVED }, RESOLVED);
+  assert(sain.drift.length === 0, "config conforme → aucune dérive");
+
+  // BUG-008 : le `.env` recopié d'une autre borne. C'est CE cas qui figeait les statistiques.
+  const derive = reconcileDeviceIdentity({ boothId: "booth-autre", orgId: "org-vrai" }, RESOLVED);
+  assert(derive.identity.boothId === "booth-vrai", "boothId dérivé → le serveur gagne, la valeur locale est écrasée");
+  assert(derive.drift.length === 1 && derive.drift[0] === "boothId", "boothId dérivé → signalé, et lui seul");
+
+  // Les deux à la fois : borne recréée dans une autre org.
+  const deux = reconcileDeviceIdentity({ boothId: "b-x", orgId: "o-x" }, RESOLVED);
+  assert(deux.drift.length === 2 && deux.drift.includes("orgId"), "boothId + orgId dérivés → les deux sont nommés");
+  assert(deux.identity.orgId === "org-vrai", "orgId dérivé → le serveur gagne aussi sur l'org");
+}
+
 function testOfflineCatalog(): void {
   const H1 = "1".repeat(64);
   const H2 = "2".repeat(64);
@@ -594,9 +619,11 @@ function main(): void {
   testDeviceError();
   console.log("\n=== MÉDIAS LOCAUX : localMediaUrl + normalizeMediaLibrary ===");
   testLocalMedia();
+  console.log("\n=== IDENTITÉ DEVICE : reconcileDeviceIdentity ===");
+  testDeviceIdentity();
   console.log("\n=== CATALOGUE HORS LIGNE : restoreOfflineCatalog ===");
   testOfflineCatalog();
-  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux + hors-ligne)`);
+  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux + identité device + hors-ligne)`);
 }
 
 try {
