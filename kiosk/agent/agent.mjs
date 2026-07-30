@@ -22,6 +22,7 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { readFileSync, appendFileSync } from "node:fs";
 import { scanMediaLibrary } from "../lib/media.mjs";
+import { validateCatalogSnapshot, writeCatalogSnapshot, readCatalogSnapshot } from "../lib/state.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.KIOSK_AGENT_PORT ?? 4599);
@@ -31,6 +32,15 @@ const BACKLIGHT = process.env.KIOSK_BACKLIGHT ?? "/sys/class/backlight/intel_bac
 // Bibliothèque média locale (CIN-112 lot 1) : les fichiers réellement présents sur le disque
 // de la borne. Partagée avec le serveur local, qui les SERT (`GET /media/<hash>`).
 const MEDIA_ROOT = process.env.KIOSK_MEDIA_ROOT ?? "/var/lib/kioskoscope/media";
+// État persistant de la borne (catalogue de secours) — SEUL chemin où l'agent écrit hors journal.
+const STATE_ROOT = process.env.KIOSK_STATE_ROOT ?? "/var/lib/kioskoscope/state";
+// Origines autorisées à parler à l'agent depuis un navigateur (BUG-020). Les deux formes du front
+// local sont listées : `localhost` et `127.0.0.1` sont des origines DISTINCTES pour le navigateur,
+// et selon l'URL de lancement de Chromium c'est l'une ou l'autre qui se présente.
+const WEB_ORIGINS = (process.env.KIOSK_WEB_ORIGINS ?? "http://127.0.0.1:8080,http://localhost:8080")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
 
 /** Jeton partagé (fichier 0600). Absent ⇒ l'agent refuse de démarrer (fail-closed). */
 function loadToken() {
@@ -78,6 +88,17 @@ const clampPct = (v) => Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
 // doit partager exactement la même liste blanche d'extensions (cf. l'en-tête de ce module).
 async function mediaLibrary() {
   return { root: MEDIA_ROOT, media: await scanMediaLibrary(MEDIA_ROOT) };
+}
+
+// ─ Catalogue de secours (CIN-112 lot 2) ────────────────────────────────────────
+// Seule écriture disque que l'agent accepte de la page web. Validation stricte + horodatage
+// posé ICI : cf. le modèle de menace en tête de `kiosk/lib/state.mjs`.
+async function saveCatalog(body) {
+  const res = validateCatalogSnapshot(body, Date.now());
+  if (!res.ok) throw new Error(`instantané refusé : ${res.error}`);
+  const { films } = await writeCatalogSnapshot(STATE_ROOT, res.snapshot);
+  journal("catalog_save", `${films} film(s)`);
+  return { ok: true, films, dropped: res.dropped, savedAt: res.snapshot.savedAt };
 }
 
 // ─ Actions système (chacune = une commande en liste blanche) ────────────────────
@@ -186,6 +207,8 @@ const ROUTES = {
   "GET /system/os-update/status": () => actions.osUpdateStatus(),
   "POST /system/os-update": () => actions.osUpdate(),
   "GET /media/library": () => mediaLibrary(),
+  "GET /state/catalog": async () => ({ snapshot: await readCatalogSnapshot(STATE_ROOT) }),
+  "POST /state/catalog": (b) => saveCatalog(b),
 };
 
 function readBody(req) {
@@ -206,10 +229,44 @@ function readBody(req) {
 }
 
 const server = createServer(async (req, res) => {
+  // ─ CORS (BUG-020) ────────────────────────────────────────────────────────────
+  // L'agent (:4599) et le front (:8080) sont deux ORIGINES différentes. Sans en-tête
+  // `Access-Control-Allow-Origin`, le navigateur refuse à la page de LIRE la réponse : tous les
+  // appels page → agent échouaient sur `Failed to fetch`. Personne ne l'avait vu parce que
+  // l'agent répond parfaitement en `curl` — c'est une règle du NAVIGATEUR, pas du serveur.
+  //
+  // Liste blanche stricte, jamais `*` : seule l'origine du front local est autorisée. Une origine
+  // inconnue est refusée NET (403) plutôt que servie sans en-tête — on ne veut pas qu'une page
+  // quelconque puisse déclencher une action système à l'aveugle, même sans pouvoir en lire la
+  // réponse. Le jeton Bearer reste la défense de fond : il n'est servi qu'en même origine que le
+  // front, donc inaccessible à une autre page.
+  const origin = req.headers.origin;
+  const cors = {};
+  if (origin) {
+    if (!WEB_ORIGINS.includes(origin)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: "origine non autorisée" }));
+    }
+    cors["access-control-allow-origin"] = origin;
+    cors["vary"] = "Origin";
+  }
+
   const send = (code, obj) => {
-    res.writeHead(code, { "content-type": "application/json" });
+    res.writeHead(code, { "content-type": "application/json", ...cors });
     res.end(JSON.stringify(obj));
   };
+
+  // Préflight : le navigateur l'envoie SANS le jeton (par définition) — il doit donc être traité
+  // avant l'authentification, sinon un 401 sur l'OPTIONS bloque la vraie requête qui suit.
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      ...cors,
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "authorization, content-type",
+      "access-control-max-age": "600",
+    });
+    return res.end();
+  }
 
   // Auth : jeton Bearer obligatoire (sauf /health, utile pour le watchdog local).
   const key = `${req.method} ${req.url}`;

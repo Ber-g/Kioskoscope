@@ -38,6 +38,9 @@
   /* Signaux */
   --ko-danger: #e5544b;
   --ko-success: #7bd88f;
+  /* Ambre soutenu, distinct du `--ko-amber-400` d'accent : un état à signaler ne doit pas se
+     confondre avec l'identité de marque, sinon on ne le remarque plus. */
+  --ko-warning: #a86b12;
 
   /* Formes, rythme, mouvement */
   --ko-radius-sm: 12px;
@@ -85,6 +88,9 @@
   /* Signaux */
   --color-danger: var(--ko-danger);
   --color-success: var(--ko-success);
+  /* « Ça marche, mais en mode dégradé » — registre volontairement distinct de `danger`
+     (« rien ne peut être proposé »). Les confondre, c'est apprendre à ignorer les deux. */
+  --color-warning: var(--ko-warning);
 
   /* Focus (F14) : accent froid = lueur d'écran, fort contraste sur fond sombre. */
   --focus-ring: var(--color-accent-2);

@@ -19,7 +19,7 @@
 // ⚠️ Rien de ce qui transite ici ne doit contenir de secret. Les appelants ne passent que des
 // NOMS de champs (`orgId`, `devicePassword`), jamais de valeur.
 
-export type BoothStatusLevel = "fault" | "demo";
+export type BoothStatusLevel = "fault" | "demo" | "offline";
 
 export interface BoothStatusMessage {
   readonly level: BoothStatusLevel;

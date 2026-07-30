@@ -9,6 +9,7 @@ import type { RecoContext } from "../src/reco/Recommender";
 import { SessionManager } from "../src/session/SessionManager";
 import { FACTICE_CATALOG, auditCatalog, localMediaUrl, type CatalogEntry } from "../src/domain/catalog";
 import { normalizeDeviceError, normalizeMediaLibrary } from "../src/setup/kioskAgent";
+import { restoreOfflineCatalog, describeOfflineCatalog } from "../src/domain/offlineCatalog";
 import type { Film, Play } from "../src/domain/types";
 
 let passed = 0;
@@ -488,6 +489,100 @@ function testLocalMedia(): void {
   }
 }
 
+// ── Catalogue de secours hors ligne (CIN-112 lot 2) ────────────────────────────
+function testOfflineCatalog(): void {
+  const H1 = "1".repeat(64);
+  const H2 = "2".repeat(64);
+  const ORG = "org-a";
+  const DAY = 86_400_000;
+  const NOW = Date.parse("2026-07-30T12:00:00.000Z");
+  const snap = (over: Record<string, unknown> = {}) => ({
+    version: 1,
+    orgId: ORG,
+    savedAt: new Date(NOW - DAY).toISOString(),
+    films: [makeFilm({ contentHash: H1, title: "Le Perchoir" })],
+    ...over,
+  });
+  const run = (over: Record<string, unknown> = {}, local = [H1], orgId = ORG, now = NOW) =>
+    restoreOfflineCatalog({ snapshot: snap(over), localMedia: new Set(local), orgId, now });
+
+  console.log("O1. Le cas nominal : catalogue restauré, URL RECALCULÉE depuis le disque");
+  {
+    const r = run();
+    assert(r.reason === "restored" && r.films.length === 1, "instantané récent + média présent → restauré");
+    assert(r.films[0].storageUrl === `/media/${H1}`, "URL locale recalculée (jamais l'URL signée conservée, qui serait expirée)");
+  }
+
+  console.log("O2. L'intersection avec le disque est la règle : pas de fichier, pas de film");
+  {
+    const r = run({}, []); // instantané valide, disque vide
+    assert(r.reason === "no-local-media" && r.films.length === 0, "aucun média sur disque → catalogue VIDE");
+    assert(r.missingLocally === 1, "le film manquant est COMPTÉ (c'est la mesure de l'écart à combler)");
+    const partial = restoreOfflineCatalog({
+      snapshot: snap({ films: [makeFilm({ contentHash: H1 }), makeFilm({ contentHash: H2 })] }),
+      localMedia: new Set([H1]),
+      orgId: ORG,
+      now: NOW,
+    });
+    assert(partial.films.length === 1 && partial.missingLocally === 1, "restauration PARTIELLE : on garde ce qui est projetable");
+  }
+
+  console.log("O3. Le temps périme le catalogue — dans le doute, on ne joue pas");
+  {
+    assert(run({ savedAt: new Date(NOW - 6 * DAY).toISOString() }).reason === "restored", "6 jours < fenêtre → encore digne de confiance");
+    const old = run({ savedAt: new Date(NOW - 8 * DAY).toISOString() });
+    assert(old.reason === "too-old" && old.films.length === 0, "8 jours > fenêtre → VIDE (une licence a pu expirer entre-temps)");
+    assert(old.ageMs !== null && old.ageMs > 7 * DAY, "l'âge est remonté pour le diagnostic sur place");
+  }
+
+  console.log("O4. Horloge qui recule : on refuse d'en juger les droits");
+  {
+    // Pile RTC morte, ou quelqu'un qui recule l'horloge pour rouvrir une fenêtre fermée.
+    const back = run({}, [H1], ORG, NOW - 3 * DAY);
+    assert(back.reason === "clock-behind" && back.films.length === 0, "horloge nettement AVANT l'instantané → VIDE");
+    // Petite dérive : tolérée, sinon toute borne sans NTP finirait muette.
+    const drift = run({}, [H1], ORG, NOW - DAY - 5 * 60_000);
+    assert(drift.reason === "restored", "5 minutes de dérive → toléré, la borne continue de servir");
+  }
+
+  console.log("O5. Un instantané d'une AUTRE org n'est jamais servi (borne réaffectée)");
+  {
+    const r = run({}, [H1], "org-b");
+    assert(r.reason === "other-org" && r.films.length === 0, "orgId différent → ignoré en bloc");
+    assert(run({ orgId: undefined }).reason === "other-org", "orgId absent → ignoré (jamais 'on suppose que c'est le nôtre')");
+  }
+
+  console.log("O6. Tout instantané douteux vaut une absence d'instantané — jamais un crash");
+  {
+    const bad = (snapshot: unknown) => restoreOfflineCatalog({ snapshot, localMedia: new Set([H1]), orgId: ORG, now: NOW });
+    assert(bad(null).reason === "no-snapshot", "null → aucun catalogue");
+    assert(bad("bonjour").reason === "no-snapshot", "chaîne → aucun catalogue");
+    assert(bad({ version: 2, orgId: ORG, savedAt: new Date().toISOString(), films: [] }).reason === "no-snapshot", "version inconnue → aucun catalogue");
+    assert(bad({ version: 1, orgId: ORG, savedAt: "pas une date", films: [] }).reason === "no-snapshot", "date illisible → aucun catalogue");
+    assert(bad({ version: 1, orgId: ORG, savedAt: new Date(NOW).toISOString(), films: "beaucoup" }).reason === "no-snapshot", "films non-tableau → aucun catalogue");
+    assert(run({ films: [] }).reason === "empty-snapshot", "instantané vide → vide, et on sait le dire");
+    // Entrées pourries au milieu d'entrées saines : on garde les saines, on ne tombe pas.
+    const mixed = restoreOfflineCatalog({
+      snapshot: snap({ films: [null, 7, { contentHash: "../../etc/passwd" }, makeFilm({ contentHash: H1 })] }),
+      localMedia: new Set([H1, "../../etc/passwd"]),
+      orgId: ORG,
+      now: NOW,
+    });
+    assert(mixed.films.length === 1, "entrées invalides ignorées, la bonne entrée survit");
+    assert(mixed.films[0].storageUrl === `/media/${H1}`, "et l'empreinte hors forme n'a produit aucune URL");
+  }
+
+  console.log("O7. Chaque refus se DIT — une borne muette sans explication est une borne en panne");
+  {
+    const reasons = ["no-snapshot", "other-org", "too-old", "clock-behind", "empty-snapshot", "no-local-media"] as const;
+    for (const reason of reasons) {
+      const msg = describeOfflineCatalog({ films: [], reason, ageMs: 9 * DAY, missingLocally: 2 });
+      assert(msg.length > 20 && !msg.includes("undefined"), `diagnostic écrit pour « ${reason} »`);
+    }
+    assert(describeOfflineCatalog(run()).includes("1 film"), "le cas nominal annonce le nombre de films");
+  }
+}
+
 function main(): void {
   console.log("=== RECO : RuleBasedRecommender ===");
   testReco();
@@ -499,7 +594,9 @@ function main(): void {
   testDeviceError();
   console.log("\n=== MÉDIAS LOCAUX : localMediaUrl + normalizeMediaLibrary ===");
   testLocalMedia();
-  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux)`);
+  console.log("\n=== CATALOGUE HORS LIGNE : restoreOfflineCatalog ===");
+  testOfflineCatalog();
+  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux + hors-ligne)`);
 }
 
 try {

@@ -1110,6 +1110,14 @@ h2 {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
 }
 
+/* Hors ligne mais FONCTIONNELLE (CIN-112 lot 2) : la borne joue son catalogue enregistré.
+   Registre volontairement différent du défaut rouge — rien n'est cassé, le parcours du
+   visiteur est normal ; c'est l'exploitant qu'on informe qu'il y a un réseau à rétablir. */
+.booth-status--offline {
+  background: var(--color-warning);
+  color: #ffffff;
+}
+
 /* Bac à sable de développement : discret mais permanent. Sert à ce qu'une capture
    d'écran ou une démo ne puisse JAMAIS être prise pour une borne réelle. */
 .booth-status--demo {

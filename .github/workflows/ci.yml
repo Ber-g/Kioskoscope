@@ -56,7 +56,7 @@ jobs:
 
       # Chaîne média locale de la borne (CIN-112) : streaming HTTP Range + refus d'accès disque.
       # Tourne partout (fichiers temporaires, serveur sur 127.0.0.1) — aucun secret, aucune borne.
-      - name: Test kiosk (media_smoke — Range + inventaire local)
+      - name: Test kiosk (media_smoke + state_smoke — Range, inventaire, catalogue de secours)
         run: npm run test:kiosk
 
       # Les scripts de test Supabase ne tournent pas ici (secrets requis) : on vérifie AU MOINS

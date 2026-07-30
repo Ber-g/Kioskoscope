@@ -38,6 +38,11 @@ echo "→ Bibliothèque média locale (CIN-112) — lue par l'agent, servie par 
 # pouvoir déposer un fichier qui sera ensuite servi à Chromium en même origine.
 install -d -m 0755 -o root -g root /var/lib/kioskoscope/media
 
+echo "→ État persistant de la borne (catalogue de secours, CIN-112 lot 2)"
+# 0700 kiosk:kiosk : SEUL chemin disque où l'agent écrit (hors journal). Séparé du dossier
+# média (root:root) — l'agent ne doit jamais pouvoir toucher aux fichiers qu'il inventorie.
+install -d -m 0700 -o "$KIOSK_USER" -g "$KIOSK_USER" /var/lib/kioskoscope/state
+
 echo "→ Helper luminosité"
 install -m 0755 "$REPO/kiosk/provisioning/kiosk-brightness" /usr/local/sbin/kiosk-brightness
 

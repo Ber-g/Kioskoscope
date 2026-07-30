@@ -153,6 +153,37 @@ export class KioskAgentClient {
       return new Set();
     }
   }
+
+  /**
+   * Instantané du dernier catalogue valide, relu sur le disque (CIN-112 lot 2).
+   * `null` = jamais écrit, illisible, ou agent d'une version antérieure — tous équivalents pour
+   * l'appelant : il n'y a pas de catalogue de secours, la borne sera vide et honnête.
+   */
+  async loadCatalogSnapshot(): Promise<unknown | null> {
+    try {
+      const res = await this.call<{ snapshot?: unknown }>("GET", "/state/catalog");
+      return res.snapshot ?? null;
+    } catch (e) {
+      console.warn("[kiosk] catalogue de secours illisible :", e instanceof Error ? e.message : e);
+      return null;
+    }
+  }
+
+  /**
+   * Persiste le catalogue courant pour le prochain démarrage hors ligne. Fire-and-forget : un
+   * échec ne doit JAMAIS gêner un visiteur présent — au pire le prochain boot hors ligne est vide.
+   * ⚠️ L'agent repose SON horodatage : celui qu'on enverrait d'ici ne serait pas retenu (une page
+   * compromise se donnerait sinon une fenêtre hors-ligne illimitée).
+   */
+  async saveCatalogSnapshot(payload: { orgId: string; boothId: string; films: readonly unknown[] }): Promise<boolean> {
+    try {
+      await this.call("POST", "/state/catalog", { version: 1, ...payload });
+      return true;
+    } catch (e) {
+      console.warn("[kiosk] catalogue de secours non enregistré :", e instanceof Error ? e.message : e);
+      return false;
+    }
+  }
 }
 
 /**

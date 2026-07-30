@@ -8,7 +8,8 @@ import { MockUnlockAdapter } from "./unlock/MockUnlockAdapter";
 import { BoothBackend } from "./data/backend";
 import { SessionJournal } from "./data/sessionJournal";
 import { setCatalog } from "./domain/catalog";
-import type { Play, Session } from "./domain/types";
+import { restoreOfflineCatalog, describeOfflineCatalog } from "./domain/offlineCatalog";
+import type { Film, Play, Session } from "./domain/types";
 import { App } from "./ui/app";
 import { showBoothStatus } from "./ui/boothStatus";
 import { WifiManager, type WifiAdapter } from "./setup/wifi";
@@ -61,6 +62,15 @@ async function main(): Promise<void> {
    */
   const readLocalMedia = async (): Promise<ReadonlySet<string>> => (agent ? agent.localMediaHashes() : new Set<string>());
   const backend = new BoothBackend(kioskConfig?.device);
+  /**
+   * Enregistre le catalogue jouable pour le prochain boot hors ligne (CIN-112 lot 2).
+   * Fire-and-forget, et volontairement : un visiteur est peut-être devant la borne à cet instant.
+   */
+  const persistCatalogSnapshot = async (films: readonly Film[]): Promise<void> => {
+    const device = kioskConfig?.device;
+    if (!agent || !device) return;
+    await agent.saveCatalogSnapshot({ orgId: device.orgId, boothId: device.boothId, films });
+  };
   let boothId = FALLBACK_BOOTH_ID;
   let organizationId = FALLBACK_ORG_ID;
   let online = false;
@@ -82,6 +92,10 @@ async function main(): Promise<void> {
     // de démo pour une vraie org sans média (sinon on montrerait du faux contenu / on ferait payer
     // pour rien). L'écran d'attente affiche un état « aucune séance » si vide (cf. app.ts goIdle).
     setCatalog(playable);
+    // CIN-112 lot 2 : on enregistre CE catalogue — déjà filtré par les droits (CIN-010) — pour le
+    // prochain démarrage sans réseau. Sur le disque via l'agent, pas en `localStorage` : un vidage
+    // de cache Chromium emporterait l'état, et la borne redeviendrait muette sans raison visible.
+    void persistCatalogSnapshot(playable);
     // F19 : style de l'org (Mes styles). La palette/les fontes → tokens CSS (applyOrgStyle) ;
     // le titre + les assets → contenu de marque (setBrand, lu par l'écran d'attente). Absent =
     // maître (déjà appliqué au boot).
@@ -124,10 +138,43 @@ async function main(): Promise<void> {
     // Un catalogue VIDE est un état honnête ; un catalogue FAUX ne l'est jamais. Même règle que
     // pour une org réelle sans média (cf. commentaire `setCatalog(playable)` ci-dessus).
     //
-    // ⚠️ Ceci ne REND PAS la borne autonome hors ligne — elle reste incapable de lire un film
-    // sans réseau (F22 / CIN-112). Ça supprime seulement le scénario trompeur en attendant.
-    setCatalog([]);
-    console.warn("[booth] backend injoignable : catalogue VIDÉ (aucune séance proposée). Les films de démonstration ne sont jamais servis sur une borne configurée.");
+    // CIN-112 lot 2 — MAIS on ne part plus forcément de rien : si la borne a déjà été en ligne,
+    // l'agent détient le dernier catalogue valide sur le disque. On le restaure, INTERSECTÉ avec
+    // les médias réellement présents (lot 1). La règle reste celle de BUG-011 : ce qui est proposé
+    // doit être projetable — un film restauré dont le fichier n'est pas là ne réapparaît jamais.
+    //
+    // Prudence assumée sur les droits (cf. `offlineCatalog.ts`) : hors ligne, la borne ne peut
+    // réévaluer ni les licences ni les plafonds. Passé la fenêtre de confiance — ou si l'horloge
+    // a reculé — le catalogue redevient VIDE. Dans le doute, on ne joue pas.
+    const restored = restoreOfflineCatalog({
+      snapshot: agent ? await agent.loadCatalogSnapshot() : null,
+      localMedia: await readLocalMedia(),
+      orgId: backend.organizationId,
+      now: Date.now(),
+    });
+    setCatalog(restored.films);
+    const diagnostic = describeOfflineCatalog(restored);
+    if (restored.reason === "restored") {
+      // Ça marche : le bandeau parle à l'exploitant (« répare le réseau quand tu peux »), pas au
+      // visiteur — dont le parcours est, lui, parfaitement normal.
+      showBoothStatus({
+        level: "offline",
+        title: "Hors ligne",
+        detail: "La borne fonctionne avec son catalogue enregistré. Les séances seront remontées à la reconnexion.",
+        code: `films: ${restored.films.length}${restored.missingLocally > 0 ? ` · absents du disque: ${restored.missingLocally}` : ""}`,
+      });
+      console.warn(`[booth] backend injoignable — ${diagnostic}`);
+    } else {
+      // Rien à proposer : l'écran d'attente dit « aucune séance » au public, et le bandeau dit
+      // POURQUOI à qui est sur place. Sans ça, une borne muette est indiscernable d'une borne en panne.
+      showBoothStatus({
+        level: "fault",
+        title: "Hors ligne — aucune séance",
+        detail: diagnostic.charAt(0).toUpperCase() + diagnostic.slice(1) + ".",
+        code: `offline · ${restored.reason}`,
+      });
+      console.warn(`[booth] backend injoignable — catalogue VIDE : ${diagnostic}`);
+    }
   } else if (kioskConfig) {
     // ⚠️ TROISIÈME PORTE (BUG-017) — AGENT LOCAL PRÉSENT + AUCUN IDENTIFIANT DEVICE.
     //

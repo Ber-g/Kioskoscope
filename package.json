@@ -4,7 +4,7 @@
   "private": true,
   "description": "Kioskoscope — monorepo : Kiosks, back-office, backend, domaine partagé.",
   "scripts": {
-    "test:kiosk": "node kiosk/tests/media_smoke.mjs"
+    "test:kiosk": "node kiosk/tests/media_smoke.mjs && node kiosk/tests/state_smoke.mjs"
   },
   "workspaces": [
     "packages/*",

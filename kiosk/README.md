@@ -53,8 +53,28 @@ n'interrompt plus le film.
   écran d'attente tuerait la borne). La vérification sha256 se fera **une fois, à l'ingestion**,
   quand l'approvisionnement automatique existera (lot 3 du ticket).
 
-⚠️ **La borne ne démarre toujours pas hors ligne** : sans réseau au boot, il n'y a aucun catalogue
-à rapprocher du disque, donc aucune séance proposée. C'est le lot suivant.
+### Démarrer sans réseau — le catalogue de secours (CIN-112 lot 2)
+
+À chaque catalogue chargé en ligne, le booth-client le fait **enregistrer par l'agent** dans
+`/var/lib/kioskoscope/state/catalog.json` (`0700 kiosk:kiosk`, écriture atomique). Au démarrage
+sans réseau, la borne relit cet instantané et le **croise avec les médias présents sur le disque** :
+ce qui reste est jouable, le reste n'est pas proposé.
+
+Deux gardes, parce que hors ligne la borne **ne peut pas réévaluer les droits** :
+- **7 jours** de fenêtre de confiance (au-delà : catalogue vide) ;
+- **horloge qui recule** de plus d'1 h : catalogue vide.
+
+Règle assumée : **dans le doute, on ne joue pas.** Une séance de moins est un manque à gagner ; une
+séance jouée hors droits est une redevance impayée. Un bandeau « Hors ligne » l'annonce à
+l'exploitant ; quand rien n'est restaurable, le bandeau dit POURQUOI (instantané absent, trop
+ancien, horloge, autre org, aucun média sur le disque).
+
+⚠️ **Résiduel connu** : un plafond de séances peut être franchi hors ligne — la borne ignore son
+allocation restante. Exposition bornée par les 7 jours, compte serveur recalé au rejeu des séances.
+
+⚠️ **L'agent n'est joignable depuis la page que via une liste blanche d'origines** (`KIOSK_WEB_ORIGINS`,
+défaut `http://127.0.0.1:8080,http://localhost:8080`). Si le front est servi sur un autre port ou un
+autre nom d'hôte, **il faut l'y ajouter**, sinon tous les appels agent échouent (cf. BUG-020).
 
 ## Modèle de sécurité (@qa — non négociable)
 

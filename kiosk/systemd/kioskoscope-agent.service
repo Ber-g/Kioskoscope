@@ -13,10 +13,15 @@ RestartSec=3
 # Durcissement : l'agent ne peut pas écrire hors de ses chemins prévus.
 NoNewPrivileges=false
 ProtectSystem=strict
+# Écritures autorisées, et RIEN d'autre : le journal, et l'état persistant (catalogue de
+# secours, CIN-112 lot 2). Le `-` tolère un dossier absent (borne pas encore approvisionnée)
+# plutôt que d'empêcher l'agent de démarrer — sans agent, plus de menu opérateur pour réparer.
 ReadWritePaths=/var/log
+ReadWritePaths=-/var/lib/kioskoscope/state
 Environment=KIOSK_AGENT_TOKEN_FILE=/etc/kioskoscope/agent.token
 # Bibliothèque média locale (CIN-112) : lue seulement — ProtectSystem=strict interdit d'y écrire.
 Environment=KIOSK_MEDIA_ROOT=/var/lib/kioskoscope/media
+Environment=KIOSK_STATE_ROOT=/var/lib/kioskoscope/state
 
 [Install]
 WantedBy=multi-user.target
