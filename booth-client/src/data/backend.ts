@@ -2,7 +2,7 @@ import type { OrgStyle, Subtitle } from "@kioskoscope/domain";
 import type { Film, Play, Session } from "../domain/types";
 import type { AccessLogEntry } from "../setup/accessCache";
 import type { AccessEntry, AccessTable, OperatorRole } from "../setup/auth";
-import { auditCatalog, type CatalogEntry } from "../domain/catalog";
+import { auditCatalog, localMediaUrl, type CatalogEntry } from "../domain/catalog";
 import { supabase } from "./supabase";
 
 // Adaptateur backend de la Kiosk : lit le catalogue réel (médias de son org) et
@@ -195,8 +195,13 @@ export class BoothBackend {
    * `storageUrl: null` et l'écran lecteur basculait en lecture simulée : une séance payée pour une
    * barre de progression. Le catalogue peut donc revenir VIDE — c'est l'état honnête attendu
    * (écran « aucune séance disponible »), pas une panne à masquer.
+   *
+   * `localMedia` = empreintes présentes sur le DISQUE de la borne (CIN-112 lot 1, inventaire de
+   * l'agent). Un média qui y figure est servi depuis `/media/<hash>` : sa lecture ne dépend alors
+   * plus du réseau, et débrancher le câble en pleine séance ne l'interrompt plus. Ensemble vide
+   * (dev, borne sans média local) = comportement d'avant, tout en URLs signées.
    */
-  async loadCatalog(): Promise<Film[]> {
+  async loadCatalog(localMedia: ReadonlySet<string> = new Set()): Promise<Film[]> {
     if (!supabase) return [];
     const { data, error } = await supabase.from("media").select("*").eq("active", true);
     if (error) {
@@ -217,8 +222,12 @@ export class BoothBackend {
     const subRowsArr = (subRows ?? []) as Array<Record<string, unknown>>;
 
     // Chemins storage à signer EN LOT (vidéos + sous-titres, même bucket `media`).
+    // ⚠️ CIN-112 — un média présent sur le disque de la borne ne demande JAMAIS d'URL signée :
+    // c'est ce qui rend sa lecture indépendante du réseau (et d'un TTL de 12 h qui, lui, expire).
     const paths = new Set<string>();
-    for (const r of mediaRows) if (r.storage_url) paths.add(String(r.storage_url));
+    for (const r of mediaRows) {
+      if (r.storage_url && !localMedia.has(String(r.content_hash ?? ""))) paths.add(String(r.storage_url));
+    }
     for (const r of subRowsArr) if (r.url) paths.add(String(r.url));
     const signed = await this.signMediaPaths([...paths]);
 
@@ -233,14 +242,24 @@ export class BoothBackend {
       subsByMedia.set(mid, list);
     }
 
+    let fromDisk = 0;
     const entries: CatalogEntry[] = mediaRows.map((row) => {
       const film = rowToFilm(row, subsByMedia.get(String(row.id)) ?? []);
-      const declaredPath = film.storageUrl && film.storageUrl.trim() !== "" ? film.storageUrl : null;
+      // Ordre de préférence : le disque d'abord. Un fichier local est un fichier DÉCLARÉ au même
+      // titre qu'un chemin storage — c'est même la déclaration la plus forte des deux, puisqu'elle
+      // est constatée et non promise. Il compte donc comme `declaredPath` pour l'audit.
+      const localUrl = localMediaUrl(film.contentHash, localMedia);
+      if (localUrl) fromDisk += 1;
+      const declaredPath = localUrl ?? (film.storageUrl && film.storageUrl.trim() !== "" ? film.storageUrl : null);
       // Chemin storage privé → URL signée. Non signable → null, et le média sera écarté ci-dessous.
-      return { film: { ...film, storageUrl: declaredPath ? (signed.get(declaredPath) ?? null) : null }, declaredPath };
+      const storageUrl = localUrl ?? (declaredPath ? (signed.get(declaredPath) ?? null) : null);
+      return { film: { ...film, storageUrl }, declaredPath };
     });
 
     const { playable, withoutFile, unresolved } = auditCatalog(entries);
+    if (fromDisk > 0) {
+      console.info(`[booth] ${fromDisk} média(s) lu(s) depuis le disque local (aucune URL signée, aucun réseau requis).`);
+    }
     // Deux journaux DIFFÉRENTS parce que ce sont deux problèmes différents (cf. auditCatalog) :
     // une fiche sans fichier est un catalogue à finir de remplir ; une URL non résolue est une
     // panne (bucket, policy, objet supprimé) sur un média censé être jouable.

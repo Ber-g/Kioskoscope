@@ -54,6 +54,11 @@ jobs:
       - name: Test admin-dashboard (logic_smoke — store/KPI)
         run: npm run -w admin-dashboard test
 
+      # Chaîne média locale de la borne (CIN-112) : streaming HTTP Range + refus d'accès disque.
+      # Tourne partout (fichiers temporaires, serveur sur 127.0.0.1) — aucun secret, aucune borne.
+      - name: Test kiosk (media_smoke — Range + inventaire local)
+        run: npm run test:kiosk
+
       # Les scripts de test Supabase ne tournent pas ici (secrets requis) : on vérifie AU MOINS
       # qu'ils restent syntaxiquement valides (pas de rot au fil des migrations).
       - name: Syntax-check des scripts de test Supabase

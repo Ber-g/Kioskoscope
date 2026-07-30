@@ -32,6 +32,12 @@ fi
 chmod 0600 /etc/kioskoscope/device.json
 chown "$KIOSK_USER":"$KIOSK_USER" /etc/kioskoscope/device.json
 
+echo "→ Bibliothèque média locale (CIN-112) — lue par l'agent, servie par le serveur local"
+# 0755 : les deux services (utilisateur kiosk) doivent LIRE ; seul root ÉCRIT. Un média y est
+# déposé par l'approvisionnement, jamais par la web-app — une page compromise ne doit pas
+# pouvoir déposer un fichier qui sera ensuite servi à Chromium en même origine.
+install -d -m 0755 -o root -g root /var/lib/kioskoscope/media
+
 echo "→ Helper luminosité"
 install -m 0755 "$REPO/kiosk/provisioning/kiosk-brightness" /usr/local/sbin/kiosk-brightness
 

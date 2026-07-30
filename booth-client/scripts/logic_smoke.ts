@@ -7,8 +7,8 @@
 import { RuleBasedRecommender } from "../src/reco/RuleBasedRecommender";
 import type { RecoContext } from "../src/reco/Recommender";
 import { SessionManager } from "../src/session/SessionManager";
-import { FACTICE_CATALOG, auditCatalog, type CatalogEntry } from "../src/domain/catalog";
-import { normalizeDeviceError } from "../src/setup/kioskAgent";
+import { FACTICE_CATALOG, auditCatalog, localMediaUrl, type CatalogEntry } from "../src/domain/catalog";
+import { normalizeDeviceError, normalizeMediaLibrary } from "../src/setup/kioskAgent";
 import type { Film, Play } from "../src/domain/types";
 
 let passed = 0;
@@ -441,6 +441,53 @@ function testDeviceError(): void {
   }
 }
 
+// ── Médias locaux : la borne préfère son disque au réseau (CIN-112 lot 1) ───────
+function testLocalMedia(): void {
+  const H = "a".repeat(64); // 64 hexadécimaux minuscules = la seule forme acceptée
+  const lib = (media: unknown): ReadonlySet<string> => normalizeMediaLibrary({ media });
+
+  console.log("L1. Une empreinte présente sur le disque donne une URL locale, même origine");
+  {
+    assert(localMediaUrl(H, new Set([H])) === `/media/${H}`, "média sur disque → /media/<hash>");
+    assert(localMediaUrl(H, new Set()) === null, "média absent du disque → null (il faudra le réseau)");
+  }
+
+  console.log("L2. Une empreinte mal formée ne produit JAMAIS d'URL (elle finit dans un chemin)");
+  {
+    // Le pire cas n'est pas l'empreinte absurde, c'est celle qui essaie de sortir du dossier.
+    const evil = "../../etc/passwd";
+    assert(localMediaUrl(evil, new Set([evil])) === null, "traversée de chemin refusée même si 'présente'");
+    assert(localMediaUrl(H.toUpperCase(), new Set([H.toUpperCase()])) === null, "hexadécimal majuscule refusé");
+    assert(localMediaUrl(H.slice(1), new Set([H.slice(1)])) === null, "63 caractères refusés (longueur exacte)");
+    assert(localMediaUrl("", new Set([""])) === null, "empreinte vide refusée");
+  }
+
+  console.log("L3. L'inventaire de l'agent est filtré, jamais recopié tel quel");
+  {
+    assert(lib([{ hash: H, bytes: 42 }]).has(H), "entrée valide retenue");
+    assert(lib([{ hash: H, bytes: 0 }]).size === 0, "fichier de 0 octet écarté (téléchargement interrompu)");
+    assert(lib([{ hash: H }]).has(H), "taille absente (agent plus ancien) → on ne rejette pas");
+    assert(lib([{ hash: "../x" }]).size === 0, "empreinte hors forme écartée à l'entrée aussi");
+    assert(lib([null, "x", 7, { hash: H }]).size === 1, "entrées non-objets ignorées sans faire tomber le reste");
+  }
+
+  console.log("L4. Un agent muet ou cassé donne une bibliothèque VIDE, pas une exception");
+  {
+    assert(normalizeMediaLibrary(null).size === 0, "réponse nulle → vide");
+    assert(normalizeMediaLibrary({}).size === 0, "réponse sans champ media → vide");
+    assert(normalizeMediaLibrary({ media: "beaucoup" }).size === 0, "media non-tableau → vide");
+  }
+
+  console.log("L5. Un média local est JOUABLE même sans URL signée (le cas hors ligne)");
+  {
+    // Reproduit ce que fait loadCatalog : le fichier local sert de chemin déclaré ET d'URL résolue.
+    const local = localMediaUrl(H, new Set([H]));
+    const a = auditCatalog([{ film: makeFilm({ storageUrl: local }), declaredPath: local }]);
+    assert(a.playable.length === 1, "média sur disque → jouable sans avoir signé quoi que ce soit");
+    assert(a.unresolved.length === 0, "et ce n'est surtout pas un incident de signature");
+  }
+}
+
 function main(): void {
   console.log("=== RECO : RuleBasedRecommender ===");
   testReco();
@@ -450,7 +497,9 @@ function main(): void {
   testPlayableCatalog();
   console.log("\n=== PROVISIONNEMENT : normalizeDeviceError ===");
   testDeviceError();
-  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement)`);
+  console.log("\n=== MÉDIAS LOCAUX : localMediaUrl + normalizeMediaLibrary ===");
+  testLocalMedia();
+  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux)`);
 }
 
 try {

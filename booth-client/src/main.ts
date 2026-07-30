@@ -51,6 +51,15 @@ async function main(): Promise<void> {
   // Verrouillage kiosque (CIN-072) : dès qu'on tourne sur une borne réelle (agent présent),
   // on neutralise menu contextuel / sélection / raccourcis d'évasion. Jamais en dev navigateur.
   if (kioskConfig) enableKioskLockdown();
+  // Agent local : créé ICI (et non plus au moment du menu opérateur) parce que le catalogue en a
+  // besoin dès le boot — c'est lui qui sait ce qu'il y a sur le disque. Une seule instance, réutilisée.
+  const agent = kioskConfig ? new KioskAgentClient(kioskConfig) : null;
+  /**
+   * Médias présents sur le DISQUE de la borne (CIN-112 lot 1). Relu à chaque rafraîchissement :
+   * un média approvisionné pendant la journée devient jouable sans redémarrer la borne.
+   * Hors borne (dev navigateur) : ensemble vide → tout passe par les URLs signées, comme avant.
+   */
+  const readLocalMedia = async (): Promise<ReadonlySet<string>> => (agent ? agent.localMediaHashes() : new Set<string>());
   const backend = new BoothBackend(kioskConfig?.device);
   let boothId = FALLBACK_BOOTH_ID;
   let organizationId = FALLBACK_ORG_ID;
@@ -66,7 +75,7 @@ async function main(): Promise<void> {
     organizationId = backend.organizationId;
     await backend.reportHeartbeat(BOOTH_VERSION); // remonte version + dernier contact
     await backend.applyPendingUpdates(BOOTH_VERSION); // updater : applique les déploiements dus
-    const films = await backend.loadCatalog();
+    const films = await backend.loadCatalog(await readLocalMedia());
     const blocked = await backend.loadBlockedMedia(); // droits F15 : exclure expiré / au plafond
     const playable = films.filter((f) => !blocked.has(f.id));
     // En ligne, le catalogue = la RÉALITÉ de l'org, même VIDE. On ne retombe JAMAIS sur les films
@@ -212,7 +221,7 @@ async function main(): Promise<void> {
     lastRefresh = Date.now();
     void (async () => {
       try {
-        const films = await backend.loadCatalog();
+        const films = await backend.loadCatalog(await readLocalMedia());
         const blk = await backend.loadBlockedMedia();
         setCatalog(films.filter((f) => !blk.has(f.id)));
         const style = await backend.loadOrgStyle();
@@ -298,8 +307,7 @@ async function main(): Promise<void> {
   // HORS bundle, déjà chargé plus haut), Wi-Fi/réglages sont RÉELS ; sinon (dev) stubs.
   let wifi: WifiAdapter;
   let settings: OperatorSettingsHooks;
-  if (kioskConfig) {
-    const agent = new KioskAgentClient(kioskConfig);
+  if (agent) {
     wifi = new AgentWifiAdapter(agent);
     settings = createAgentSettings(agent);
     console.info("[booth] agent local détecté · Wi-Fi/réglages pilotés par la borne");

@@ -11,6 +11,8 @@ Restart=always
 RestartSec=3
 Environment=KIOSK_WEB_ROOT=/opt/kioskoscope/booth-client/dist
 Environment=KIOSK_AGENT_TOKEN_FILE=/etc/kioskoscope/agent.token
+# Bibliothèque média locale (CIN-112) : lue seulement — ProtectSystem=strict interdit d'y écrire.
+Environment=KIOSK_MEDIA_ROOT=/var/lib/kioskoscope/media
 # Durcissement : lecture seule sauf rien (sert des fichiers, lit le jeton).
 ProtectSystem=strict
 

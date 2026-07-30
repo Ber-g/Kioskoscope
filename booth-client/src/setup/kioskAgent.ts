@@ -140,6 +140,42 @@ export class KioskAgentClient {
   osUpdateStatus(): Promise<{ pending: number }> {
     return this.call("GET", "/system/os-update/status");
   }
+
+  /**
+   * Médias RÉELLEMENT présents sur le disque de la borne (CIN-112 lot 1). Un échec n'est jamais
+   * fatal : la borne retombe sur les URLs signées, c'est-à-dire sur le comportement d'avant.
+   */
+  async localMediaHashes(): Promise<ReadonlySet<string>> {
+    try {
+      return normalizeMediaLibrary(await this.call("GET", "/media/library"));
+    } catch (e) {
+      console.warn("[kiosk] bibliothèque média locale illisible :", e instanceof Error ? e.message : e);
+      return new Set();
+    }
+  }
+}
+
+/**
+ * Empreintes de la bibliothèque locale, filtrées. PURE (testée isolément).
+ *
+ * Ces empreintes finissent dans une URL (`/media/<hash>`) construite par la page : on n'accepte
+ * donc QUE la forme attendue — 64 hexadécimaux minuscules — plutôt que d'échapper après coup.
+ * Un octet de plus, un caractère de moins : l'entrée est ignorée, pas corrigée.
+ */
+export function normalizeMediaLibrary(raw: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  const list = (raw as { media?: unknown } | null)?.media;
+  if (!Array.isArray(list)) return out;
+  for (const item of list) {
+    const o = item as Record<string, unknown> | null;
+    if (!o || typeof o !== "object") continue;
+    if (typeof o.hash !== "string" || !/^[0-9a-f]{64}$/.test(o.hash)) continue;
+    // Taille absente = agent d'une version antérieure : on ne rejette pas. Taille présente et
+    // nulle = fichier vide, donc pas jouable (téléchargement interrompu).
+    if (typeof o.bytes === "number" && o.bytes <= 0) continue;
+    out.add(o.hash);
+  }
+  return out;
 }
 
 /** Adaptateur Wi-Fi réel (agent) — même contrat que le mock `WifiManager`. */

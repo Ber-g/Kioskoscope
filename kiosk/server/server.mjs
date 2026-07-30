@@ -1,9 +1,11 @@
 // Kioskoscope — serveur local de la borne (CIN-071, couche de service front).
 //
-// Deux rôles, sur 127.0.0.1 uniquement :
+// Trois rôles, sur 127.0.0.1 uniquement :
 //   1. sert le build statique du `booth-client` à Chromium (kiosk) ;
 //   2. sert `GET /kiosk-config.json` avec le jeton de l'agent LU AU RUNTIME depuis
-//      /etc/kioskoscope/agent.token — jamais compilé dans le bundle (principe F17).
+//      /etc/kioskoscope/agent.token — jamais compilé dans le bundle (principe F17) ;
+//   3. sert les MÉDIAS du disque local (`GET /media/<sha256>`) en streaming HTTP Range —
+//      c'est ce qui permet à un film de se lire réseau débranché (CIN-112 lot 1).
 //
 // Le jeton n'est exposé que sur la boucle locale, même origine que le front (pas d'en-tête
 // CORS) : seul le booth-client servi ici peut le lire, pas une page d'une autre origine.
@@ -13,10 +15,13 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
+import { serveMedia } from "../lib/media.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.KIOSK_WEB_PORT ?? 8080);
 const WEB_ROOT = process.env.KIOSK_WEB_ROOT ?? "/opt/kioskoscope/booth-client/dist";
+// Bibliothèque média locale (CIN-112 lot 1) — même dossier que celui inventorié par l'agent.
+const MEDIA_ROOT = process.env.KIOSK_MEDIA_ROOT ?? "/var/lib/kioskoscope/media";
 const AGENT_URL = process.env.KIOSK_AGENT_URL ?? "http://127.0.0.1:4599";
 const TOKEN_FILE = process.env.KIOSK_AGENT_TOKEN_FILE ?? "/etc/kioskoscope/agent.token";
 // Creds Supabase du device (boothId/orgId/deviceEmail/devicePassword), provisionnés en local.
@@ -160,6 +165,20 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Média local (CIN-112) : `<video src="/media/<sha256>">`. Servi en streaming Range depuis le
+  // disque de la borne — aucune URL signée, aucun réseau, donc aucune expiration possible.
+  // Placé AVANT le statique : `/media/…` ne doit jamais tomber dans le repli SPA (qui renverrait
+  // un `index.html` en guise de vidéo, et un lecteur qui échoue sans rien dire).
+  if (path.startsWith("/media/")) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405, { allow: "GET, HEAD" });
+      res.end();
+      return;
+    }
+    await serveMedia(req, res, path.slice("/media/".length), MEDIA_ROOT);
+    return;
+  }
+
   // Statique : anti-traversal (le chemin résolu doit rester sous WEB_ROOT).
   if (path === "/" || path === "") path = "/index.html";
   const file = join(WEB_ROOT, normalize(path));
@@ -186,7 +205,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.info(`[web] Kioskoscope front sur http://${HOST}:${PORT} (racine ${WEB_ROOT})`);
+  console.info(`[web] Kioskoscope front sur http://${HOST}:${PORT} (racine ${WEB_ROOT}, médias ${MEDIA_ROOT})`);
   // État du provisionnement dit AU DÉMARRAGE : un exploitant qui branche un écran/ssh voit
   // immédiatement pourquoi sa borne ne propose rien, sans avoir à ouvrir la console du navigateur.
   const state = deviceState();

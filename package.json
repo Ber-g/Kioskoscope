@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "Kioskoscope — monorepo : Kiosks, back-office, backend, domaine partagé.",
+  "scripts": {
+    "test:kiosk": "node kiosk/tests/media_smoke.mjs"
+  },
   "workspaces": [
     "packages/*",
     "booth-client",

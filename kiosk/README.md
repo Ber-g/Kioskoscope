@@ -30,6 +30,31 @@ back-office). Volet A opérateur = `booth-client` ; ici = la couche **système**
   (Chromium plein écran, `Restart=always` = watchdog anti-écran-figé, F4).
 - **`provisioning/`** — `setup.sh` (install idempotente), `sudoers-kioskoscope` (liste
   blanche), `kiosk-brightness` (seul écrivain du backlight).
+- **`server/server.mjs`** — sert le front à Chromium, `/kiosk-config.json` (jeton + creds
+  device au runtime) et **les médias locaux** (voir ci-dessous).
+- **`lib/media.mjs`** — inventaire + service des médias locaux, **partagé** par l'agent et le
+  serveur : une seule liste blanche d'extensions pour les deux.
+- **`tests/media_smoke.mjs`** — `npm run test:kiosk` (49 assertions, aucune borne requise).
+
+### Médias locaux — lire un film sans réseau (CIN-112)
+
+Un média posé dans **`/var/lib/kioskoscope/media/<sha256>.<mp4|webm>`** est servi par le serveur
+local en **streaming HTTP Range** sur `/media/<sha256>`, et le booth-client le **préfère** à
+l'URL signée. La lecture ne dépend alors plus du réseau : débrancher le câble en pleine séance
+n'interrompt plus le film.
+
+- `<sha256>` = **`media.content_hash`**, l'empreinte calculée à l'upload back-office. C'est le seul
+  contrat entre le catalogue et le disque : mauvais nom ⇒ média invisible pour la borne.
+- Le dossier est **`0755 root:root`** : les deux services LISENT, seul l'approvisionnement écrit.
+  Une web-app compromise ne doit pas pouvoir y déposer un fichier qui sera servi à Chromium.
+- Seuls `.mp4` et `.webm` sont servis (liste fermée), et l'agent n'inventorie qu'eux.
+- Un fichier de **0 octet est ignoré** (téléchargement interrompu ⇒ jamais proposé comme jouable).
+- L'inventaire **constate une présence, il ne vérifie pas l'empreinte** (re-hacher 6 Go à chaque
+  écran d'attente tuerait la borne). La vérification sha256 se fera **une fois, à l'ingestion**,
+  quand l'approvisionnement automatique existera (lot 3 du ticket).
+
+⚠️ **La borne ne démarre toujours pas hors ligne** : sans réseau au boot, il n'y a aucun catalogue
+à rapprocher du disque, donc aucune séance proposée. C'est le lot suivant.
 
 ## Modèle de sécurité (@qa — non négociable)
 

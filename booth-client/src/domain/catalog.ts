@@ -199,6 +199,20 @@ export function filmById(id: string, catalog: readonly Film[] = runtimeCatalog):
 // aucun son). Un visiteur pouvait donc payer pour un fichier qui n'existe pas. Règle : on ne
 // propose que ce qu'on peut réellement projeter.
 
+/**
+ * Source de lecture LOCALE d'un média (CIN-112 lot 1), servie par le serveur local de la borne
+ * en streaming Range. `null` = ce média n'est pas sur le disque → il faudra une URL signée, donc
+ * du réseau. La forme de l'empreinte est re-vérifiée ici parce qu'elle vient de la base et finit
+ * dans une URL : une empreinte mal formée ne produit pas une URL douteuse, elle ne produit RIEN.
+ *
+ * Chemin relatif (même origine que l'app) : le lecteur n'a donc pas à connaître le port local, et
+ * la requête n'est pas soumise au CORS.
+ */
+export function localMediaUrl(contentHash: string, localMedia: ReadonlySet<string>): string | null {
+  if (!/^[0-9a-f]{64}$/.test(contentHash) || !localMedia.has(contentHash)) return null;
+  return `/media/${contentHash}`;
+}
+
 /** Un média du catalogue réel, avec le chemin de fichier DÉCLARÉ en base (avant résolution). */
 export interface CatalogEntry {
   /** Le film tel qu'il sera servi au parcours (`storageUrl` = URL résolue, ou null si échec). */

@@ -3,6 +3,8 @@
 // Rôle : exposer au menu opérateur (booth-client, dans Chromium) les actions SYSTÈME
 // réelles — Wi-Fi, alimentation, luminosité, infos machine — et appliquer les mises à
 // jour de l'OS sur commande (patch de sécurité piloté back-office, CIN-077).
+// Il inventorie aussi les MÉDIAS présents sur le disque (CIN-112) : la page web n'a aucun
+// accès au disque, l'agent si — c'est par lui que passe toute la chaîne hors-ligne.
 //
 // ─ Modèle de sécurité (non négociable @qa) ─────────────────────────────────────
 // • L'agent écoute UNIQUEMENT sur 127.0.0.1 : inatteignable depuis le réseau.
@@ -19,12 +21,16 @@
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { readFileSync, appendFileSync } from "node:fs";
+import { scanMediaLibrary } from "../lib/media.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.KIOSK_AGENT_PORT ?? 4599);
 const TOKEN_FILE = process.env.KIOSK_AGENT_TOKEN_FILE ?? "/etc/kioskoscope/agent.token";
 const LOG_FILE = process.env.KIOSK_AGENT_LOG ?? "/var/log/kioskoscope-agent.log";
 const BACKLIGHT = process.env.KIOSK_BACKLIGHT ?? "/sys/class/backlight/intel_backlight";
+// Bibliothèque média locale (CIN-112 lot 1) : les fichiers réellement présents sur le disque
+// de la borne. Partagée avec le serveur local, qui les SERT (`GET /media/<hash>`).
+const MEDIA_ROOT = process.env.KIOSK_MEDIA_ROOT ?? "/var/lib/kioskoscope/media";
 
 /** Jeton partagé (fichier 0600). Absent ⇒ l'agent refuse de démarrer (fail-closed). */
 function loadToken() {
@@ -61,6 +67,18 @@ function run(cmd, args, { timeoutMs = 20_000 } = {}) {
 // ─ Validation d'entrées ────────────────────────────────────────────────────────
 const isStr = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max;
 const clampPct = (v) => Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+
+// ─ Bibliothèque média locale (CIN-112 lot 1) ───────────────────────────────────
+//
+// Un fichier est nommé par son empreinte : `<sha256 minuscule>.<mp4|webm>`. C'est la MÊME
+// empreinte que `media.content_hash` en base (calculée à l'upload back-office), donc la borne
+// peut rapprocher son catalogue de son disque sans rien demander au réseau.
+//
+// L'inventaire lui-même vit dans `kiosk/lib/media.mjs` : le serveur local, qui SERT ces fichiers,
+// doit partager exactement la même liste blanche d'extensions (cf. l'en-tête de ce module).
+async function mediaLibrary() {
+  return { root: MEDIA_ROOT, media: await scanMediaLibrary(MEDIA_ROOT) };
+}
 
 // ─ Actions système (chacune = une commande en liste blanche) ────────────────────
 const actions = {
@@ -167,6 +185,7 @@ const ROUTES = {
   "POST /power/reboot": () => actions.powerReboot(),
   "GET /system/os-update/status": () => actions.osUpdateStatus(),
   "POST /system/os-update": () => actions.osUpdate(),
+  "GET /media/library": () => mediaLibrary(),
 };
 
 function readBody(req) {
