@@ -124,8 +124,25 @@ export function mediaPage(store: FleetStore, onChanged: () => void): HTMLElement
       ]);
     });
 
-    const add = el("button", { class: "btn btn-primary", type: "button" }, ["Ajouter un média"]);
-    add.addEventListener("click", () => openMediaForm(store, null, onChanged));
+    // CIN-102 — le refus arrive AVANT le premier octet, pas après six giga-octets.
+    // Un bouton grisé sans explication est une impasse ; le titre dit donc le motif ET le rôle
+    // qu'il faut, pour que la personne sache à qui le demander plutôt que réessayer.
+    const canAdd = store.canWriteMedia();
+    const add = el(
+      "button",
+      {
+        class: "btn btn-primary",
+        type: "button",
+        ...(canAdd ? {} : { disabled: "true", title: "Votre rôle ne permet pas d'ajouter un média. Demandez le rôle « manager » ou « super_user » à un administrateur de votre organisation." }),
+      },
+      ["Ajouter un média"],
+    );
+    // Ceinture ET bretelles : le `disabled` peut être retiré depuis l'inspecteur, et le
+    // téléversement démarre dès l'ouverture du formulaire. On revérifie donc à l'ouverture.
+    add.addEventListener("click", () => {
+      if (!store.canWriteMedia()) return;
+      openMediaForm(store, null, onChanged);
+    });
 
     const selCount = state.selected.size;
     const send = el(

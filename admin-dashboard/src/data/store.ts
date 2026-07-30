@@ -949,6 +949,22 @@ export class FleetStore {
     return this.upsertOrgStyle(orgId, patch);
   }
 
+  /**
+   * Le rôle courant permet-il d'ÉCRIRE dans le catalogue média ? (CIN-102)
+   *
+   * Miroir EXACT de la règle RLS de `0002_rls.sql` : écriture = `super_user` ou `manager`.
+   * ⚠️ Ce n'est qu'un confort d'interface — **la RLS reste la seule autorité**. On duplique la
+   * règle ici uniquement pour pouvoir refuser AVANT d'avoir téléversé six giga-octets pour rien :
+   * jusqu'ici le bouton était offert à tous et c'est la base qui disait non, après l'envoi.
+   * Si les deux divergent un jour, c'est l'interface qui a tort, jamais la base.
+   */
+  canWriteMedia(): boolean {
+    if (this.mode === "mock") return true;
+    if (this.isGlobalAdmin) return true;
+    const role = this.identity?.role;
+    return role === "super_user" || role === "manager";
+  }
+
   // ── Gestion d'organisation (menu Organisation — RBAC, invitations, paiement) ─
   /** L'utilisateur courant est-il super_user de l'org (ou global_admin) ? */
   canManageOrg(orgId: string | null | undefined): boolean {
