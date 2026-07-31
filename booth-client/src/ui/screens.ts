@@ -431,6 +431,13 @@ export function playerScreen(
     skip,
     volume,
   ]);
+  // CIN-116 : une VRAIE vidéo occupe tout l'écran (`object-fit: contain`, jamais `cover` — on ne
+  // recadre pas le film à la place de son auteur ; les bandes noires sont le comportement d'une
+  // salle). Aucun appel à l'API Fullscreen : Chromium tourne déjà en mode kiosque, et cette API
+  // créerait un état dont on peut SORTIR (Échap, gestes) — l'inverse du verrouillage de CIN-072.
+  // Le repli sans fichier (lecture simulée, échec de lecture) garde la mise en page centrée : là,
+  // il n'y a pas d'image à respecter, et un écran noir plein cadre n'expliquerait rien.
+  if (videoEl) node.classList.add("screen--fullbleed");
 
   // Contrôles média en intentions (F14) : le lecteur expose play/pause/stop/volume
   // en actions de premier plan (avant : « passer » uniquement). Navigation/confirm

@@ -392,6 +392,45 @@ h2 {
   display: block;
 }
 
+/* ── Plein cadre (CIN-116) ─────────────────────────────────────────────────── */
+/* Posé par `playerScreen` UNIQUEMENT quand un vrai fichier est joué. L'image prend 100 % de la
+   hauteur OU de la largeur en gardant son ratio — pas d'entre-deux, pas de recadrage. Tout ce qui
+   entoure disparaît : ni marge, ni coin arrondi, ni gouttière. Les commandes qui restent (volume,
+   bouton d'angle) sont déjà en `position: fixed`, elles ne prennent donc aucune place à l'image. */
+.screen--fullbleed {
+  padding: 0;
+  gap: 0;
+}
+
+.screen--fullbleed .player__videostage {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.screen--fullbleed .player__video {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain; /* JAMAIS `cover` : rogner l'image, c'est recadrer le film. */
+  border-radius: 0;
+}
+
+.screen--fullbleed .player__overlay {
+  border-radius: 0;
+}
+
+/* Les chips de sous-titres passent AU-DESSUS de l'image plutôt que de la repousser vers le haut.
+   Décalées à gauche du bouton d'angle pour ne jamais se recouvrir sur un écran étroit. */
+.screen--fullbleed .player__subs {
+  position: fixed;
+  left: 1.5rem;
+  right: 12rem;
+  bottom: 1.5rem;
+  z-index: 2;
+}
+
 /* Scène vidéo : conteneur relatif pour poser l'overlay (spinner / « toucher pour lancer »). */
 .player__videostage {
   position: relative;

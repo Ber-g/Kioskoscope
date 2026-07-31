@@ -82,6 +82,16 @@ export interface SessionRow {
   readonly unlockMethod: string;
   readonly amountCents: number | null;
   readonly films: ReadonlyArray<{ title: string; source: string; completed: boolean }>;
+  /**
+   * Ouvertures de la page de partage `/s/{token}` de CETTE séance (CIN-106, table `share_opens`).
+   *
+   * ⚠️ `null` ≠ `0`. `null` = la mesure n'est pas LISIBLE (table absente, lecture refusée) ;
+   * `0` = personne n'a ouvert. Les confondre afficherait « 0 ouverture » à un exploitant dont
+   * le compteur est simplement débranché — exactement le zéro silencieux que ce projet traque.
+   */
+  readonly shareOpens: number | null;
+  /** Dernière ouverture connue (ms epoch), `null` si aucune ou mesure indisponible. */
+  readonly lastShareOpenAt: number | null;
 }
 
 /**
@@ -1405,6 +1415,7 @@ export class FleetStore {
       .order("started_at", { ascending: false })
       .limit(300);
     const { data: playsData } = await supabase!.from("plays").select("session_id,media_id,position,completed,source");
+    const opens = await this.shareOpensFor((sess ?? []) as Array<{ started_at: string }>);
     const boothLabel = new Map(this.booths.map((b) => [b.id, b.label]));
     const mediaTitle = new Map(this.media.map((m) => [m.id, m.title]));
     const bySession = new Map<string, Array<{ position: number; title: string; source: string; completed: boolean }>>();
@@ -1420,7 +1431,47 @@ export class FleetStore {
       unlockMethod: s.unlock_method,
       amountCents: s.amount_cents ?? null,
       films: (bySession.get(s.id) ?? []).sort((a, b) => a.position - b.position).map(({ title, source, completed }) => ({ title, source, completed })),
+      shareOpens: opens.readable ? (opens.bySession.get(s.id)?.count ?? 0) : null,
+      lastShareOpenAt: opens.readable ? (opens.bySession.get(s.id)?.last ?? null) : null,
     }));
+  }
+
+  /**
+   * Ouvertures de page de partage rattachées aux séances affichées (CIN-106).
+   *
+   * FENÊTRE EXACTE PAR CONSTRUCTION : une page ne peut être ouverte qu'APRÈS le début de sa
+   * séance, donc borner à `opened_at >= début de la plus ancienne séance affichée` ne perd
+   * aucune ouverture des séances listées. C'est ce qui garantit qu'un taux ne dépasse jamais
+   * 100 % : numérateur et dénominateur décrivent la même fenêtre.
+   *
+   * Le drapeau `readable` distingue « mesure débranchée » de « zéro ouverture » — voir
+   * `SessionRow.shareOpens`.
+   */
+  private async shareOpensFor(
+    sessions: ReadonlyArray<{ started_at: string }>,
+  ): Promise<{ readable: boolean; bySession: Map<string, { count: number; last: number }> }> {
+    const bySession = new Map<string, { count: number; last: number }>();
+    if (sessions.length === 0) return { readable: true, bySession };
+    const since = sessions.reduce((min, s) => (s.started_at < min ? s.started_at : min), sessions[0]!.started_at);
+    const { data, error } = await supabase!
+      .from("share_opens")
+      .select("session_id,opened_at")
+      .gte("opened_at", since)
+      .order("opened_at", { ascending: false })
+      .limit(5000);
+    // Base antérieure à 0026 (table absente) : on rend la mesure INDISPONIBLE plutôt que nulle.
+    if (error) return { readable: false, bySession };
+    for (const o of (data ?? []) as Array<{ session_id: string; opened_at: string }>) {
+      const at = new Date(o.opened_at).getTime();
+      const cur = bySession.get(o.session_id);
+      if (cur) {
+        cur.count += 1;
+        if (at > cur.last) cur.last = at;
+      } else {
+        bySession.set(o.session_id, { count: 1, last: at });
+      }
+    }
+    return { readable: true, bySession };
   }
 
   /**
@@ -1627,18 +1678,47 @@ export class FleetStore {
   }
 
   /** Enregistre (upsert) la licence d'un média (une par org+média). */
-  async saveMediaLicense(orgId: string, l: Omit<MediaLicense, "id"> & { id?: string }): Promise<{ ok: boolean; error?: string }> {
-    if (this.mode !== "supabase") return { ok: true };
+  /**
+   * Écrit la licence d'un média et RAPPORTE LA LIGNE ÉCRITE (BUG-018).
+   *
+   * ⚠️ POURQUOI `.select()` N'EST PAS COSMÉTIQUE. Un `upsert` dont la branche UPDATE ne touche
+   * AUCUNE ligne — parce que la policy RLS ne rend pas la ligne modifiable — ne renvoie pas
+   * d'erreur : PostgREST répond 200 avec un corps vide. Sans `.select()`, on ne peut pas
+   * distinguer « écrit » de « refusé en silence », et l'écran annonce un succès imaginaire.
+   * Ici, zéro ligne rendue = échec, dit comme tel.
+   *
+   * L'id rendu est celui de la BASE, pas celui d'un rechargement : l'appelant peut enchaîner
+   * (plafonds par machine) sans dépendre d'un `loadFromSupabase()` qui pourrait ne pas ramener
+   * la ligne — second trou de BUG-018.
+   *
+   * `reload: false` laisse l'appelant qui enchaîne une seconde écriture ne payer qu'UN
+   * rechargement complet (≈30 requêtes) au lieu de deux.
+   */
+  async saveMediaLicense(
+    orgId: string,
+    l: Omit<MediaLicense, "id"> & { id?: string },
+    opts: { reload?: boolean } = {},
+  ): Promise<{ ok: boolean; id?: string; error?: string }> {
+    // Mode démo : pas de base, mais un id doit être rendu — l'appelant traite désormais son
+    // absence comme un échec, à juste titre.
+    if (this.mode !== "supabase") return { ok: true, id: l.id ?? "mock-license" };
     const row = {
       organization_id: orgId, media_id: l.mediaId, distributor_id: l.distributorId,
       royalty_model: l.royaltyModel, royalty_cents: l.royaltyCents, revenue_share_pct: l.revenueSharePct,
       minimum_guarantee_cents: l.minimumGuaranteeCents, max_screenings: l.maxScreenings,
       valid_from: l.validFrom, valid_to: l.validTo, notes: l.notes,
     };
-    const { error } = await supabase!.from("media_licenses").upsert(row, { onConflict: "organization_id,media_id" });
+    const { data, error } = await supabase!
+      .from("media_licenses")
+      .upsert(row, { onConflict: "organization_id,media_id" })
+      .select("id");
     if (error) return { ok: false, error: error.message };
-    await this.loadFromSupabase();
-    return { ok: true };
+    const written = (data ?? []) as Array<{ id: string }>;
+    if (written.length === 0) {
+      return { ok: false, error: "La base a accepté la requête sans rien écrire — droits insuffisants sur cette licence. Rien n'a été enregistré." };
+    }
+    if (opts.reload !== false) await this.loadFromSupabase();
+    return { ok: true, id: written[0]!.id };
   }
   async deleteMediaLicense(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
@@ -1650,11 +1730,18 @@ export class FleetStore {
   /** Remplace le scope/plafond par machine d'une licence (delete + insert). */
   async setLicenseBooths(orgId: string, licenseId: string, entries: Array<{ boothId: string; maxScreenings: number | null }>): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    await supabase!.from("license_booths").delete().eq("license_id", licenseId);
+    // L'erreur du DELETE était avalée : un refus laissait les anciens plafonds en place pendant
+    // que l'écran annonçait les nouveaux (BUG-018). Zéro ligne supprimée reste légitime — il n'y
+    // avait peut-être rien —, mais une ERREUR doit se voir.
+    const { error: delError } = await supabase!.from("license_booths").delete().eq("license_id", licenseId);
+    if (delError) return { ok: false, error: delError.message };
     if (entries.length > 0) {
       const rows = entries.map((e) => ({ organization_id: orgId, license_id: licenseId, booth_id: e.boothId, max_screenings: e.maxScreenings }));
-      const { error } = await supabase!.from("license_booths").insert(rows);
+      const { data, error } = await supabase!.from("license_booths").insert(rows).select("id");
       if (error) return { ok: false, error: error.message };
+      if ((data ?? []).length !== rows.length) {
+        return { ok: false, error: "Les plafonds par machine n'ont pas tous été enregistrés — droits insuffisants. Vérifiez la licence avant de vous y fier." };
+      }
     }
     await this.loadFromSupabase();
     return { ok: true };

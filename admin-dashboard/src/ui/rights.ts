@@ -181,15 +181,25 @@ function openLicenseModal(store: FleetStore, mediaId: string, title: string, onD
       maxScreenings: maxScr.value ? Math.round(Number(maxScr.value)) : null,
       validFrom: from.value || null, validTo: to.value || null, notes: "",
     };
-    void store.saveMediaLicense(orgId, lic).then((res) => {
-      if (!res.ok) { save.removeAttribute("disabled"); error.textContent = res.error ?? "Échec."; error.classList.remove("d-none"); return; }
-      const licId = store.mediaLicenseFor(mediaId)?.id;
-      const entries = perBoothToggle.checked && licId
+    // BUG-018 : une écriture ne se termine JAMAIS en fermant la fenêtre sans rien dire. La
+    // fenêtre ne se ferme que si la base a rendu la ligne écrite ; tout le reste reste à l'écran,
+    // avec son motif, formulaire intact — l'opérateur ne doit pas avoir à deviner ni à recommencer.
+    const fail = (msg: string): void => {
+      save.removeAttribute("disabled");
+      error.textContent = msg;
+      error.classList.remove("d-none");
+    };
+    // `reload: false` : le rechargement complet est payé une seule fois, par `setLicenseBooths`.
+    void store.saveMediaLicense(orgId, lic, { reload: false }).then((res) => {
+      if (!res.ok || !res.id) { fail(res.error ?? "Échec de l'enregistrement de la licence."); return; }
+      const entries = perBoothToggle.checked
         ? [...boothInputs.entries()].filter(([, i]) => i.on.checked).map(([boothId, i]) => ({ boothId, maxScreenings: i.cap.value ? Math.round(Number(i.cap.value)) : null }))
         : [];
-      const finish = (): void => { modal.hide(); onDone(); };
-      if (licId) void store.setLicenseBooths(orgId, licId, entries).then(finish);
-      else finish();
+      void store.setLicenseBooths(orgId, res.id, entries).then((lb) => {
+        if (!lb.ok) { fail(lb.error ?? "La licence est enregistrée, mais pas les plafonds par machine."); return; }
+        modal.hide();
+        onDone();
+      });
     });
   });
 

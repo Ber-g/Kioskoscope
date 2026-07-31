@@ -19,6 +19,8 @@ import { allHealthStatuses, connectionMeta, healthMeta } from "../src/domain/sta
 import { HOME, VIEWS, formatRoute, parseRoute, sameRoute, type Route, type SettingsTab } from "../src/ui/router";
 import { designatedOrgId, resolveSettingsNav, type SettingsNavContext } from "../src/ui/settingsNav";
 import { setLang } from "../src/i18n";
+import { shareOpenStats } from "../src/ui/sessions";
+import type { SessionRow } from "../src/data/store";
 
 // DÉTERMINISME : ce test vérifie des libellés FRANÇAIS (relativeTime, healthMeta…). La langue par
 // défaut est DÉTECTÉE (localStorage/navigator) → dépend de l'environnement (mac FR en local, en-US
@@ -475,6 +477,44 @@ assertEqual(connectionMeta("lte").label, "LTE (4G)", "connectionMeta(lte).label"
   assertEqual(formatBytes(512), "512 o", "formatBytes : sous le kilo-octet");
   assertEqual(formatBytes(145000), "142 Ko", "formatBytes : kilo-octets arrondis");
   assertEqual(formatBytes(2400000), "2,3 Mo", "formatBytes : méga-octets, virgule française");
+}
+
+// ── 10. Ouvertures de la page de partage (CIN-106) ───────────────────────────
+// Ce chiffre est destiné à des ayants droit et à une décision produit (le QR sert-il ?).
+// Les deux façons de le fausser sont testées ici : compter les ré-ouvertures au numérateur
+// (taux > 100 %), et afficher un zéro alors que la mesure est simplement débranchée.
+{
+  const session = (id: string, shareOpens: number | null): SessionRow => ({
+    id,
+    boothLabel: "K1",
+    startedAt: 0,
+    unlockMethod: "free",
+    amountCents: null,
+    films: [],
+    shareOpens,
+    lastShareOpenAt: shareOpens && shareOpens > 0 ? 1000 : null,
+  });
+
+  const stats = shareOpenStats([session("a", 3), session("b", 0), session("c", 1), session("d", 0)]);
+  assert(stats.available, "shareOpenStats : mesure lisible quand les séances portent un compte");
+  assertEqual(stats.opens, 4, "shareOpenStats : 4 ouvertures au total (ré-ouvertures comprises)");
+  assertEqual(stats.sessionsOpened, 2, "shareOpenStats : 2 séances ouvertes au moins une fois");
+  assertEqual(stats.rate, 0.5, "shareOpenStats : le taux compte les SÉANCES, pas les ouvertures");
+  assert(stats.rate !== null && stats.rate <= 1, "shareOpenStats : une ré-ouverture ne fait jamais dépasser 100 %");
+
+  const blind = shareOpenStats([session("a", null), session("b", null)]);
+  assert(!blind.available, "shareOpenStats : mesure indisponible ⇒ available=false (jamais un 0 muet)");
+  assertEqual(blind.rate, null, "shareOpenStats : pas de taux inventé quand rien n'est lisible");
+  assertEqual(blind.sessions, 2, "shareOpenStats : les séances restent comptées même sans mesure");
+
+  assert(!shareOpenStats([]).available, "shareOpenStats : aucune séance ⇒ rien à annoncer");
+  assertEqual(shareOpenStats([]).rate, null, "shareOpenStats : aucun taux sur un lot vide (pas de 0/0)");
+
+  // Base partiellement instrumentée : le dénominateur ne retient QUE les séances mesurées,
+  // sinon le taux serait mécaniquement écrasé par des séances dont on ne sait rien.
+  const partial = shareOpenStats([session("a", 1), session("b", null)]);
+  assertEqual(partial.sessions, 1, "shareOpenStats : les séances non mesurées sortent du dénominateur");
+  assertEqual(partial.rate, 1, "shareOpenStats : 1 séance mesurée et ouverte ⇒ 100 %");
 }
 
 // ── Verdict ──────────────────────────────────────────────────────────────────
