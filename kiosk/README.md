@@ -30,8 +30,9 @@ back-office). Volet A opérateur = `booth-client` ; ici = la couche **système**
   (Chromium plein écran, `Restart=always` = watchdog anti-écran-figé, F4).
 - **`provisioning/`** — `setup.sh` (install idempotente), `sudoers-kioskoscope` (liste
   blanche), `kiosk-brightness` (seul écrivain du backlight).
-- **`server/server.mjs`** — sert le front à Chromium, `/kiosk-config.json` (jeton + creds
-  device au runtime) et **les médias locaux** (voir ci-dessous).
+- **`server/server.mjs`** — sert le front à Chromium, `/kiosk-config.json` (état du
+  provisionnement, **sans secret**), **relaie `/agent/*`** vers l'agent en injectant le jeton
+  (CIN-128) et sert **les médias locaux** (voir ci-dessous).
 - **`lib/media.mjs`** — inventaire + service des médias locaux, **partagé** par l'agent et le
   serveur : une seule liste blanche d'extensions pour les deux.
 - **`tests/media_smoke.mjs`** — `npm run test:kiosk` (49 assertions, aucune borne requise).
@@ -72,9 +73,11 @@ ancien, horloge, autre org, aucun média sur le disque).
 ⚠️ **Résiduel connu** : un plafond de séances peut être franchi hors ligne — la borne ignore son
 allocation restante. Exposition bornée par les 7 jours, compte serveur recalé au rejeu des séances.
 
-⚠️ **L'agent n'est joignable depuis la page que via une liste blanche d'origines** (`KIOSK_WEB_ORIGINS`,
-défaut `http://127.0.0.1:8080,http://localhost:8080`). Si le front est servi sur un autre port ou un
-autre nom d'hôte, **il faut l'y ajouter**, sinon tous les appels agent échouent (cf. BUG-020).
+⚠️ **La liste blanche d'origines de l'agent** (`KIOSK_WEB_ORIGINS`, défaut
+`http://127.0.0.1:8080,http://localhost:8080`) ne concerne plus le chemin normal depuis CIN-128 :
+la page passe par le relais du serveur local, donc en même origine. Elle est **conservée comme
+filet de bascule** — et elle redevient indispensable si un jour la page rappelle l'agent en
+direct (cf. BUG-020, où son absence a condamné toute la surface agent pendant un mois).
 
 ## Modèle de sécurité (@qa — non négociable)
 
@@ -149,20 +152,46 @@ sudo /opt/kioskoscope/kiosk/provisioning/setup.sh
 sudo systemctl enable --now kioskoscope-kiosk.service
 ```
 
-## Injection du jeton (hors bundle) — `/kiosk-config.json`
+## Le jeton ne descend plus dans la page — relais `/agent/*` (CIN-128)
 
 Le `booth-client` (dans Chromium) ne peut pas lire `/etc/kioskoscope/agent.token`, et le
 jeton **ne doit pas** être compilé dans le bundle (sinon un contenu web compromis aurait le
-privilège système). Solution : la **couche de service locale** qui sert le front à Chromium
-sert aussi, au runtime, un `GET /kiosk-config.json` :
+privilège système). Jusqu'au 2026-07-31 il était **servi en clair** dans `/kiosk-config.json`
+et la page le portait dans chaque appel. C'était fin — même origine, donc illisible depuis une
+autre page — mais **le secret vivait dans le DOM** : une faille XSS repartait avec un jeton
+réutilisable hors de la machine.
+
+**Aujourd'hui le serveur local relaie.** La page appelle `/agent/<route>` en **même origine** ;
+le serveur local recopie la requête vers `http://127.0.0.1:4599/<route>` en **injectant le jeton
+lui-même**. Le secret ne quitte plus les processus Node.
 
 ```json
-{ "agentUrl": "http://127.0.0.1:4599", "agentToken": "<contenu de /etc/kioskoscope/agent.token>" }
+{ "agentBase": "/agent", "agentReady": true, "device": { "…": "…" } }
 ```
 
-`booth-client` le lit au démarrage (`loadKioskConfig`) : présent ⇒ Wi-Fi/réglages **réels**
-via l'agent ; absent (dev navigateur) ⇒ stubs (mock). Ce petit serveur local est le seul à lire
-les secrets sur disque — ils restent hors du bundle public.
+| Champ | Sens |
+|---|---|
+| `agentBase` | préfixe d'appel de l'agent, **même origine** — plus aucun CORS sur ce chemin |
+| `agentReady` | `false` = pas de jeton sur la borne : le relais répond `503`, le menu opérateur retombe sur ses stubs — **mais la borne reste une borne** |
+
+⚠️ **Ce que le relais NE corrige PAS.** Une page compromise peut toujours *appeler* les actions
+système : elle est dans la même origine. Le gain est « le secret n'est plus copiable hors de la
+machine », rien de plus. Ne pas le vendre pour davantage.
+
+⚠️ **Garde du relais (@qa).** Aucun en-tête du client n'est transmis à l'agent — surtout pas
+`authorization` : la page ne doit pas pouvoir proposer un autre jeton. Les routes sont bornées à
+`^/[a-z0-9]+(?:[/-][a-z0-9]+)*$` (ni `..`, ni `//`, ni changement de schéma), les méthodes à
+GET/POST, le corps à 4 Mo, et un POST doit être `application/json` — ce qui force un préflight
+CORS sur toute tentative venue d'une autre origine.
+
+⚠️ **Déploiement couplé.** Le build `booth-client` et `server.mjs` doivent être déployés
+**ensemble** : un bundle antérieur à CIN-128 attend `agentToken` et ne le trouvera plus. Le
+contraire est géré (un client récent reconnaît un serveur ancien et le traite comme une borne
+sans relais, jamais comme un poste de dev).
+
+`booth-client` lit la config au démarrage (`loadKioskConfig`) : présente ⇒ borne réelle
+(verrouillage kiosque, creds device) ; absente (dev navigateur) ⇒ stubs (mock). Ce petit serveur
+local est le seul à lire les secrets sur disque — ils restent hors du bundle public.
 
 **Creds device (Supabase) au runtime aussi (sécu 2026-07-08).** `/kiosk-config.json` inclut, si
 provisionné, un objet `device` (`boothId`/`orgId`/`deviceEmail`/`devicePassword`) lu depuis

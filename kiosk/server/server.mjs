@@ -1,20 +1,28 @@
 // Kioskoscope — serveur local de la borne (CIN-071, couche de service front).
 //
-// Trois rôles, sur 127.0.0.1 uniquement :
+// Quatre rôles, sur 127.0.0.1 uniquement :
 //   1. sert le build statique du `booth-client` à Chromium (kiosk) ;
-//   2. sert `GET /kiosk-config.json` avec le jeton de l'agent LU AU RUNTIME depuis
-//      /etc/kioskoscope/agent.token — jamais compilé dans le bundle (principe F17) ;
-//   3. sert les MÉDIAS du disque local (`GET /media/<sha256>`) en streaming HTTP Range —
+//   2. sert `GET /kiosk-config.json` — état du provisionnement, SANS aucun secret d'agent ;
+//   3. **relaie `/agent/*` vers l'agent local en injectant le jeton lui-même** (CIN-128) ;
+//   4. sert les MÉDIAS du disque local (`GET /media/<sha256>`) en streaming HTTP Range —
 //      c'est ce qui permet à un film de se lire réseau débranché (CIN-112 lot 1).
 //
-// Le jeton n'est exposé que sur la boucle locale, même origine que le front (pas d'en-tête
-// CORS) : seul le booth-client servi ici peut le lire, pas une page d'une autre origine.
+// CIN-128 — POURQUOI LE JETON NE DESCEND PLUS DANS LA PAGE. Avant, `/kiosk-config.json` le
+// servait en clair et la page le portait dans chaque appel. C'était fin — le fichier n'est servi
+// qu'en même origine — mais le secret vivait dans le DOM : une faille XSS du booth-client
+// l'exfiltrait, et il reste valable hors de la machine. Depuis le relais, le jeton ne quitte plus
+// les processus Node. Effet de bord : tout est en même origine, donc plus aucun CORS (BUG-020
+// devient sans objet sur ce chemin).
+// ⚠️ CE QUE ÇA NE CORRIGE PAS : une page compromise peut TOUJOURS appeler les actions système,
+// elle est dans la même origine. Le gain est « le secret n'est plus copiable », rien de plus.
+//
 // Node natif, aucune dépendance : se déploie avec `node server.mjs`.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
+import { Readable } from "node:stream";
 import { serveMedia } from "../lib/media.mjs";
 
 const HOST = "127.0.0.1";
@@ -117,6 +125,92 @@ function describeDeviceState(state) {
   }
 }
 
+/**
+ * Forme d'une route d'agent acceptée par le relais. Volontairement ÉTROITE : ce relais ajoute un
+ * privilège système (le jeton) à une requête venue de la page. Tout ce qui n'est pas une suite de
+ * segments alphanumériques est refusé — pas d'échappement, pas de `..`, pas de `//`, pas de
+ * changement de schéma. On rejette la forme inattendue plutôt que d'essayer de l'assainir.
+ * ⚠️ Cette contrainte s'applique au CHEMIN seul ; la query string est recopiée telle quelle.
+ */
+const AGENT_PATH_RE = /^\/[a-z0-9]+(?:[/-][a-z0-9]+)*$/;
+
+/** Corps de requête accepté par le relais. Au-delà, on coupe : rien de légitime n'est si gros. */
+const MAX_RELAY_BODY = 4 * 1024 * 1024;
+
+function relayError(res, status, message) {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify({ error: message }));
+}
+
+/** Lit le corps d'une requête, borné. Renvoie `null` si le plafond est dépassé. */
+async function readBody(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_RELAY_BODY) return null;
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Relaie un appel de la page vers l'agent local en injectant le jeton (CIN-128).
+ *
+ * ⚠️ AUCUN en-tête du client n'est transmis. Ni `authorization` (on impose le nôtre — une page ne
+ * doit pas pouvoir proposer un autre jeton), ni le reste (pas de contrebande d'en-têtes vers un
+ * processus privilégié). Seul `content-type` est reposé, et seulement en `application/json` :
+ * c'est aussi ce qui force un préflight CORS sur toute tentative venue d'une autre origine, donc
+ * ce qui empêche une page tierce de déclencher une action système en aveugle.
+ */
+async function relayToAgent(req, res, route) {
+  const token = agentToken();
+  if (!token) return relayError(res, 503, "agent indisponible sur cette borne");
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.writeHead(405, { allow: "GET, POST" });
+    res.end();
+    return;
+  }
+  const path = route === "" ? "/" : route;
+  if (!AGENT_PATH_RE.test(path)) return relayError(res, 404, "route inconnue");
+  if (req.method === "POST") {
+    const ctype = String(req.headers["content-type"] ?? "");
+    if (!ctype.startsWith("application/json")) return relayError(res, 415, "corps JSON attendu");
+  }
+
+  let body;
+  if (req.method === "POST") {
+    body = await readBody(req);
+    if (body === null) return relayError(res, 413, "corps trop volumineux");
+  }
+
+  const query = (req.url ?? "").includes("?") ? (req.url ?? "").slice((req.url ?? "").indexOf("?")) : "";
+  const headers = { authorization: `Bearer ${token}` };
+  if (req.method === "POST") headers["content-type"] = "application/json";
+
+  let upstream;
+  try {
+    upstream = await fetch(`${AGENT_URL}${path}${query}`, { method: req.method, headers, body });
+  } catch (e) {
+    // L'agent est arrêté / en train de redémarrer : c'est un fait NORMAL sur une borne, pas une
+    // erreur du serveur web. 502 le dit, et le message reste sans détail d'implémentation.
+    console.warn(`[web] relais agent injoignable (${path}) : ${e && e.message}`);
+    return relayError(res, 502, "agent injoignable");
+  }
+
+  // Statut et corps propagés tels quels : la page doit voir le refus de l'agent (401, 400…)
+  // exactement comme s'il lui répondait — sinon on lui ferait croire à un succès.
+  res.writeHead(upstream.status, {
+    "content-type": upstream.headers.get("content-type") ?? "application/json",
+    "cache-control": "no-store",
+  });
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  Readable.fromWeb(upstream.body).pipe(res);
+}
+
 // On NE refuse PAS de démarrer sur un device incomplet, et c'est délibéré : sans serveur local,
 // Chromium affiche une page d'erreur réseau du navigateur — illisible, non traduite, et surtout
 // elle emporte AUSSI le menu opérateur (Wi-Fi, réglages, redémarrage). Or c'est précisément par ce
@@ -140,28 +234,39 @@ const server = createServer(async (req, res) => {
       if (state.kind === "ok" || state.kind === "absent") console.info(line);
       else console.error(line);
     }
-    res.writeHead(token ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store" });
+    // ⚠️ 200 MÊME SANS JETON D'AGENT — correction d'un couplage dangereux (CIN-128). Avant, un
+    // jeton absent renvoyait 503, le client lisait `null`, et la borne se croyait alors sur un
+    // POSTE DE DÉVELOPPEMENT : pas de verrouillage kiosque, creds device ignorés, catalogue de
+    // démonstration. Un agent mal provisionné transformait donc une borne de production en borne
+    // de démo — la classe BUG-011/BUG-017, atteinte par un tout autre chemin. Le jeton de l'agent
+    // et l'identité de la borne sont deux faits INDÉPENDANTS : ils se répondent séparément.
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(
-      JSON.stringify(
-        token
-          ? {
-              agentUrl: AGENT_URL,
-              agentToken: token,
-              // `device` OU `deviceError` — jamais rien d'implicite : le client ne doit pas avoir à
-              // déduire d'une absence de champ s'il est sur un poste de dev ou sur une borne cassée.
-              ...(state.kind === "ok"
-                ? { device: state.device }
-                : {
-                    deviceError: {
-                      kind: state.kind,
-                      ...(state.missing ? { missing: state.missing } : {}),
-                      ...(state.reason ? { reason: state.reason } : {}),
-                    },
-                  }),
-            }
-          : { error: "jeton indisponible" },
-      ),
+      JSON.stringify({
+        // Le client appelle l'agent par ce préfixe, en MÊME ORIGINE. Aucun jeton ne descend ici.
+        agentBase: "/agent",
+        // `false` = relais inopérant (jeton absent) : le menu opérateur retombe sur ses stubs,
+        // mais la borne reste une borne (verrouillage, creds device, catalogue réel).
+        agentReady: Boolean(token),
+        // `device` OU `deviceError` — jamais rien d'implicite : le client ne doit pas avoir à
+        // déduire d'une absence de champ s'il est sur un poste de dev ou sur une borne cassée.
+        ...(state.kind === "ok"
+          ? { device: state.device }
+          : {
+              deviceError: {
+                kind: state.kind,
+                ...(state.missing ? { missing: state.missing } : {}),
+                ...(state.reason ? { reason: state.reason } : {}),
+              },
+            }),
+      }),
     );
+    return;
+  }
+
+  // Relais vers l'agent local (CIN-128) : `/agent/<route>` → `AGENT_URL/<route>`, jeton injecté ici.
+  if (path === "/agent" || path.startsWith("/agent/")) {
+    await relayToAgent(req, res, path.slice("/agent".length));
     return;
   }
 

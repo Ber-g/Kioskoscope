@@ -35,8 +35,13 @@ export interface KioskDeviceError {
 }
 
 export interface KioskConfig {
-  readonly agentUrl: string;
-  readonly agentToken: string;
+  /**
+   * Préfixe d'appel de l'agent, en MÊME ORIGINE (CIN-128). Le serveur local relaie et injecte
+   * le jeton lui-même : plus aucun secret ne descend dans la page, et il n'y a plus de CORS.
+   */
+  readonly agentBase: string;
+  /** `false` = pas de jeton sur la borne → le relais répondra 503. La borne reste une borne. */
+  readonly agentReady: boolean;
   /** Creds device, servis localement par la borne. Absent = build public inerte (mock). */
   readonly device?: KioskDeviceConfig;
   /** Renseigné dès que `device` manque : dit POURQUOI. Toujours présent si `device` est absent. */
@@ -78,40 +83,61 @@ export function normalizeDeviceError(raw: unknown, hadDeviceBlock: boolean): Kio
   };
 }
 
-/** Charge la config locale de la borne (jeton + creds device, hors bundle). null = pas de borne (dev). */
+/**
+ * Interprète la réponse de `/kiosk-config.json`. PURE (testée sans réseau).
+ *
+ * `null` = on n'est PAS sur une borne (dev navigateur : le fichier n'existe pas). Tout le reste
+ * de l'application en dépend — verrouillage kiosque, creds device, catalogue réel — d'où la
+ * règle : ne renvoyer `null` que lorsque la réponse ne ressemble pas du tout à une borne.
+ *
+ * ⚠️ Un serveur local ANTÉRIEUR à CIN-128 sert `agentUrl` + `agentToken` et ignore `agentBase`.
+ * On le reconnaît et on le traite comme une borne SANS relais (`agentReady: false`) plutôt que
+ * comme un poste de dev : mieux vaut une borne dont le menu opérateur retombe sur ses stubs
+ * qu'une borne de production qui se croit en bac à sable. Le jeton qu'il envoie est IGNORÉ — on
+ * ne le recopie nulle part, c'est tout l'objet du ticket.
+ */
+export function parseKioskConfig(raw: unknown): KioskConfig | null {
+  const cfg = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const modern = typeof cfg.agentBase === "string" && cfg.agentBase.startsWith("/");
+  const legacy = typeof cfg.agentUrl === "string";
+  if (!modern && !legacy) return null;
+  const device = parseDevice(cfg.device);
+  return {
+    agentBase: modern ? String(cfg.agentBase) : "/agent",
+    agentReady: modern ? cfg.agentReady === true : false,
+    ...(device ? { device } : { deviceError: normalizeDeviceError(cfg.deviceError, cfg.device !== undefined) }),
+  };
+}
+
+/** Charge la config locale de la borne (creds device + relais agent). null = pas de borne (dev). */
 export async function loadKioskConfig(): Promise<KioskConfig | null> {
   try {
     const res = await fetch("/kiosk-config.json", { cache: "no-store" });
     if (!res.ok) return null;
-    const cfg = (await res.json()) as Record<string, unknown>;
-    if (typeof cfg.agentUrl === "string" && typeof cfg.agentToken === "string") {
-      const device = parseDevice(cfg.device);
-      return device
-        ? { agentUrl: cfg.agentUrl, agentToken: cfg.agentToken, device }
-        : {
-            agentUrl: cfg.agentUrl,
-            agentToken: cfg.agentToken,
-            deviceError: normalizeDeviceError(cfg.deviceError, cfg.device !== undefined),
-          };
-    }
-    return null;
+    return parseKioskConfig(await res.json());
   } catch {
     return null;
   }
 }
 
-/** Appelle l'agent local avec le jeton Bearer. Lève en cas d'erreur réseau/HTTP. */
+/**
+ * Appelle l'agent local À TRAVERS le serveur local (CIN-128). Lève en cas d'erreur réseau/HTTP.
+ *
+ * Cette classe ne connaît AUCUN secret : c'est le serveur local qui pose le jeton. Une faille XSS
+ * dans le booth-client peut donc déclencher les mêmes actions (même origine), mais elle ne repart
+ * avec rien de réutilisable ailleurs. Ne pas vendre ce gain pour plus qu'il n'est.
+ */
 export class KioskAgentClient {
   constructor(private readonly cfg: KioskConfig) {}
 
   private async call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
-    const headers: Record<string, string> = { authorization: `Bearer ${this.cfg.agentToken}` };
+    const headers: Record<string, string> = {};
     const init: RequestInit = { method, headers };
     if (method === "POST") {
       headers["content-type"] = "application/json";
       init.body = JSON.stringify(body ?? {});
     }
-    const res = await fetch(`${this.cfg.agentUrl}${path}`, init);
+    const res = await fetch(`${this.cfg.agentBase}${path}`, init);
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok) throw new Error((data.error as string) ?? `agent ${res.status}`);
     return data as T;

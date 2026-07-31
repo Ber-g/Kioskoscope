@@ -54,7 +54,13 @@ async function main(): Promise<void> {
   if (kioskConfig) enableKioskLockdown();
   // Agent local : créé ICI (et non plus au moment du menu opérateur) parce que le catalogue en a
   // besoin dès le boot — c'est lui qui sait ce qu'il y a sur le disque. Une seule instance, réutilisée.
-  const agent = kioskConfig ? new KioskAgentClient(kioskConfig) : null;
+  // CIN-128 : le client d'agent n'existe que si le RELAIS est opérationnel (jeton présent côté
+  // serveur local). Une borne sans jeton reste une borne — verrouillage et creds device inchangés,
+  // seul le menu opérateur retombe sur ses stubs. Ces deux faits sont désormais indépendants.
+  const agent = kioskConfig?.agentReady ? new KioskAgentClient(kioskConfig) : null;
+  if (kioskConfig && !kioskConfig.agentReady) {
+    console.error("[kiosk] agent local indisponible (jeton absent) — réglages système inopérants, borne néanmoins active.");
+  }
   /**
    * Médias présents sur le DISQUE de la borne (CIN-112 lot 1). Relu à chaque rafraîchissement :
    * un média approvisionné pendant la journée devient jouable sans redémarrer la borne.
@@ -145,9 +151,15 @@ async function main(): Promise<void> {
     showBoothStatus({
       level: "fault",
       title: refused ? "Borne refusée" : "Borne non rattachée",
+      // CIN-129 : ce message ENVOYAIT VERS UN ÉCRAN QUI N'EXISTE PAS. Mesuré le 2026-07-31 —
+      // `device_user_id` n'apparaît nulle part dans `admin-dashboard/src`. Le rattachement est,
+      // par conception, une opération de PROVISIONNEMENT de flotte (recette R1, en SQL), et non
+      // une action d'exploitant : autoriser une org à rattacher un compte device arbitraire à
+      // une borne serait une porte d'escalade entre organisations. Le message dit donc ce qui est
+      // vrai — une panne de provisionnement, à traiter par celui qui provisionne.
       detail: refused
         ? "Le serveur a rejeté les identifiants de cette borne. Aucune séance ne peut être proposée tant que le provisionnement n'est pas refait."
-        : "Le compte de cette borne n'est rattaché à aucune borne enregistrée. Rattachez-la dans le back-office (Maintenance), puis redémarrez.",
+        : "Le compte de cette borne n'est rattaché à aucune borne enregistrée. C'est une erreur de provisionnement : contactez le support, cette borne ne peut pas se réparer seule.",
       // Noms d'états seulement — jamais un identifiant ni un fragment de secret (F17).
       code: `device · ${initResult.reason}`,
     });

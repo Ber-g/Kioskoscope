@@ -8,7 +8,7 @@ import { RuleBasedRecommender } from "../src/reco/RuleBasedRecommender";
 import type { RecoContext } from "../src/reco/Recommender";
 import { SessionManager } from "../src/session/SessionManager";
 import { FACTICE_CATALOG, auditCatalog, localMediaUrl, type CatalogEntry } from "../src/domain/catalog";
-import { normalizeDeviceError, normalizeMediaLibrary } from "../src/setup/kioskAgent";
+import { normalizeDeviceError, normalizeMediaLibrary, parseKioskConfig } from "../src/setup/kioskAgent";
 import { restoreOfflineCatalog, describeOfflineCatalog } from "../src/domain/offlineCatalog";
 import { reconcileDeviceIdentity } from "../src/domain/deviceIdentity";
 import type { Film, Play } from "../src/domain/types";
@@ -440,6 +440,47 @@ function testDeviceError(): void {
     assert(normalizeDeviceError(null, true).kind === "incomplete", "null + device refusé → incomplete");
     assert(normalizeDeviceError("bonjour", false).kind === "absent", "chaîne → absent");
     assert(normalizeDeviceError({ missing: "orgId" }, true).missing === undefined, "missing non-tableau ignoré");
+  }
+
+  // ── Contrat de config de borne (CIN-128) ────────────────────────────────────
+  // Cette fonction décide d'UNE chose : « suis-je sur une borne ? ». S'en tromper ne se voit pas
+  // à l'écran — ça se voit en comptabilité, quand une borne de production a servi du catalogue de
+  // démonstration sans verrouillage. D'où le soin porté aux cas d'entre-deux.
+  const device = { boothId: "b1", orgId: "o1", deviceEmail: "d@k.local", devicePassword: "x" };
+
+  console.log("D8. Config moderne : relais annoncé, aucun jeton attendu");
+  {
+    const cfg = parseKioskConfig({ agentBase: "/agent", agentReady: true, device });
+    assert(cfg !== null, "config reconnue");
+    assert(cfg?.agentBase === "/agent", "préfixe de relais retenu");
+    assert(cfg?.agentReady === true, "relais opérationnel");
+    assert(cfg?.device?.boothId === "b1", "creds device transmis");
+    assert(!("agentToken" in (cfg as object)), "aucun jeton n'entre dans l'objet de config");
+  }
+
+  console.log("D9. Jeton absent côté serveur : c'est toujours une borne");
+  {
+    const cfg = parseKioskConfig({ agentBase: "/agent", agentReady: false, device });
+    assert(cfg !== null, "une borne sans jeton d'agent reste une borne (verrouillage, creds)");
+    assert(cfg?.agentReady === false, "…mais le relais est annoncé inopérant");
+  }
+
+  console.log("D10. Serveur local ANTÉRIEUR à CIN-128 : borne sans relais, jamais un poste de dev");
+  {
+    const cfg = parseKioskConfig({ agentUrl: "http://127.0.0.1:4599", agentToken: "secret-de-la-borne", device });
+    assert(cfg !== null, "ancien contrat reconnu comme borne");
+    assert(cfg?.agentReady === false, "pas de relais → menu opérateur en stubs");
+    assert(!JSON.stringify(cfg).includes("secret-de-la-borne"), "le jeton de l'ancien contrat est IGNORÉ, jamais recopié");
+  }
+
+  console.log("D11. Ce qui n'est pas une borne reste `null`");
+  {
+    assert(parseKioskConfig({}) === null, "objet vide → pas une borne");
+    assert(parseKioskConfig(null) === null, "null → pas une borne");
+    assert(parseKioskConfig("borne") === null, "chaîne → pas une borne");
+    assert(parseKioskConfig({ agentBase: "https://ailleurs.example/agent" }) === null, "préfixe non relatif refusé");
+    const broken = parseKioskConfig({ agentBase: "/agent", agentReady: true, device: { boothId: "b1" } });
+    assert(broken?.deviceError?.kind === "incomplete", "device partiel → erreur explicite, pas d'absence muette");
   }
 }
 
