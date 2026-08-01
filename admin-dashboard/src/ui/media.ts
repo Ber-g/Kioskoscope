@@ -7,6 +7,7 @@ import { openPreview } from "./preview";
 import { subtitleTracksPanel } from "./subtitles";
 import { videoVersionsPanel } from "./videoVersions";
 import { el } from "./dom";
+import { uploadProgressPanel } from "./uploadProgress";
 import { t } from "../i18n";
 
 // Page de gestion des médias (F8) + modale d'ajout/édition. CRUD sur Supabase,
@@ -473,21 +474,46 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
     showCodecHint(file.name);
     applyProbe(file);
     hashInfo.textContent = "Calcul de l'empreinte…";
-    void sha256Hex(file).then((h) => {
-      computedHash = h;
-      if (!title.value) title.value = file!.name.replace(/\.[^.]+$/, "");
-      hashInfo.textContent = `Empreinte : ${h.slice(0, 24)}…`;
-    });
+    // L'empreinte d'un film de plusieurs Go prend une minute : tant qu'elle n'est pas connue,
+    // « Ajouter » resterait à envoyer un fichier dont on ne sait pas encore s'il fait doublon,
+    // et sous quel nom le ranger. On désactive donc plutôt que de laisser cliquer dans le vide.
+    const hashing = file;
+    save.setAttribute("disabled", "true");
+    computedHash = "";
+    uploadPanel.reset();
+    void sha256Hex(file, (p) =>
+      uploadPanel.update({ phase: "hash", doneBytes: p.hashedBytes, totalBytes: p.totalBytes }),
+    ).then(
+      (h) => {
+        // Fichier changé entre-temps : cette empreinte ne décrit plus ce qui est à l'écran.
+        if (fileInput.files?.[0] !== hashing) return;
+        computedHash = h;
+        if (!title.value) title.value = hashing.name.replace(/\.[^.]+$/, "");
+        hashInfo.textContent = `Empreinte : ${h.slice(0, 24)}…`;
+        uploadPanel.reset();
+        save.removeAttribute("disabled");
+      },
+      (e: Error) => {
+        if (fileInput.files?.[0] !== hashing) return;
+        hashInfo.textContent = "";
+        uploadPanel.fail(`Le fichier n'a pas pu être lu en entier : ${e.message}`);
+      },
+    );
   });
 
   const error = el("div", { class: "alert alert-danger d-none" }, []);
   const save = el("button", { class: "btn btn-primary ms-auto", type: "button" }, [isNew ? "Ajouter" : "Enregistrer"]);
+  // Panneau partagé par les deux phases : l'empreinte à la sélection, l'envoi à l'enregistrement.
+  let uploadCancel = { aborted: false };
+  const uploadPanel = uploadProgressPanel(() => {
+    uploadCancel.aborted = true;
+  });
 
   const body = el("div", {}, [
     error,
     el("div", { class: "row" }, [
       ...(needsOrgChoice ? [field("Organisation", orgSelect)] : []),
-      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo, codecInfo])),
+      field("Fichier vidéo", el("div", {}, [fileInput, hashInfo, codecInfo, uploadPanel.node])),
       field("Titre", title),
       field("Réalisateur", director),
       field("Année", year),
@@ -572,6 +598,10 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
 
     save.setAttribute("disabled", "true");
     save.textContent = "Enregistrement…";
+    // Le fichier est verrouillé pendant l'envoi : le remplacer en cours de route enverrait des
+    // octets qui ne correspondent plus à l'empreinte déjà calculée — donc un objet rangé sous
+    // un nom qui ment sur son contenu.
+    if (file) fileInput.setAttribute("disabled", "true");
     const done = (res: { ok: boolean; error?: string }): void => {
       if (res.ok) {
         modal.hide();
@@ -580,10 +610,22 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
         error.textContent = res.error ?? "Erreur.";
         error.classList.remove("d-none");
         save.removeAttribute("disabled");
+        fileInput.removeAttribute("disabled");
         save.textContent = isNew ? "Ajouter" : "Enregistrer";
+        uploadPanel.fail(res.error ?? "Erreur.");
       }
     };
-    if (isNew) void store.addMedia(media, file).then(done);
+    if (isNew) {
+      uploadCancel = { aborted: false };
+      uploadPanel.reset();
+      void store
+        .addMedia(media, file, {
+          onProgress: uploadPanel.update,
+          signal: uploadCancel,
+          ...(file && computedHash ? { knownHash: computedHash } : {}),
+        })
+        .then(done);
+    }
     else void store.updateMedia(media).then(() => done({ ok: true }));
   });
 

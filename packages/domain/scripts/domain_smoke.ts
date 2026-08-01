@@ -25,6 +25,13 @@ import {
   PLAY_DECILES,
   type AccessEntry,
   type AccessTable,
+  Sha256Stream,
+  sha256HexOfRanges,
+  resumableUpload,
+  base64Utf8,
+  type UploadTransport,
+  type UploadResponse,
+  type UploadTarget,
 } from "../src/index";
 
 let passed = 0;
@@ -214,6 +221,382 @@ async function main(): Promise<void> {
     assert(judgeVideoCodec("vp09").verdict === "playable", "VP9 : verdict `playable`");
     assert(judgeVideoCodec("dvhe").verdict === "transcode", "Dolby Vision : verdict `transcode`");
     assert(judgeVideoCodec("zzzz").verdict === "unknown", "fourcc inconnu : `unknown`, on n'invente pas");
+  }
+
+  // ── 3. SHA-256 incrémental (CIN-101 verrou n°1) ────────────────────────────
+  // Le point à prouver n'est pas « l'empreinte est juste » (elle l'est ou le fichier est perdu),
+  // c'est « elle est juste SANS jamais tenir le fichier en mémoire ». Les deux se testent :
+  // l'exactitude contre les vecteurs FIPS et contre WebCrypto, la frugalité en comptant ce que
+  // le lecteur s'est vu réclamer.
+  {
+    const hexOf = (s: string): string => {
+      const h = new Sha256Stream();
+      h.update(new TextEncoder().encode(s));
+      return h.digestHex();
+    };
+
+    // Vecteurs publiés (FIPS 180-4 / NIST) — la référence qui ne dépend d'aucune implémentation.
+    assert(
+      hexOf("") === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "SHA-256 : vecteur NIST, message vide",
+    );
+    assert(
+      hexOf("abc") === "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "SHA-256 : vecteur NIST, « abc »",
+    );
+    assert(
+      hexOf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ===
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+      "SHA-256 : vecteur NIST, 448 bits (deux blocs)",
+    );
+    {
+      const h = new Sha256Stream();
+      const chunk = new TextEncoder().encode("a".repeat(1000));
+      for (let i = 0; i < 1000; i++) h.update(chunk);
+      assert(
+        h.digestHex() === "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        "SHA-256 : vecteur NIST, un million de « a » servi en 1000 tranches",
+      );
+    }
+
+    // Confrontation à WebCrypto sur les tailles qui encadrent le rembourrage (55/56/57 et 63/64/65
+    // sont exactement là où une implémentation fausse se trahit).
+    let boundaryOk = true;
+    for (const n of [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 1000]) {
+      const bytes = new Uint8Array(n);
+      for (let i = 0; i < n; i++) bytes[i] = (i * 31 + 7) & 0xff;
+      const ref = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const h = new Sha256Stream();
+      h.update(bytes);
+      if (h.digestHex() !== ref) boundaryOk = false;
+    }
+    assert(boundaryOk, "SHA-256 : identique à WebCrypto sur 13 tailles autour des bornes de bloc");
+
+    // Le découpage ne doit RIEN changer : c'est la propriété qui autorise le calcul par tranches.
+    {
+      const bytes = new Uint8Array(5000);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 17) & 0xff;
+      const oneShot = new Sha256Stream();
+      oneShot.update(bytes);
+      const expected = oneShot.digestHex();
+      let allSplitsOk = true;
+      for (const step of [1, 7, 63, 64, 65, 100, 4096]) {
+        const h = new Sha256Stream();
+        for (let o = 0; o < bytes.length; o += step) h.update(bytes.subarray(o, Math.min(o + step, bytes.length)));
+        if (h.digestHex() !== expected) allSplitsOk = false;
+      }
+      assert(allSplitsOk, "SHA-256 : 7 découpages différents donnent la même empreinte qu'un seul bloc");
+    }
+
+    // LA propriété de CIN-101 : hacher un « fichier » sans jamais en tenir plus d'une tranche.
+    {
+      const SIZE = 3_000_000;
+      let maxRequested = 0;
+      let totalRequested = 0;
+      const reader = {
+        size: SIZE,
+        async read(offset: number, length: number): Promise<Uint8Array> {
+          maxRequested = Math.max(maxRequested, length);
+          totalRequested += length;
+          const out = new Uint8Array(length);
+          for (let i = 0; i < length; i++) out[i] = (offset + i) & 0xff;
+          return out;
+        },
+      };
+      const whole = new Uint8Array(SIZE);
+      for (let i = 0; i < SIZE; i++) whole[i] = i & 0xff;
+      const ref = [...new Uint8Array(await crypto.subtle.digest("SHA-256", whole))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      const progress: number[] = [];
+      const got = await sha256HexOfRanges(reader, {
+        chunkBytes: 64 * 1024,
+        onProgress: (p) => progress.push(p.hashedBytes),
+      });
+      assert(got === ref, "sha256HexOfRanges : empreinte d'un fichier de 3 Mo lu par plages = WebCrypto");
+      assert(maxRequested <= 64 * 1024, `sha256HexOfRanges : jamais plus de 64 Ko réclamés d'un coup (max ${maxRequested})`);
+      assert(totalRequested === SIZE, "sha256HexOfRanges : chaque octet lu une seule fois, aucun relu");
+      assert(
+        progress[progress.length - 1] === SIZE && progress.every((v, i) => i === 0 || v >= progress[i - 1]!),
+        "sha256HexOfRanges : progression monotone et terminée à 100 %",
+      );
+    }
+
+    // Une empreinte à moitié calculée ne doit jamais sortir comme si elle était valide.
+    {
+      const reader = {
+        size: 1_000_000,
+        async read(_o: number, l: number): Promise<Uint8Array> {
+          return new Uint8Array(l);
+        },
+      };
+      const signal = { aborted: false };
+      const p = sha256HexOfRanges(reader, { chunkBytes: 1024, signal });
+      signal.aborted = true;
+      let name = "";
+      await p.catch((e: Error) => {
+        name = e.name;
+      });
+      assert(name === "AbortError", "sha256HexOfRanges : annulation → rejet AbortError, pas une empreinte partielle");
+    }
+
+    // Un lecteur qui rend 0 octet avant la fin ment sur la taille : refuser plutôt que boucler.
+    {
+      const reader = { size: 100, async read(): Promise<Uint8Array> { return new Uint8Array(0); } };
+      let threw = false;
+      await sha256HexOfRanges(reader).catch(() => { threw = true; });
+      assert(threw, "sha256HexOfRanges : lecture vide avant la fin → erreur, jamais une boucle sans fin");
+    }
+
+    // L'objet est scellé après lecture : réutiliser un état déjà digéré donnerait une empreinte fausse.
+    {
+      const h = new Sha256Stream();
+      h.update(new Uint8Array([1]));
+      h.digestHex();
+      let sealed = false;
+      try { h.update(new Uint8Array([2])); } catch { sealed = true; }
+      assert(sealed, "Sha256Stream : update() après digestHex() est refusé");
+    }
+  }
+
+  // ── 4. Envoi reprenable TUS (CIN-101 verrou n°2) ───────────────────────────
+  // Un serveur TUS de simulation : il tient l'objet en cours et l'offset, exactement comme le
+  // vrai. Il permet de provoquer ce qu'on ne peut pas provoquer à la demande en vrai — la coupure
+  // au mauvais moment, la réponse perdue, l'URL expirée.
+  {
+    interface FakeServer {
+      readonly stored: Map<string, Uint8Array>;
+      readonly transport: UploadTransport;
+      failNextPatches: number;
+      /** Simule une réponse PERDUE : le serveur écrit puis la réponse n'arrive pas. */
+      swallowNextResponse: boolean;
+      patchCount: number;
+      createCount: number;
+      sizeLimit: number;
+      expireAfterCreate: boolean;
+      seenTokens: string[];
+    }
+
+    const makeServer = (): FakeServer => {
+      const uploads = new Map<string, { data: Uint8Array; length: number; name: string }>();
+      let nextId = 1;
+      const srv: FakeServer = {
+        stored: new Map(),
+        failNextPatches: 0,
+        swallowNextResponse: false,
+        patchCount: 0,
+        createCount: 0,
+        sizeLimit: Number.MAX_SAFE_INTEGER,
+        expireAfterCreate: false,
+        seenTokens: [],
+        transport: async (req): Promise<UploadResponse> => {
+          const token = (req.headers["authorization"] ?? "").replace("Bearer ", "");
+          srv.seenTokens.push(token);
+          const none = { status: 0, headers: {}, body: "" };
+          if (req.method === "POST") {
+            srv.createCount += 1;
+            const meta = req.headers["upload-metadata"] ?? "";
+            const nameB64 = /objectName ([^,]+)/.exec(meta)?.[1] ?? "";
+            const name = new TextDecoder().decode(
+              Uint8Array.from(Buffer.from(nameB64, "base64")),
+            );
+            const length = Number(req.headers["upload-length"]);
+            if (length > srv.sizeLimit) return { status: 413, headers: {}, body: "Maximum size exceeded" };
+            if (name.startsWith("00000000")) return { status: 403, headers: {}, body: "row-level security" };
+            const id = `https://fake/upload/${nextId++}`;
+            uploads.set(id, { data: new Uint8Array(0), length, name });
+            return { status: 201, headers: { location: id }, body: "" };
+          }
+          const up = uploads.get(req.url);
+          if (!up || srv.expireAfterCreate) return { status: 404, headers: {}, body: "not found" };
+          if (req.method === "HEAD") {
+            return { status: 200, headers: { "upload-offset": String(up.data.length) }, body: "" };
+          }
+          if (req.method === "PATCH") {
+            srv.patchCount += 1;
+            if (srv.failNextPatches > 0) {
+              srv.failNextPatches -= 1;
+              throw new Error("réseau coupé");
+            }
+            const at = Number(req.headers["upload-offset"]);
+            if (at !== up.data.length) return { status: 409, headers: {}, body: "offset mismatch" };
+            const merged = new Uint8Array(up.data.length + (req.body?.length ?? 0));
+            merged.set(up.data, 0);
+            if (req.body) merged.set(req.body, up.data.length);
+            up.data = merged;
+            if (up.data.length >= up.length) srv.stored.set(up.name, up.data);
+            if (srv.swallowNextResponse) {
+              srv.swallowNextResponse = false;
+              throw new Error("réponse perdue en route");
+            }
+            return { status: 204, headers: { "upload-offset": String(up.data.length) }, body: "" };
+          }
+          return none;
+        },
+      };
+      return srv;
+    };
+
+    const SIZE = 500_000;
+    const payload = new Uint8Array(SIZE);
+    for (let i = 0; i < SIZE; i++) payload[i] = (i * 13) & 0xff;
+    const reader = {
+      size: SIZE,
+      async read(offset: number, length: number): Promise<Uint8Array> {
+        return payload.subarray(offset, offset + length);
+      },
+    };
+    const target = (name = "org-a/film"): UploadTarget => ({
+      createUrl: "https://fake/upload/resumable",
+      bucket: "media",
+      objectName: name,
+      contentType: "video/mp4",
+      authToken: () => "jeton-1",
+      upsert: false,
+    });
+    const sameBytes = (a: Uint8Array | undefined, b: Uint8Array): boolean =>
+      a !== undefined && a.length === b.length && a.every((v, i) => v === b[i]);
+    const noSleep = async (): Promise<void> => {};
+
+    // Cas nominal : l'objet arrive entier, octet pour octet.
+    {
+      const srv = makeServer();
+      const seen: number[] = [];
+      const out = await resumableUpload(reader, target(), srv.transport, {
+        chunkBytes: 64_000,
+        onProgress: (p) => seen.push(p.sentBytes),
+        sleep: noSleep,
+      });
+      assert(out.ok && out.sentBytes === SIZE, "envoi TUS : cas nominal terminé");
+      assert(sameBytes(srv.stored.get("org-a/film"), payload), "envoi TUS : l'objet stocké est identique à la source");
+      assert(seen[seen.length - 1] === SIZE, "envoi TUS : la progression finit à 100 %");
+    }
+
+    // Le Wi-Fi tombe : trois PATCH échouent, puis ça repart. Aucun octet dupliqué ni perdu.
+    {
+      const srv = makeServer();
+      srv.failNextPatches = 3;
+      const out = await resumableUpload(reader, target(), srv.transport, { chunkBytes: 64_000, sleep: noSleep });
+      assert(out.ok, "envoi TUS : 3 coupures réseau consécutives sont absorbées");
+      assert(sameBytes(srv.stored.get("org-a/film"), payload), "envoi TUS : après coupure, l'objet reste exact");
+    }
+
+    // LE piège : le serveur a ÉCRIT la tranche mais la réponse s'est perdue. Reprendre à l'offset
+    // qu'on croit avoir dupliquerait des octets au milieu du fichier. On relit donc l'offret serveur.
+    {
+      const srv = makeServer();
+      srv.swallowNextResponse = true;
+      const out = await resumableUpload(reader, target(), srv.transport, { chunkBytes: 64_000, sleep: noSleep });
+      assert(out.ok, "envoi TUS : une réponse perdue n'empêche pas la fin de l'envoi");
+      assert(
+        sameBytes(srv.stored.get("org-a/film"), payload),
+        "envoi TUS : réponse perdue → l'offset est relu au serveur, AUCUN octet dupliqué",
+      );
+    }
+
+    // Onglet fermé à 80 % : on garde l'URL, on relance plus tard, ça reprend où le serveur en est.
+    {
+      const srv = makeServer();
+      let url: string | null = null;
+      const signal = { aborted: false };
+      let sent = 0;
+      const first = await resumableUpload(reader, target(), srv.transport, {
+        chunkBytes: 50_000,
+        sleep: noSleep,
+        signal,
+        onUploadUrl: (u) => { url = u; },
+        onProgress: (p) => {
+          sent = p.sentBytes;
+          if (p.sentBytes >= 300_000) signal.aborted = true; // l'onglet se ferme
+        },
+      });
+      assert(!first.ok && first.reason === "aborted", "envoi TUS : fermeture à mi-course → `aborted`");
+      assert(!first.ok && first.confirmedBytes === sent && sent > 0, "envoi TUS : l'interruption annonce les octets RÉELLEMENT reçus");
+      assert(url !== null, "envoi TUS : l'URL de reprise a été signalée dès la création");
+
+      const createsBefore = srv.createCount;
+      const second = await resumableUpload(reader, target(), srv.transport, {
+        chunkBytes: 50_000,
+        sleep: noSleep,
+        resumeUrl: url,
+      });
+      assert(second.ok && second.resumed, "envoi TUS : la reprise repart de l'envoi existant");
+      assert(srv.createCount === createsBefore, "envoi TUS : reprendre ne recrée PAS un envoi (rien n'est réémis depuis zéro)");
+      assert(sameBytes(srv.stored.get("org-a/film"), payload), "envoi TUS : après reprise, l'objet est complet et exact");
+    }
+
+    // Une reprise dont l'URL a expiré doit le DIRE, pas repartir de zéro en silence.
+    {
+      const srv = makeServer();
+      srv.expireAfterCreate = true;
+      const out = await resumableUpload(reader, target(), srv.transport, {
+        chunkBytes: 64_000,
+        sleep: noSleep,
+        resumeUrl: "https://fake/upload/disparu",
+      });
+      assert(!out.ok && out.reason === "expired", "envoi TUS : URL de reprise périmée → `expired`, jamais un redémarrage muet");
+    }
+
+    // Le plafond de taille est refusé À LA CRÉATION : aucun octet ne part inutilement.
+    {
+      const srv = makeServer();
+      srv.sizeLimit = 52_428_800; // le plafond réellement mesuré sur le projet
+      const bigReader = { size: 6 * 1024 ** 3, async read(): Promise<Uint8Array> { return new Uint8Array(1); } };
+      const out = await resumableUpload(bigReader, target(), srv.transport, { sleep: noSleep });
+      assert(!out.ok && out.reason === "too-large", "envoi TUS : 6 Go contre un plafond de 50 Mio → `too-large`");
+      assert(srv.patchCount === 0, "envoi TUS : refus de taille → PAS un seul octet émis");
+    }
+
+    // L'isolation : un chemin d'une autre org est refusé, et l'échec est nommé pour ce qu'il est.
+    {
+      const srv = makeServer();
+      const out = await resumableUpload(reader, target("00000000-0000-0000-0000-000000000000/film"), srv.transport, { sleep: noSleep });
+      assert(!out.ok && out.reason === "forbidden", "envoi TUS : chemin d'une autre org → `forbidden` (RLS storage)");
+    }
+
+    // Le fichier bouge sur le disque pendant l'envoi : on ne prétend pas avoir envoyé un film.
+    {
+      const srv = makeServer();
+      let reads = 0;
+      const flaky = {
+        size: SIZE,
+        async read(offset: number, length: number): Promise<Uint8Array> {
+          if (++reads > 2) throw new DOMException?.("file changed", "NotReadableError") ?? new Error("file changed");
+          return payload.subarray(offset, offset + length);
+        },
+      };
+      const out = await resumableUpload(flaky, target(), srv.transport, { chunkBytes: 64_000, sleep: noSleep });
+      assert(!out.ok && out.reason === "source-changed", "envoi TUS : fichier modifié en cours → `source-changed`");
+      assert(!out.ok && out.confirmedBytes < SIZE, "envoi TUS : fichier modifié → on n'annonce pas un envoi complet");
+    }
+
+    // Le réseau ne revient jamais : on rend la main en disant ce que le serveur détient.
+    {
+      const srv = makeServer();
+      srv.failNextPatches = 99;
+      const out = await resumableUpload(reader, target(), srv.transport, {
+        chunkBytes: 64_000,
+        sleep: noSleep,
+        retryDelaysMs: [1, 1],
+      });
+      assert(!out.ok && out.reason === "network", "envoi TUS : réseau définitivement absent → `network` après les tentatives");
+      assert(!out.ok && out.uploadUrl !== null, "envoi TUS : l'URL de reprise est rendue même en échec (l'envoi reste reprenable)");
+    }
+
+    // Le jeton est relu à chaque requête : un envoi long survit à une rotation de session.
+    {
+      const srv = makeServer();
+      let n = 0;
+      const rotating: UploadTarget = { ...target(), authToken: () => `jeton-${++n}` };
+      await resumableUpload(reader, rotating, srv.transport, { chunkBytes: 100_000, sleep: noSleep });
+      assert(new Set(srv.seenTokens).size > 1, "envoi TUS : le jeton est relu à chaque requête, pas figé à la création");
+    }
+
+    assert(base64Utf8("média/été") === "bcOpZGlhL8OpdMOp", "base64Utf8 : les accents passent (btoa échouerait)");
+    assert(base64Utf8("a") === "YQ==" && base64Utf8("ab") === "YWI=", "base64Utf8 : rembourrage correct");
   }
 
   console.log(`\n—— ${passed}/${passed + failed} assertions OK ——`);

@@ -653,3 +653,27 @@ export function videoPlayabilityHint(filename: string): VideoPlayabilityHint {
 // qui resterait noir en cabine. Ré-exporté ici pour que les applications n'aient qu'une porte.
 export { probeMp4, judgeVideoCodec } from "./mp4";
 export type { ByteRangeReader, Mp4Probe, CodecVerdict, CodecJudgement } from "./mp4";
+
+// ── Téléversement de gros fichiers (CIN-101) ─────────────────────────────────
+// Deux briques, un même principe : le fichier n'entre JAMAIS en mémoire d'un bloc. Il est lu par
+// plages via le `ByteRangeReader` ci-dessus — celui-là même qui lit 424 octets d'un fichier de
+// 6 Go pour le probe de codec. L'empreinte se calcule tranche par tranche, l'envoi se pousse
+// tranche par tranche, et le serveur reste seul juge de ce qu'il détient.
+export { Sha256Stream, sha256HexOfRanges, HASH_CHUNK_BYTES } from "./sha256";
+export type { HashProgress, HashOptions } from "./sha256";
+export {
+  resumableUpload,
+  base64Utf8,
+  TUS_VERSION,
+  UPLOAD_CHUNK_BYTES,
+  RETRY_DELAYS_MS,
+} from "./resumableUpload";
+export type {
+  UploadTransport,
+  UploadTarget,
+  UploadProgress,
+  UploadFailure,
+  UploadOutcome,
+  UploadOptions,
+  UploadResponse,
+} from "./resumableUpload";

@@ -14,6 +14,10 @@ const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
 export const isSupabaseConfigured: boolean = Boolean(url && anonKey);
 
+/** URL du projet — nécessaire pour parler au endpoint d'envoi reprenable (CIN-101), qui n'est
+ *  pas exposé par le SDK : `storage.upload()` est un POST unique, sans reprise ni progression. */
+export const supabaseUrl: string | null = url ?? null;
+
 export const supabase: SupabaseClient | null = isSupabaseConfigured
   ? createClient(url as string, anonKey as string)
   : null;

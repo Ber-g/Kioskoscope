@@ -390,8 +390,8 @@ export class App {
    *
    * Administrer un CLIENT depuis le roster ouvre techniquement la vue `settings`, et le menu
    * surlignait donc « Mon organisation » alors qu'on administre celle de quelqu'un d'autre.
-   * Constat de Beranger sur CIN-084 : *« quand on clique sur une org on entre dans le menu "mon
-   * org", c'est pas hyper clair »*. Il a raison, et c'est un défaut de vocabulaire, pas de goût :
+   * Constat de session sur CIN-084 : *« quand on clique sur une org on entre dans le menu "mon
+   * org", c'est pas hyper clair »*. C'est juste, et c'est un défaut de vocabulaire, pas de goût :
    * ces deux mots ont été séparés exprès en CIN-091, le menu les reconfondait.
    *
    * L'URL tranchait déjà — `#/organizations/<id>` et non `#/settings` (CIN-118). Le menu s'aligne

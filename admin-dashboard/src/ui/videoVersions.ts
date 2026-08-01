@@ -4,6 +4,7 @@ import { el, icon, toast } from "./dom";
 import { COMMON_LANGS, existingAmbiguities, langLabel, langWarnings } from "./trackLang";
 import { judgeVideoCodec, probeMp4, videoPlayabilityHint } from "@kioskoscope/domain";
 import { fileByteReader } from "../data/hash";
+import { uploadProgressPanel } from "./uploadProgress";
 
 // Tableau des VERSIONS VIDÉO d'un média (CIN-095) — pendant exact du tableau des sous-titres.
 //
@@ -186,27 +187,51 @@ export function videoVersionsPanel(store: FleetStore, media: Media, onChanged: (
       });
       refreshHint();
 
+      // Envoi reprenable avec progression (CIN-101). Le drapeau d'annulation est lu par le
+      // moteur d'envoi entre deux tranches : l'arrêt est donc effectif en quelques secondes,
+      // et il annonce les octets que le serveur a réellement confirmés.
+      let cancelFlag = { aborted: false };
+      const progress = uploadProgressPanel(() => {
+        cancelFlag.aborted = true;
+      });
+
       submit.addEventListener("click", () => {
         const lang = langInput.value.trim().toLowerCase();
         const file = fileInput.files?.[0];
         if (!lang) return toast("Indiquez la langue de la version (ex. en).", "error");
         if (!file) return toast("Choisissez un fichier vidéo.", "error");
+        // Le formulaire est verrouillé pendant l'envoi : changer de langue ou de fichier en
+        // cours de route enverrait le nouveau fichier sous l'ancien nom.
         submit.setAttribute("disabled", "true");
-        // ⚠️ Téléversement en un seul bloc, sans progression ni reprise (CIN-101 non fait) :
-        // acceptable sur des fichiers légers, à revoir avant tout catalogue réel volumineux.
+        fileInput.setAttribute("disabled", "true");
+        langInput.setAttribute("disabled", "true");
         submit.textContent = "Envoi en cours…";
-        void store.saveMediaVideo(media, lang, file).then((res) => {
-          if (res.ok) {
-            toast(`Version ${langLabel(lang)} envoyée ✓`);
-            addOpen = false;
-            render();
-            onChanged();
-          } else {
-            submit.removeAttribute("disabled");
-            submit.textContent = "Envoyer";
-            toast(res.error ?? "Échec de l'envoi.", "error");
-          }
-        });
+        cancelFlag = { aborted: false };
+        progress.reset();
+
+        const unlock = (): void => {
+          submit.removeAttribute("disabled");
+          fileInput.removeAttribute("disabled");
+          langInput.removeAttribute("disabled");
+          submit.textContent = "Envoyer";
+        };
+
+        void store
+          .saveMediaVideo(media, lang, file, { onProgress: progress.update, signal: cancelFlag })
+          .then((res) => {
+            if (res.ok) {
+              toast(`Version ${langLabel(lang)} envoyée ✓`);
+              addOpen = false;
+              render();
+              onChanged();
+            } else {
+              unlock();
+              // Le message reste SOUS la barre, à côté du chiffre qu'il commente : un toast
+              // disparaît, et avec lui l'information qui dit s'il faut tout recommencer.
+              progress.fail(res.error ?? "Échec de l'envoi.");
+              toast(res.error ?? "Échec de l'envoi.", "error");
+            }
+          });
       });
 
       form.replaceChildren(
@@ -217,6 +242,7 @@ export function videoVersionsPanel(store: FleetStore, media: Media, onChanged: (
           el("div", { class: "align-self-end" }, [submit]),
         ]),
         hint,
+        progress.node,
       );
     }
 

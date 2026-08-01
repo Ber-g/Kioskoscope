@@ -3,7 +3,22 @@ import { MOCK_BOOTHS, MOCK_MEMBERSHIPS, MOCK_ORGS, MOCK_USERS } from "./mockFlee
 import { isSupabaseConfigured, supabase } from "./supabase";
 import { boothToRow, mediaToRow, rowToBooth, rowToMedia, rowToMediaInstance, rowToStorageLocation, rowToTransaction, type TransactionRecord } from "./mappers";
 import { sha256Hex } from "./hash";
+import { uploadFileResumable, uploadFailureMessage } from "./upload";
 import { buildAccessEntry, type OperatorRole, type OrgStyle, type OrgStyleAssets, type OrgStyleFonts, type OrgStylePalette } from "@kioskoscope/domain";
+
+/**
+ * Avancement d'un téléversement, tel qu'il doit être MONTRÉ (CIN-101).
+ *
+ * Deux phases, et il faut les distinguer à l'écran : le hachage est borné par le processeur et
+ * ne consomme pas de réseau, l'émission est bornée par le réseau. Les confondre dans une seule
+ * barre ferait passer une minute de calcul local pour un envoi qui n'avance pas — c'est
+ * exactement l'irritant remonté le 2026-07-28 (« on attend sans savoir où on en est »).
+ */
+export interface MediaUploadProgress {
+  readonly phase: "hash" | "upload";
+  readonly doneBytes: number;
+  readonly totalBytes: number;
+}
 
 /** Accès opérateur cabine (CIN-073) — vue back-office (jamais le PIN, seulement méta). */
 export interface OperatorAccessRecord {
@@ -1290,12 +1305,45 @@ export class FleetStore {
   }
 
   /**
+   * L'objet existe-t-il déjà dans le bucket ? Sert au dedup : le chemin étant l'empreinte du
+   * contenu, un objet présent a forcément des octets IDENTIQUES — le renvoyer serait pousser
+   * six gigaoctets pour rien.
+   */
+  private async mediaObjectExists(path: string): Promise<boolean> {
+    const cut = path.lastIndexOf("/");
+    const folder = path.slice(0, cut);
+    const name = path.slice(cut + 1);
+    const { data, error } = await supabase!.storage.from("media").list(folder, { search: name, limit: 100 });
+    if (error) return false;
+    return (data ?? []).some((o) => o.name === name);
+  }
+
+  /**
    * Ajoute un média. Si un fichier est fourni, calcule son SHA-256 (dedup +
    * intégrité) et le téléverse (Supabase Storage). Le doublon est refusé par la
    * base (`unique(organization_id, content_hash)`) → message clair.
+   *
+   * ⚠️ L'envoi est REPRENABLE (CIN-101) : le fichier n'entre jamais en mémoire d'un bloc, ni
+   * pour le hachage ni pour l'émission, et une coupure ne fait pas reperdre ce qui est parti.
    */
-  async addMedia(input: Media, file: File | null): Promise<{ ok: boolean; error?: string }> {
-    const contentHash = file ? await sha256Hex(file) : input.contentHash;
+  async addMedia(
+    input: Media,
+    file: File | null,
+    options: {
+      onProgress?: (p: MediaUploadProgress) => void;
+      signal?: { readonly aborted: boolean };
+      /** Empreinte DÉJÀ calculée pour ce fichier exact (l'écran la calcule à la sélection, pour
+       *  afficher le doublon avant l'envoi). La refaire ici coûterait une minute pleine sur un
+       *  film de 6 Go, pour un résultat identique. */
+      knownHash?: string;
+    } = {},
+  ): Promise<{ ok: boolean; error?: string }> {
+    const contentHash = !file
+      ? input.contentHash
+      : (options.knownHash ??
+        (await sha256Hex(file, (p) =>
+          options.onProgress?.({ phase: "hash", doneBytes: p.hashedBytes, totalBytes: p.totalBytes }),
+        )));
 
     if (this.mode === "mock") {
       if (this.media.some((m) => m.organizationId === input.organizationId && m.contentHash === contentHash)) {
@@ -1309,9 +1357,19 @@ export class FleetStore {
     let storageUrl = input.storageUrl;
     if (file) {
       const path = `${input.organizationId}/${contentHash}`;
-      const up = await supabase!.storage.from("media").upload(path, file, { upsert: false });
-      if (up.error && !/already exists/i.test(up.error.message)) {
-        return { ok: false, error: `Téléversement échoué : ${up.error.message}` };
+      // Le chemin EST l'empreinte : un objet déjà présent a des octets identiques, il n'y a
+      // rien à réémettre. C'est ce qui rend un doublon gratuit au lieu de coûteux.
+      if (await this.mediaObjectExists(path)) {
+        options.onProgress?.({ phase: "upload", doneBytes: file.size, totalBytes: file.size });
+      } else {
+        const outcome = await uploadFileResumable(file, path, {
+          contentType: file.type || "video/mp4",
+          ...(options.onProgress
+            ? { onProgress: (p) => options.onProgress?.({ phase: "upload", doneBytes: p.sentBytes, totalBytes: p.totalBytes }) }
+            : {}),
+          ...(options.signal ? { signal: options.signal } : {}),
+        });
+        if (!outcome.ok) return { ok: false, error: uploadFailureMessage(outcome, file) };
       }
       storageUrl = path;
     }
@@ -1930,25 +1988,59 @@ export class FleetStore {
    *
    * La PREMIÈRE version d'un média devient automatiquement primaire : un média dont aucune
    * version n'est servie serait injouable en cabine sans que rien ne le signale.
-   * Chemin storage `{org}/{hash}/video/{lang}` → couvert par les policies d'isolation existantes
-   * (1er segment = org), au même titre que la vidéo principale et les sous-titres.
+   * Chemin storage `{org}/{hash}/video/{lang}/{empreinte}` → couvert par les policies
+   * d'isolation existantes (1er segment = org), au même titre que la vidéo principale.
+   *
+   * ⚠️ L'ORDRE A ÉTÉ INVERSÉ (CIN-101). Cette fonction faisait `remove(path)` PUIS `upload(path)`,
+   * parce que le bucket `0003` n'a pas de policy UPDATE et qu'on ne peut donc pas écraser en
+   * place. Conséquence : entre les deux, le fichier servi au public N'EXISTAIT PLUS, alors que
+   * la ligne continuait de le désigner. Sur un fichier de quelques Mo la fenêtre durait une
+   * seconde ; sur un film de 6 Go envoyé en reprenable, elle dure des DIZAINES DE MINUTES —
+   * pendant lesquelles toute cabine demandant ce film tombe sur du vide. Et si l'envoi échoue,
+   * la fenêtre ne se referme jamais.
+   *
+   * Le remède est celui déjà posé pour les suppressions, appliqué à l'écriture : le nouveau
+   * fichier va à un chemin NEUF (l'empreinte de son contenu), l'ancien reste servi tout du long,
+   * la ligne ne bascule qu'une fois le fichier arrivé, et l'ancien objet n'est retiré qu'APRÈS
+   * que la bascule a été CONSTATÉE. Un échec, à n'importe quelle étape, laisse la version
+   * précédente intacte et jouable.
    */
   async saveMediaVideo(
     media: Media,
     lang: string,
     file: File,
+    options: { onProgress?: (p: MediaUploadProgress) => void; signal?: { readonly aborted: boolean } } = {},
   ): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: false, error: "hors ligne" };
     const safeLang = lang.trim().toLowerCase() || "fr";
-    const path = `${media.organizationId}/${media.contentHash}/video/${safeLang}`;
 
-    // Le bucket `media` (0003) n'a pas de policy UPDATE : remplacer une version passe par
-    // suppression puis insertion (même contrainte que pour les sous-titres, cf. saveSubtitle).
-    await supabase!.storage.from("media").remove([path]);
-    const up = await supabase!.storage.from("media").upload(path, file, { upsert: false, contentType: file.type || "video/mp4" });
-    if (up.error) return { ok: false, error: `Téléversement échoué : ${up.error.message}` };
+    // L'empreinte du fichier de version sert de nom : elle rend le chemin unique, donc non
+    // destructif, ET fait de la reprise une opération sûre — deux fichiers différents ne
+    // peuvent pas se disputer le même envoi.
+    const versionHash = await sha256Hex(file, (p) =>
+      options.onProgress?.({ phase: "hash", doneBytes: p.hashedBytes, totalBytes: p.totalBytes }),
+    );
+    const path = `${media.organizationId}/${media.contentHash}/video/${safeLang}/${versionHash}`;
 
     const existing = this.mediaVideos.find((v) => v.mediaId === media.id && v.lang === safeLang);
+    const previousPath = existing?.storageUrl ?? null;
+
+    if (previousPath === path) {
+      // Exactement le même contenu, déjà en place : il n'y a rien à envoyer ni à changer.
+      return { ok: true };
+    }
+
+    if (!(await this.mediaObjectExists(path))) {
+      const outcome = await uploadFileResumable(file, path, {
+        contentType: file.type || "video/mp4",
+        ...(options.onProgress
+          ? { onProgress: (p) => options.onProgress?.({ phase: "upload", doneBytes: p.sentBytes, totalBytes: p.totalBytes }) }
+          : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+      if (!outcome.ok) return { ok: false, error: uploadFailureMessage(outcome, file) };
+    }
+
     const isFirst = this.mediaVideos.filter((v) => v.mediaId === media.id).length === 0;
     const row = {
       organization_id: media.organizationId,
@@ -1960,16 +2052,38 @@ export class FleetStore {
       created_by: this.identity?.user.id ?? null,
       ...(isFirst ? { is_primary: true } : {}),
     };
-    const { error } = existing
-      ? await supabase!.from("media_videos").update(row).eq("id", existing.id)
-      : await supabase!.from("media_videos").insert(row);
-    if (error) return { ok: false, error: error.message };
+    // `.select()` sur les DEUX branches : un UPDATE refusé par la RLS répond 200 corps vide avec
+    // `error` à null. Sans ça on annoncerait « version envoyée ✓ » sur une ligne inchangée, et
+    // on supprimerait ensuite l'ancien fichier — donc on détruirait la seule version servie.
+    const written = existing
+      ? await this.writeOne(
+          supabase!.from("media_videos").update(row).eq("id", existing.id).select("id"),
+          "La version n'a PAS été enregistrée : la base a refusé la mise à jour. L'ancienne version reste servie aux cabines.",
+        )
+      : await this.writeOne(
+          supabase!.from("media_videos").insert(row).select("id"),
+          "La version n'a PAS été enregistrée : la base a refusé l'insertion.",
+        );
+    if (!written.ok) return written;
 
     // La borne lit toujours `media.storage_url` : on l'aligne sur la version primaire, sinon la
     // cabine continuerait de servir l'ancien fichier sans que rien ne l'indique.
     if (isFirst || existing?.isPrimary) {
-      const { error: me } = await supabase!.from("media").update({ storage_url: path }).eq("id", media.id);
-      if (me) return { ok: false, error: me.message };
+      const aligned = await this.writeOne(
+        supabase!.from("media").update({ storage_url: path }).eq("id", media.id).select("id"),
+        "La version est enregistrée mais le fichier servi aux cabines n'a PAS été mis à jour : les bornes joueront encore l'ancienne version.",
+      );
+      if (!aligned.ok) {
+        await this.loadFromSupabase();
+        return aligned;
+      }
+    }
+
+    // Constaté seulement maintenant : l'ancien objet ne sert plus rien, on peut le rendre.
+    // Un échec ici ne coûte que des octets ; il ne coûte jamais une séance.
+    if (previousPath && previousPath !== path) {
+      const { error: rmErr } = await supabase!.storage.from("media").remove([previousPath]);
+      if (rmErr) console.warn("saveMediaVideo: ancien fichier orphelin laissé sur le storage —", rmErr.message);
     }
     await this.loadFromSupabase();
     return { ok: true };

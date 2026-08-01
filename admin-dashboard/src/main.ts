@@ -14,6 +14,7 @@ import "bootstrap";
 
 import { FleetStore } from "./data/store";
 import { App } from "./ui/app";
+import { sweepStaleUploads } from "./data/upload";
 
 const root = document.getElementById("app");
 if (!root) throw new Error("Élément #app introuvable");
@@ -21,3 +22,9 @@ if (!root) throw new Error("Élément #app introuvable");
 const store = new FleetStore();
 const app = new App(root, store);
 app.start(); // rend + lance le chargement async (mock ou Supabase)
+
+// Un envoi abandonné laisse des octets que le bucket NE MONTRE PAS : `storage.list()` ne les
+// voit pas, donc aucun écran ne peut les inventorier. Seule l'URL d'envoi, gardée localement,
+// permet de les révoquer. Ce balayage est donc le seul ramasse-miettes qui existe côté produit
+// — et il ne peut agir que sur ce navigateur-ci. Cf. CIN-101 et la note du QA-LOG.
+void sweepStaleUploads();
