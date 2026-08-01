@@ -1169,3 +1169,26 @@ h2 {
 .booth-status--demo .booth-status__detail {
   flex: 0 1 auto;
 }
+
+/* Entrée multilingue (CIN-115) : un bouton par langue, côte à côte. Deux langues = élégant ;
+   au-delà de trois ou quatre, ce n'est plus un choix mais un mur — revoir le modèle plutôt
+   qu'empiler des boutons. Le passage en colonne sur écran étroit garde chaque libellé entier :
+   un libellé tronqué dans une langue qu'on ne lit pas n'est plus reconnaissable. */
+.idle-start {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: center;
+}
+
+@media (max-width: 600px) {
+  .idle-start {
+    flex-direction: column;
+    width: 100%;
+  }
+}
+
+.idle-unavailable {
+  display: grid;
+  gap: 0.25rem;
+}

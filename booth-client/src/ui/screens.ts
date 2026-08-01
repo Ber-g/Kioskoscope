@@ -5,6 +5,7 @@ import { createCountdown, el, formatDuration, renderQrDataUrl } from "./dom";
 import { isKioskLocked } from "../setup/kioskLockdown";
 import { FocusRing } from "../input/focusRing";
 import type { Intent, IntentHandler } from "../input/intents";
+import { AVAILABLE_LANGS, setLang, t } from "../i18n";
 
 // Chaque écran renvoie un noeud + une fonction de nettoyage optionnelle (timers,
 // vidéo…) + son handler d'intentions (F14 : modèle de focus / contrôles média).
@@ -52,7 +53,7 @@ function stillTiles(film: Film, count = 3): HTMLElement {
 // Bloc de valorisation de l'auteur : réalisateur, synopsis, extraits, lien.
 function authorBlock(film: Film): HTMLElement {
   const children: Array<Node | string> = [
-    el("p", { class: "eyebrow" }, ["Un film de"]),
+    el("p", { class: "eyebrow" }, [t("film.directedBy")]),
     el("h3", { class: "author__name" }, [film.director]),
     el("p", { class: "author__synopsis" }, [film.synopsis]),
     stillTiles(film),
@@ -68,17 +69,17 @@ function authorBlock(film: Film): HTMLElement {
 
 /** Lien « En savoir plus » cliquable (dev / hors kiosque). */
 function learnMoreLink(url: string): HTMLElement {
-  return el("a", { class: "btn btn--ghost", href: url, target: "_blank", rel: "noopener" }, ["En savoir plus"]);
+  return el("a", { class: "btn btn--ghost", href: url, target: "_blank", rel: "noopener" }, [t("learnMore.label")]);
 }
 
 /** QR « En savoir plus » (borne verrouillée) : le visiteur ouvre le lien sur son téléphone. */
 function learnMoreQr(url: string): HTMLElement {
-  const img = el("img", { class: "learn-more__qr", alt: "QR — en savoir plus", width: "132", height: "132" }) as HTMLImageElement;
+  const img = el("img", { class: "learn-more__qr", alt: t("learnMore.qrAlt"), width: "132", height: "132" }) as HTMLImageElement;
   void renderQrDataUrl(url).then((src) => (img.src = src)).catch(() => undefined);
   return el("div", { class: "learn-more" }, [
-    el("p", { class: "learn-more__label" }, ["En savoir plus"]),
+    el("p", { class: "learn-more__label" }, [t("learnMore.label")]),
     img,
-    el("p", { class: "learn-more__hint" }, ["Scannez avec votre téléphone"]),
+    el("p", { class: "learn-more__hint" }, [t("learnMore.scan")]),
   ]);
 }
 
@@ -86,13 +87,31 @@ function learnMoreQr(url: string): HTMLElement {
 // `hasFilms=false` (org sans média jouable) → PAS de bouton de démarrage : le visiteur ne peut
 // pas déverrouiller (donc jamais payer) pour un catalogue vide ; message humain à la place.
 export function idleScreen(onStart: () => void, hasFilms = true): ScreenResult {
-  const start = el("button", { class: "btn btn--primary btn--xl", type: "button" }, [
-    "Toucher pour commencer",
-  ]);
-  start.addEventListener("click", onStart);
-  const unavailable = el("p", { class: "muted idle-unavailable" }, [
-    "Aucune séance disponible pour le moment. Revenez bientôt.",
-  ]);
+  // CIN-115 — L'ENTRÉE PORTE LA LANGUE. Un bouton par langue disponible, chacun libellé DANS SA
+  // PROPRE LANGUE : le visiteur choisit sa langue par le geste qu'il devait de toute façon faire.
+  // Zéro étape ajoutée sur le chemin critique, et un anglophone reconnaît son bouton sans lire un
+  // mot de français. Une seule langue disponible ⇒ un seul bouton, l'écran est celui d'avant :
+  // la mécanique ne coûte rien quand elle ne sert pas.
+  //
+  // ⚠️ La langue est fixée AVANT de céder la main (`setLang` puis `onStart`) : l'écran suivant se
+  // construit déjà traduit. L'inverse afficherait un premier écran en français, ce qui vaudrait
+  // pire que pas de choix du tout — une promesse trahie dès le premier geste.
+  const startButtons = AVAILABLE_LANGS.map((lang) => {
+    const b = el("button", { class: "btn btn--primary btn--xl", type: "button", lang }, [t("idle.start", lang)]);
+    b.addEventListener("click", () => {
+      setLang(lang);
+      onStart();
+    });
+    return b;
+  });
+  const start = el("div", { class: "idle-start" }, startButtons);
+  // Le message d'indisponibilité s'affiche dans TOUTES les langues proposées : ici on ne sait pas
+  // encore qui est devant la borne, et personne ne doit rester devant un écran qu'il ne lit pas.
+  const unavailable = el(
+    "div",
+    { class: "idle-unavailable" },
+    AVAILABLE_LANGS.map((lang) => el("p", { class: "muted", lang }, [t("idle.unavailable", lang)])),
+  );
   // F19 : titre/accroche viennent de la marque de l'org (repli maître). Logo v2 = si présent,
   // il remplace le titre typographique ; sinon le titre reste. « powered by » non supprimable.
   const brand = getBrand();
@@ -101,7 +120,7 @@ export function idleScreen(onStart: () => void, hasFilms = true): ScreenResult {
     : el("h1", { class: "brand__title" }, [brand.title]);
   const brandChildren = [heading, el("p", { class: "brand__tagline" }, [brand.tagline])];
   // Mention non supprimable, uniquement sur une marque d'org (redondante si marque = maître).
-  if (isCustomBrand()) brandChildren.push(el("p", { class: "brand__powered" }, ["propulsé par Kioskoscope"]));
+  if (isCustomBrand()) brandChildren.push(el("p", { class: "brand__powered" }, [t("idle.poweredBy")]));
   const node = screen("idle", [el("div", { class: "brand" }, brandChildren), hasFilms ? start : unavailable]);
   // F19 v2 : image d'attente de l'org en fond (assets). Un voile sombre (via .has-idle-image)
   // garde le titre/bouton lisibles quelle que soit l'image. Absente → fond de marque par défaut.
@@ -109,18 +128,18 @@ export function idleScreen(onStart: () => void, hasFilms = true): ScreenResult {
     node.classList.add("has-idle-image");
     node.style.setProperty("--idle-image", `url("${cssUrl(brand.idleImageUrl)}")`);
   }
-  return { node, handler: new FocusRing({ items: hasFilms ? [start] : [] }) };
+  return { node, handler: new FocusRing({ items: hasFilms ? startButtons : [] }) };
 }
 
 // ── Déverrouillage en cours ──────────────────────────────────────────────────
 export function unlockingScreen(onCancel: () => void): ScreenResult {
-  const cancel = el("button", { class: "btn btn--ghost", type: "button" }, ["Annuler"]);
+  const cancel = el("button", { class: "btn btn--ghost", type: "button" }, [t("unlock.cancel")]);
   cancel.addEventListener("click", onCancel);
   return {
     node: screen("unlocking", [
       el("div", { class: "spinner", "aria-hidden": "true" }, []),
-      el("h2", {}, ["Déverrouillage de votre séance…"]),
-      el("p", { class: "muted" }, ["Suivez les instructions à l'écran."]),
+      el("h2", {}, [t("unlock.inProgress")]),
+      el("p", { class: "muted" }, [t("unlock.followScreen")]),
       cancel,
     ]),
     handler: new FocusRing({ items: [cancel], onBack: onCancel }),
@@ -132,20 +151,20 @@ export function unlockFallbackScreen(status: UnlockStatus, onRetry: () => void):
   // Copie non-technique, actionnable, adaptée à chaque cas.
   const messages: Record<Exclude<UnlockStatus, "success">, { title: string; body: string }> = {
     refused: {
-      title: "Le déverrouillage n'a pas abouti",
-      body: "Aucun montant n'a été prélevé. Vous pouvez réessayer quand vous voulez.",
+      title: t("unlock.refused.title"),
+      body: t("unlock.refused.body"),
     },
     timeout: {
-      title: "Un peu trop long…",
-      body: "La séance ne s'est pas déverrouillée à temps. On réessaie ?",
+      title: t("unlock.timeout.title"),
+      body: t("unlock.timeout.body"),
     },
     abandoned: {
-      title: "Séance annulée",
-      body: "Pas de souci — revenez quand vous êtes prêt·e.",
+      title: t("unlock.cancelled.title"),
+      body: t("unlock.cancelled.body"),
     },
   };
   const m = messages[status as Exclude<UnlockStatus, "success">] ?? messages.refused;
-  const retry = el("button", { class: "btn btn--primary", type: "button" }, ["Réessayer"]);
+  const retry = el("button", { class: "btn btn--primary", type: "button" }, [t("unlock.retry")]);
   retry.addEventListener("click", onRetry);
   return {
     node: screen("fallback", [
@@ -180,9 +199,9 @@ export function selectScreen(
   });
 
   const durations: Array<{ label: string; value: number | null }> = [
-    { label: "Court (< 5 min)", value: 300 },
-    { label: "Moyen (< 10 min)", value: 600 },
-    { label: "Peu importe", value: null },
+    { label: t("select.duration.short"), value: 300 },
+    { label: t("select.duration.medium"), value: 600 },
+    { label: t("select.duration.any"), value: null },
   ];
   let durationButtons: HTMLButtonElement[] = [];
   durationButtons = durations.map((d) => {
@@ -195,13 +214,13 @@ export function selectScreen(
   });
 
   const go = el("button", { class: "btn btn--primary btn--lg", type: "button" }, [
-    "Voir les suggestions",
+    t("select.go"),
   ]);
   go.addEventListener("click", () => onChoose({ mood, maxDurationSeconds: maxDuration }));
 
   return {
     node: screen("select", [
-      el("h2", {}, ["Quelle humeur, ce soir ?"]),
+      el("h2", {}, [t("select.title")]),
       el("p", { class: "muted" }, ["Choisissez une ambiance et une durée — ou laissez-vous guider."]),
       el("div", { class: "group" }, [
         el("h3", { class: "group__label" }, ["Ambiance"]),
@@ -226,11 +245,11 @@ export interface RecoCallbacks {
 
 export function recoScreen(recommended: readonly Film[], cb: RecoCallbacks): ScreenResult {
   if (recommended.length === 0) {
-    const end = el("button", { class: "btn btn--primary", type: "button" }, ["Terminer la séance"]);
+    const end = el("button", { class: "btn btn--primary", type: "button" }, [t("reco.endSession")]);
     end.addEventListener("click", cb.onNoneEndSession);
     return {
       node: screen("reco", [
-        el("h2", {}, ["Vous avez fait le tour !"]),
+        el("h2", {}, [t("reco.exhausted")]),
         el("p", { class: "muted" }, ["Plus de film à proposer pour ces critères."]),
         end,
       ]),
@@ -239,7 +258,7 @@ export function recoScreen(recommended: readonly Film[], cb: RecoCallbacks): Scr
   }
 
   const [top, ...rest] = recommended;
-  const playTop = el("button", { class: "btn btn--primary btn--lg", type: "button" }, ["Lancer ce film"]);
+  const playTop = el("button", { class: "btn btn--primary btn--lg", type: "button" }, [t("reco.playTop")]);
   playTop.addEventListener("click", () => cb.onPlayRecommended(top!));
 
   const restCards = rest.slice(0, 3).map((f) => {
@@ -289,7 +308,7 @@ export function playerScreen(
   // Barre d'avancement : montée UNIQUEMENT en lecture simulée (outil de dev). Sur une VRAIE vidéo, on
   // n'affiche pas le temps restant — c'est une séance de cinéma, pas un lecteur : on ne « spoile » pas la fin.
   let progress: HTMLElement | undefined;
-  const skip = el("button", { class: "btn btn--ghost btn--corner", type: "button" }, ["Passer (démo)"]);
+  const skip = el("button", { class: "btn btn--ghost btn--corner", type: "button" }, [t("player.skip")]);
 
   // Le lecteur SAIT pourquoi il s'arrête ; c'est lui qui doit le dire, plutôt que de laisser
   // l'appelant le deviner à partir d'un pourcentage. Un film qui va au bout, un film qu'on passe
@@ -344,11 +363,11 @@ export function playerScreen(
         chip.addEventListener("click", () => { setTrack(i); highlight(chip); });
         subtitleChips.push(chip);
       });
-      const offChip = el("button", { class: "chip", type: "button" }, ["Sans"]);
+      const offChip = el("button", { class: "chip", type: "button" }, [t("player.subtitles.off")]);
       offChip.addEventListener("click", () => { setTrack(-1); highlight(offChip); });
       subtitleChips.push(offChip);
       subtitleControls = el("div", { class: "player__subs" }, [
-        el("span", { class: "player__subs-label" }, ["Sous-titres"]),
+        el("span", { class: "player__subs-label" }, [t("player.subtitles")]),
         ...subtitleChips,
       ]);
       // Défaut : première langue affichée (accessibilité) dès que les pistes sont prêtes.
@@ -359,7 +378,7 @@ export function playerScreen(
     // Overlay : spinner pendant le buffering, et repli « Toucher pour lancer » si l'AUTOPLAY est
     // refusé (dans ce cas AUCUN `error` n'est émis → sans ça, écran noir figé jusqu'à « Passer »).
     const spinner = el("div", { class: "spinner", "aria-hidden": "true" }, []);
-    const tapToPlay = el("button", { class: "btn btn--primary btn--lg", type: "button" }, ["Toucher pour lancer"]);
+    const tapToPlay = el("button", { class: "btn btn--primary btn--lg", type: "button" }, [t("player.tapToPlay")]);
     const overlay = el("div", { class: "player__overlay" }, [spinner]);
     const hideOverlay = (): void => { overlay.style.display = "none"; };
     const showOverlay = (child: HTMLElement): void => { overlay.style.display = ""; overlay.replaceChildren(child); };
@@ -380,7 +399,7 @@ export function playerScreen(
     // existe — elle couvre le chemin qu'on n'a pas prévu (import USB à venir, film ajouté par
     // `addFilm`, régression future). On ne simule pas : on le DIT et on rend la main tout de suite.
     const failure = el("div", { class: "player__stage" }, [
-      el("h2", {}, ["Ce film n'est pas disponible"]),
+      el("h2", {}, [t("player.unavailable")]),
       el("p", { class: "muted" }, ["Le fichier est introuvable sur cette borne. Choisissons-en un autre."]),
     ]);
     stage = failure;
@@ -411,7 +430,7 @@ export function playerScreen(
   // bougeait sans aucun feedback). Ne concerne que la vraie vidéo (le mode démo n'a pas de son).
   const volumeFill = el("div", { class: "player__volume-fill" }, []);
   const volume = el("div", { class: "player__volume", "aria-hidden": "true" }, [
-    el("span", { class: "player__volume-label" }, ["Volume"]),
+    el("span", { class: "player__volume-label" }, [t("player.volume")]),
     el("div", { class: "player__volume-track" }, [volumeFill]),
   ]);
   let volumeTimer: number | undefined;
@@ -501,7 +520,7 @@ export function afterFilmScreen(
 ): ScreenResult {
   const another = el("button", { class: "btn btn--primary btn--lg", type: "button" }, ["Encore un film"]);
   another.addEventListener("click", cb.onAnother);
-  const end = el("button", { class: "btn btn--ghost", type: "button" }, ["Terminer la séance"]);
+  const end = el("button", { class: "btn btn--ghost", type: "button" }, [t("reco.endSession")]);
   end.addEventListener("click", cb.onEnd);
 
   const countdown = createCountdown(countdownSeconds, cb.onExpire);

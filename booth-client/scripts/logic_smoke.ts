@@ -11,6 +11,7 @@ import { FACTICE_CATALOG, auditCatalog, localMediaUrl, type CatalogEntry } from 
 import { normalizeDeviceError, normalizeMediaLibrary, parseKioskConfig } from "../src/setup/kioskAgent";
 import { restoreOfflineCatalog, describeOfflineCatalog } from "../src/domain/offlineCatalog";
 import { reconcileDeviceIdentity } from "../src/domain/deviceIdentity";
+import { AVAILABLE_LANGS, LANG_ENDONYM, REFERENCE_LANG, currentLang, isLang, missingKeys, setLang, t } from "../src/i18n";
 import type { Film, Play } from "../src/domain/types";
 
 let passed = 0;
@@ -664,7 +665,9 @@ function main(): void {
   testDeviceIdentity();
   console.log("\n=== CATALOGUE HORS LIGNE : restoreOfflineCatalog ===");
   testOfflineCatalog();
-  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux + identité device + hors-ligne)`);
+  console.log("\n=== I18N CABINE : dictionnaires + langue d'entrée ===");
+  testI18n();
+  console.log(`\n✅ logic_smoke : ${passed} assertions vérifiées (reco + session + catalogue + provisionnement + médias locaux + identité device + hors-ligne + i18n)`);
 }
 
 try {
@@ -673,3 +676,49 @@ try {
   console.error("\n❌ logic_smoke a échoué :", err instanceof Error ? err.message : err);
   process.exit(1);
 }
+
+// ── i18n de la cabine (CIN-115) ─────────────────────────────────────────────
+// Ce que ces assertions protègent : un VISITEUR ne doit jamais voir une clé ni un mot de
+// français sur un bouton anglais. Un dictionnaire incomplet doit casser ICI, pas en séance.
+function testI18n(): void {
+  console.log("I1. Aucun trou de traduction — c'est la CI qui l'apprend, pas le public");
+  for (const lang of AVAILABLE_LANGS) {
+    const holes = missingKeys(lang);
+    assert(holes.length === 0, `dictionnaire ${lang} complet (manquantes : ${holes.join(", ") || "aucune"})`);
+  }
+
+  console.log("I2. Chaque langue est nommée DANS SA PROPRE LANGUE");
+  {
+    assert(LANG_ENDONYM.fr === "Français", "le français se nomme « Français »");
+    assert(LANG_ENDONYM.en === "English", "l'anglais se nomme « English », jamais « Anglais »");
+    // La règle vaut aussi pour le bouton d'entrée : c'est LUI que doit reconnaître un
+    // anglophone qui ne lit pas un mot de français.
+    assert(t("idle.start", "en") === "Touch to start", "le bouton anglais est écrit en anglais");
+    assert(t("idle.start", "fr") !== t("idle.start", "en"), "les deux boutons d'entrée diffèrent");
+  }
+
+  console.log("I3. La langue courante est un état, fixé à l'entrée");
+  {
+    assert(currentLang() === REFERENCE_LANG, "au démarrage : langue de référence");
+    setLang("en");
+    assert(currentLang() === "en", "setLang change la langue courante");
+    assert(t("player.skip") === "Skip", "t() sans argument suit la langue courante");
+    setLang("fr");
+    assert(t("player.skip") === "Passer", "retour au français");
+  }
+
+  console.log("I4. Un trou de traduction n'atteint JAMAIS l'écran");
+  {
+    // On force une langue non servie : le repli doit rendre du français correct, pas la clé.
+    const rendered = t("select.title", "de" as never);
+    assert(rendered === t("select.title", "fr"), "langue inconnue → repli français, jamais la clé brute");
+    assert(!rendered.includes("."), "aucun point de clé technique dans ce qui s'affiche");
+  }
+
+  console.log("I5. `isLang` ne laisse pas passer n'importe quoi");
+  {
+    assert(isLang("fr") && isLang("en"), "les langues servies sont reconnues");
+    assert(!isLang("de") && !isLang("") && !isLang(null) && !isLang(42), "tout le reste est refusé");
+  }
+}
+
