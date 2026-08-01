@@ -17,6 +17,9 @@ import {
   fileExtension,
   isBrowserPlayableVideo,
   videoPlayabilityHint,
+  probeMp4,
+  judgeVideoCodec,
+  type ByteRangeReader,
   watchRatio,
   emptyDeciles,
   PLAY_DECILES,
@@ -140,6 +143,78 @@ async function main(): Promise<void> {
   assert(watchRatio(-1, 100) === null, "watchRatio : durée vue négative → null");
   assert(emptyDeciles().length === PLAY_DECILES, "emptyDeciles : longueur = PLAY_DECILES");
   assert(emptyDeciles().every((d) => d === false), "emptyDeciles : tout à false");
+
+  // ── Probe de codec RÉEL, sur des entêtes MP4 fabriqués (CIN-103 / CIN-114a) ──
+  // On construit de VRAIES boîtes ISOBMFF plutôt que de simuler le parseur : c'est la seule
+  // façon de prouver qu'on sait lire un fichier qu'on n'a pas écrit soi-même. Le cas qui
+  // compte est `hvc1` — le fichier qui se lit chez l'exploitant et reste noir en cabine.
+  {
+    const enc = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
+    const be32 = (n: number): number[] => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+    /** Boîte ISOBMFF : taille (4) + type (4) + charge utile. */
+    const box = (type: string, payload: number[]): number[] => [...be32(payload.length + 8), ...enc(type), ...payload];
+    const mvhd = (timescale: number, duration: number): number[] =>
+      box("mvhd", [0, 0, 0, 0, ...be32(0), ...be32(0), ...be32(timescale), ...be32(duration), ...new Array(80).fill(0)]);
+    const sampleEntry = (fourcc: string): number[] => box(fourcc, new Array(78).fill(0));
+    const videoTrak = (fourcc: string): number[] =>
+      box("trak", box("mdia", box("minf", box("stbl", box("stsd", [0, 0, 0, 0, ...be32(1), ...sampleEntry(fourcc)])))));
+    const audioTrak = (): number[] => box("trak", box("mdia", box("minf", box("stbl", box("stsd", [0, 0, 0, 0, ...be32(1), ...sampleEntry("mp4a")])))));
+
+    const file = (moovPayload: number[], moovLast: boolean): Uint8Array => {
+      const ftyp = box("ftyp", enc("isom") .concat(be32(512), enc("isomiso2avc1mp41")));
+      // `mdat` GÉANT et vide : c'est tout l'enjeu du parcours par sauts — si le probe le lisait,
+      // il chargerait le film entier en mémoire. Ici il ne doit lire que 16 octets d'entête.
+      const mdat = box("mdat", new Array(200_000).fill(0));
+      const moov = box("moov", moovPayload);
+      return new Uint8Array(moovLast ? [...ftyp, ...mdat, ...moov] : [...ftyp, ...moov, ...mdat]);
+    };
+
+    let bytesRead = 0;
+    const reader = (bytes: Uint8Array): ByteRangeReader => ({
+      size: bytes.length,
+      async read(offset, length) {
+        bytesRead += length;
+        return bytes.subarray(offset, offset + length);
+      },
+    });
+
+    // H.264, faststart (moov avant mdat) : cas nominal.
+    const avc = await probeMp4(reader(file([...mvhd(1000, 90_000), ...videoTrak("avc1")], false)));
+    assert(avc?.videoCodec === "avc1", "probeMp4 : flux H.264 identifié");
+    assert(avc?.durationSeconds === 90, "probeMp4 : durée lue dans mvhd (90 000 / 1000 = 90 s)");
+
+    // LE cas du ticket : un .mp4 qui contient du H.265.
+    const hevcBytes = file([...mvhd(600, 720_000), ...audioTrak(), ...videoTrak("hvc1")], true);
+    bytesRead = 0;
+    const hevc = await probeMp4(reader(hevcBytes));
+    assert(hevc?.videoCodec === "hvc1", "probeMp4 : H.265 démasqué, moov EN FIN de fichier");
+    assert(hevc?.durationSeconds === 1200, "probeMp4 : durée correcte malgré un autre timescale");
+    assert(bytesRead < 10_000, `probeMp4 : le mdat de 200 Ko n'est jamais lu (${bytesRead} octets lus)`);
+    assert(judgeVideoCodec(hevc!.videoCodec).verdict === "transcode", "H.265 : verdict `transcode`, contre l'avis du navigateur de l'exploitant");
+
+    // Piste audio d'abord : elle ne doit pas être prise pour la vidéo.
+    const mixed = await probeMp4(reader(file([...mvhd(1000, 1000), ...audioTrak(), ...videoTrak("av01")], false)));
+    assert(mixed?.videoCodec === "av01", "probeMp4 : la piste audio n'est pas confondue avec la vidéo");
+    assert(judgeVideoCodec("av01").verdict === "risky", "AV1 : ni rassurant ni interdit — décodage logiciel sur borne");
+
+    // Durée inconnue (0xffffffff) : ne JAMAIS la rendre comme une durée.
+    const unknownDur = await probeMp4(reader(file([...mvhd(1000, 0xffffffff), ...videoTrak("avc1")], false)));
+    assert(unknownDur?.durationSeconds === null, "probeMp4 : durée `inconnue` (0xffffffff) rendue null, pas 4 294 967 s");
+
+    // Ce qui n'est pas un MP4 : aucun verdict inventé.
+    assert((await probeMp4(reader(new Uint8Array([1, 2, 3])))) === null, "probeMp4 : fichier minuscule → null");
+    assert((await probeMp4(reader(new Uint8Array(64)))) === null, "probeMp4 : octets nuls (taille de boîte 0) → null");
+    const webmish = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, ...new Array(200).fill(1)]);
+    assert((await probeMp4(reader(webmish))) === null, "probeMp4 : WebM → null (repli sur l'extension, pas de verdict faux)");
+    const noVideo = await probeMp4(reader(file([...mvhd(1000, 5000), ...audioTrak()], false)));
+    assert(noVideo?.videoCodec === null, "probeMp4 : fichier sans piste vidéo → codec null");
+    assert(judgeVideoCodec(null).verdict === "unknown", "codec absent → `unknown`, jamais `playable`");
+
+    assert(judgeVideoCodec("avc1").verdict === "playable", "H.264 : verdict `playable`");
+    assert(judgeVideoCodec("vp09").verdict === "playable", "VP9 : verdict `playable`");
+    assert(judgeVideoCodec("dvhe").verdict === "transcode", "Dolby Vision : verdict `transcode`");
+    assert(judgeVideoCodec("zzzz").verdict === "unknown", "fourcc inconnu : `unknown`, on n'invente pas");
+  }
 
   console.log(`\n—— ${passed}/${passed + failed} assertions OK ——`);
   if (failed > 0) {

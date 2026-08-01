@@ -2,7 +2,8 @@ import type { Media } from "../domain/types";
 import type { FleetStore } from "../data/store";
 import { el, icon, toast } from "./dom";
 import { COMMON_LANGS, existingAmbiguities, langLabel, langWarnings } from "./trackLang";
-import { videoPlayabilityHint } from "@kioskoscope/domain";
+import { judgeVideoCodec, probeMp4, videoPlayabilityHint } from "@kioskoscope/domain";
+import { fileByteReader } from "../data/hash";
 
 // Tableau des VERSIONS VIDÉO d'un média (CIN-095) — pendant exact du tableau des sous-titres.
 //
@@ -143,6 +144,10 @@ export function videoVersionsPanel(store: FleetStore, media: Media, onChanged: (
       const hint = el("div", { class: "form-hint mt-1" }, []);
       const submit = el("button", { class: "btn btn-primary", type: "button" }, ["Envoyer"]);
 
+      // Verdict de codec établi en LISANT le fichier (CIN-103). Nul tant que la lecture n'a pas
+      // répondu : on affiche alors l'heuristique par extension, jamais rien.
+      let probedWarning: string | null = null;
+
       const refreshHint = (): void => {
         const lang = langInput.value.trim().toLowerCase();
         const warnings = langWarnings(lang, versions);
@@ -150,8 +155,12 @@ export function videoVersionsPanel(store: FleetStore, media: Media, onChanged: (
         // Le garde-fou codec (CIN-022) s'applique ici comme à l'upload principal : prévenir avant
         // l'envoi, pas après avoir découvert un écran noir en cabine.
         if (file) {
-          const codec = videoPlayabilityHint(file.name);
-          if (codec.verdict !== "playable") warnings.push(codec.message);
+          if (probedWarning !== null) {
+            warnings.push(probedWarning);
+          } else {
+            const codec = videoPlayabilityHint(file.name);
+            if (codec.verdict !== "playable") warnings.push(codec.message);
+          }
         }
         if (warnings.length === 0) {
           hint.className = "form-hint mt-1";
@@ -162,7 +171,19 @@ export function videoVersionsPanel(store: FleetStore, media: Media, onChanged: (
         hint.replaceChildren(...warnings.map((w) => el("div", {}, [w])));
       };
       langInput.addEventListener("input", refreshHint);
-      fileInput.addEventListener("change", refreshHint);
+      fileInput.addEventListener("change", () => {
+        const chosen = fileInput.files?.[0] ?? null;
+        probedWarning = null;
+        refreshHint();
+        if (!chosen) return;
+        void probeMp4(fileByteReader(chosen)).then((probe) => {
+          // Fichier changé entre-temps : le verdict ne décrit plus ce qui est à l'écran.
+          if (fileInput.files?.[0] !== chosen || !probe) return;
+          const judged = judgeVideoCodec(probe.videoCodec);
+          probedWarning = judged.verdict === "playable" ? null : judged.message;
+          refreshHint();
+        });
+      });
       refreshHint();
 
       submit.addEventListener("click", () => {

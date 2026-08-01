@@ -646,3 +646,10 @@ export function videoPlayabilityHint(filename: string): VideoPlayabilityHint {
     message: `Format .${extension} inhabituel : vérifiez le film dans l'aperçu avant de l'envoyer sur une borne.`,
   };
 }
+
+// ── Probe de codec RÉEL (CIN-103) ────────────────────────────────────────────
+// L'heuristique par extension ci-dessus dit « ce conteneur est-il le bon ? ». Le module `mp4`
+// ouvre le fichier et dit ce qu'il contient VRAIMENT — c'est lui qui attrape le `.mp4` en H.265
+// qui resterait noir en cabine. Ré-exporté ici pour que les applications n'aient qu'une porte.
+export { probeMp4, judgeVideoCodec } from "./mp4";
+export type { ByteRangeReader, Mp4Probe, CodecVerdict, CodecJudgement } from "./mp4";

@@ -1,8 +1,8 @@
 import { Modal } from "bootstrap";
-import { CANONICAL_MOODS, videoPlayabilityHint } from "@kioskoscope/domain";
+import { CANONICAL_MOODS, judgeVideoCodec, probeMp4, videoPlayabilityHint } from "@kioskoscope/domain";
 import type { Media } from "../domain/types";
 import type { FleetStore } from "../data/store";
-import { sha256Hex } from "../data/hash";
+import { fileByteReader, sha256Hex } from "../data/hash";
 import { openPreview } from "./preview";
 import { subtitleTracksPanel } from "./subtitles";
 import { videoVersionsPanel } from "./videoVersions";
@@ -381,6 +381,9 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
   const director = el("input", { class: "form-control", type: "text", value: base.director }) as HTMLInputElement;
   const year = el("input", { class: "form-control", type: "number", value: String(base.year) }) as HTMLInputElement;
   const duration = el("input", { class: "form-control", type: "number", value: String(base.durationSeconds), placeholder: "secondes" }) as HTMLInputElement;
+  // Dit D'OÙ vient la durée affichée. Un champ pré-rempli sans explication laisse croire à une
+  // valeur imposée ; ici l'exploitant sait qu'elle a été lue, et qu'il peut la corriger.
+  const durationInfo = el("div", { class: "form-hint" }, []);
   const language = el("input", { class: "form-control", type: "text", value: base.language, maxlength: "5" }) as HTMLInputElement;
   const audienceTags = el("input", { class: "form-control", type: "text", value: base.audienceTags.join(", "), placeholder: "18+, bar, enfant…" }) as HTMLInputElement;
   const genres = el("input", { class: "form-control", type: "text", value: base.genres.join(", "), placeholder: "drame, expérimental, animation…" }) as HTMLInputElement;
@@ -429,13 +432,46 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
     codecInfo.className = hint.verdict === "transcode" ? "alert alert-warning py-2 mt-1 mb-0" : "form-hint mt-1 text-yellow";
     codecInfo.textContent = hint.message;
   };
+  /**
+   * Verdict établi en LISANT le fichier (CIN-103), qui remplace l'heuristique par extension dès
+   * qu'il est disponible. Il faut qu'il puisse CONTREDIRE le navigateur de l'exploitant : sur un
+   * Mac, un `.mp4` en H.265 se lit parfaitement — et resterait noir en cabine.
+   */
+  const applyProbe = (probed: File): void => {
+    void probeMp4(fileByteReader(probed)).then((probe) => {
+      // Le fichier a changé pendant la lecture (l'exploitant en a choisi un autre) : le verdict
+      // qui revient ne décrit plus ce qui est à l'écran. On le jette plutôt que d'afficher faux.
+      if (file !== probed || !probe) return;
+      const judged = judgeVideoCodec(probe.videoCodec);
+      codecInfo.className =
+        judged.verdict === "playable"
+          ? "form-hint mt-1 text-green"
+          : judged.verdict === "transcode"
+            ? "alert alert-warning py-2 mt-1 mb-0"
+            : "form-hint mt-1 text-yellow";
+      codecInfo.textContent = judged.message;
+      // CIN-114 (a) : la durée est le DÉNOMINATEUR du taux d'écoute envoyé aux ayants droit —
+      // une durée tapée de travers fausse un pourcentage contractuel. On la lit dans le fichier,
+      // sans jamais écraser une valeur déjà saisie : l'exploitant peut vouloir exclure une mire.
+      const seconds = probe.durationSeconds !== null ? Math.round(probe.durationSeconds) : 0;
+      if (seconds > 0 && (duration.value === "" || Number(duration.value) === 0)) {
+        duration.value = String(seconds);
+        durationInfo.textContent = `Durée lue dans le fichier : ${Math.floor(seconds / 60)} min ${String(seconds % 60).padStart(2, "0")} s. Modifiable.`;
+      }
+    });
+  };
+
   fileInput.addEventListener("change", () => {
     file = fileInput.files?.[0] ?? null;
     if (!file) {
       codecInfo.replaceChildren();
+      durationInfo.textContent = "";
       return;
     }
+    // Verdict provisoire par extension, remplacé dès que la lecture de l'entête a répondu :
+    // l'exploitant ne reste jamais sans indication, même une fraction de seconde.
     showCodecHint(file.name);
+    applyProbe(file);
     hashInfo.textContent = "Calcul de l'empreinte…";
     void sha256Hex(file).then((h) => {
       computedHash = h;
@@ -455,7 +491,7 @@ export function openMediaForm(store: FleetStore, existing: Media | null, onChang
       field("Titre", title),
       field("Réalisateur", director),
       field("Année", year),
-      field("Durée (secondes)", duration),
+      field("Durée (secondes)", el("div", {}, [duration, durationInfo])),
       field("Langue (ISO)", language),
       field("Tags d'audience", audienceTags),
       field("Protection", protection),
