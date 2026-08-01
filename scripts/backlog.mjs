@@ -246,43 +246,103 @@ function edges(tickets) {
   return [...set].map((s) => { const [from, to] = s.split('>'); return { from, to }; });
 }
 
-/** Nombre de tickets encore vivants bloqués en aval — l'urgence n'est jamais saisie à la main. */
+/**
+ * Les tickets encore vivants bloqués en aval de chacun — l'urgence n'est jamais saisie
+ * à la main.
+ *
+ * Renvoie des ENSEMBLES d'identifiants, pas des compteurs. Deux actions du même outil
+ * peuvent libérer le même ticket : sommer leurs compteurs pour peser un groupe le
+ * compterait deux fois, et le chiffre affiché mentirait précisément là où on lui
+ * demande de trancher.
+ */
 function impacts(tickets) {
   const E = edges(tickets);
   const alive = new Set(tickets.filter((t) => t.status !== 'done' && t.status !== 'dropped').map((t) => t.id));
   const out = {};
-  const down = (id, seen) => {
-    let n = 0;
+  const down = (id, seen, acc) => {
     for (const e of E) {
       if (e.from !== id || seen.has(e.to)) continue;
       seen.add(e.to);
-      if (alive.has(e.to)) n++;
-      n += down(e.to, seen);
+      if (alive.has(e.to)) acc.add(e.to);
+      down(e.to, seen, acc);
     }
-    return n;
+    return acc;
   };
-  for (const t of tickets) out[t.id] = down(t.id, new Set([t.id]));
+  for (const t of tickets) out[t.id] = down(t.id, new Set([t.id]), new Set());
   return out;
 }
+
+/**
+ * L'ordre des actions — UNE seule règle, appliquée aux lignes comme aux groupes :
+ *
+ *   P0 d'abord, puis ce qui débloque le plus, puis la priorité.
+ *
+ * P0 n'est pas un cran de plus sur l'échelle. C'est la seule priorité que la page
+ * remplit en aplat plein, et la seule qui veuille dire « ça brûle » : une action P0
+ * enterrée sous deux groupes serait une erreur de lecture, pas un arbitrage. En
+ * dessous, l'ampleur CALCULÉE est un meilleur guide que P1/P2/P3, qui sont des
+ * estimations posées à la main — c'est le choix d'origine de l'outil, conservé.
+ *
+ * Deux niveaux triés par deux règles différentes, ce serait une liste qu'on doit
+ * réapprendre à chaque session.
+ */
+const byUrgency = (pa, fa, pb, fb) =>
+  (pa === 'P0' ? 0 : 1) - (pb === 'P0' ? 0 : 1) || fb - fa || pa.localeCompare(pb);
 
 /** Les actions ouvertes, regroupées par outil : on ouvre Supabase une fois, on enchaîne. */
 function actions(tickets) {
   const imp = impacts(tickets);
   return tickets.filter((t) => t.action).map((t) => {
     const i = t.action.indexOf('—');
+    const frees = [...(imp[t.id] || [])];
     return {
       id: t.id, icon: t.icon, priority: t.priority, epic: t.epic,
       tool: i < 0 ? 'divers' : t.action.slice(0, i).trim(),
       text: i < 0 ? t.action.trim() : t.action.slice(i + 1).trim(),
-      unblocks: imp[t.id] || 0,
+      unblocks: frees.length,
+      // Les identifiants voyagent avec l'action : la page regroupe elle-même par outil,
+      // et sans eux elle ne pourrait pas dédoublonner ce qu'un groupe libère.
+      frees,
     };
-  }).sort((a, b) => b.unblocks - a.unblocks || a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id));
+  }).sort((a, b) => byUrgency(a.priority, a.unblocks, b.priority, b.unblocks) || a.id.localeCompare(b.id));
 }
 
+/**
+ * Ce qu'un groupe d'actions pèse : sa priorité la plus haute, le nombre de tickets
+ * DISTINCTS qu'il libère en tout, et ce que sa plus grosse action libère à elle seule.
+ *
+ * `max` sert à ne PAS répéter : les actions étant triées par la même règle, la première
+ * ligne d'un groupe porte déjà sa priorité la plus haute, et le plus souvent son plus
+ * gros levier. Afficher le total en tête ne se justifie que s'il dépasse cette ligne —
+ * c'est-à-dire quand plusieurs actions libèrent des tickets DIFFÉRENTS.
+ *
+ * `P0 < P1 < P2 < P3` dans l'ordre des chaînes : la comparaison lexicale suffit, pas
+ * besoin d'une table de rangs à tenir synchronisée avec `PRIORITIES`.
+ */
+function toolWeight(acts) {
+  const frees = new Set();
+  for (const a of acts) for (const id of a.frees) frees.add(id);
+  return {
+    top: acts.reduce((m, a) => (a.priority < m ? a.priority : m), 'P3'),
+    frees: frees.size,
+    max: acts.reduce((m, a) => (a.unblocks > m ? a.unblocks : m), 0),
+  };
+}
+
+/**
+ * Groupe par outil, puis ORDONNE LES GROUPES avec la règle de `byUrgency`.
+ *
+ * L'ordre était « le groupe le plus fourni d'abord » — un critère de logistique, pas
+ * d'urgence. Conséquence : le groupe portant l'action qui libère cinq tickets pouvait
+ * se retrouver en bas de page, sous un groupe de six broutilles. Le regroupement par
+ * outil est conservé (on ouvre Supabase une fois, on enchaîne) ; seul son ORDRE change.
+ */
 function byTool(list) {
   const g = {};
   for (const a of list) (g[a.tool] ||= []).push(a);
-  return Object.entries(g).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  return Object.entries(g).map(([tool, acts]) => [tool, acts, toolWeight(acts)])
+    .sort((a, b) => byUrgency(a[2].top, a[2].frees, b[2].top, b[2].frees)
+      || b[1].length - a[1].length || a[0].localeCompare(b[0]));
 }
 
 /**
@@ -473,11 +533,23 @@ function renderIndex({ tickets, epics, recipes }) {
   const acts = actions(tickets);
   if (acts.length) {
     head.push(`## ⏳ Actions à faire — humaines (${acts.length})`, '');
-    for (const [tool, list] of byTool(acts)) {
-      head.push(`### ${tool} (${list.length})`);
-      for (const a of list) head.push(`- [${a.id}] ${a.priority} · débloque ${a.unblocks} · ${a.text}`);
+    for (const [tool, list, w] of byTool(acts)) {
+      // Ni la priorité ni le levier ne sont répétés ici : la première ligne du groupe
+      // les porte déjà, juste en dessous. Seul le total apparaît, et seulement s'il
+      // dit quelque chose qu'aucune ligne ne dit.
+      head.push(`### ${tool} — ${list.length} action${list.length > 1 ? 's' : ''}`
+        + (w.frees > w.max ? ` · débloque ${w.frees} tickets en tout` : ''));
+      // « débloque 0 » sur chaque ligne, c'est onze caractères qui ne disent rien, payés
+      // à chaque lecture d'index. Le silence dit la même chose et coûte zéro.
+      for (const a of list) {
+        head.push(`- [${a.id}] ${a.priority}${a.unblocks ? ` · débloque ${a.unblocks}` : ''} · ${a.text}`);
+      }
       head.push('');
     }
+    // La règle de tri, écrite une fois : sans elle, l'ordre de la liste ressemble à un
+    // hasard et se relit à chaque session.
+    head.push('→ Ordre (groupes et lignes) : P0 d\'abord, puis ce qui débloque le plus, puis la priorité. '
+      + 'Cocher : `node backlog.mjs --done <ID> ["…"]`', '');
   }
 
   return [
@@ -672,14 +744,39 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 .pf{font-size:11.5px;color:var(--muted);margin:8px 0 0;padding-top:7px;
   border-top:1px solid color-mix(in srgb,#f59e0b 22%,transparent)}
 .pf code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;border-radius:4px}
-.act{display:flex;gap:10px;align-items:flex-start;padding:9px 4px;border-top:1px solid var(--line);cursor:pointer}
+/* ── Vue « Mes actions » : deux canaux, jamais mélangés ────────────────────────
+   La COULEUR dit la priorité — la même échelle P0..P3 que le kanban, le même badge.
+   Le POIDS dit l'ampleur — combien de tickets l'action libère.
+   Peindre le levier en rouge lui aussi rendrait le rouge ambigu : on ne saurait plus
+   s'il crie « urgent » (jugement posé à la main) ou « débloquant » (fait calculé).
+   L'ambre reste réservé à l'attente, comme partout ailleurs dans la page. */
+.act{position:relative;display:flex;gap:10px;align-items:flex-start;padding:9px 4px 9px 14px;
+  border-top:1px solid var(--line);cursor:pointer}
 .act:first-of-type{border-top:0}
+/* La colonne du milieu prend toute la place restante : sans ça, l'identité du ticket
+   ne peut pas être rejetée à droite, elle colle au texte. */
+.act>span:first-of-type{flex:1;min-width:0}
+/* Le même filet de priorité que sur une carte du kanban : reconnu sans être appris. */
+.act::before{content:"";position:absolute;left:0;top:7px;bottom:7px;width:3px;border-radius:2px;background:var(--p2)}
+.act.P0::before{background:var(--p0)}.act.P1::before{background:var(--p1)}
+.act.P2::before{background:var(--p2)}.act.P3::before{background:var(--p3)}
+/* Ce qui est fait ne réclame plus rien : le filet s'éteint. */
+.act.past::before{background:var(--line)}
 .act input{margin:2px 0 0;width:16px;height:16px;accent-color:var(--accent);cursor:pointer;flex:none}
 .act .at{font-size:13px}
-.act .am{font-size:11.5px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
+.act .am{font-size:11.5px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:3px}
 .act.gone{opacity:.35;text-decoration:line-through}
 .act .chev{margin-left:auto;color:var(--muted);font-size:12px;flex:none;padding-left:8px}
 .act .wait{color:#b45309;font-weight:600}
+/* Trois paliers, pas un dégradé : comparer des nuances est plus lent que lire un
+   chiffre. Rien / un peu / beaucoup — et le chiffre exact reste écrit. */
+.frees{font-variant-numeric:tabular-nums;border:1px solid var(--line);border-radius:5px;padding:.5px 5px}
+.frees.big{font-weight:700;color:var(--ink);border-color:color-mix(in srgb,var(--ink) 34%,transparent);
+  background:color-mix(in srgb,var(--ink) 7%,transparent)}
+/* Identité du ticket : nécessaire (elle se copie vers la ligne de commande), jamais
+   première — elle ne sert qu'une fois la décision prise. Rejetée à droite, ensemble. */
+.act .who{margin-left:auto;display:flex;gap:8px;align-items:center;color:var(--muted)}
+.act .who .id{font-weight:600;color:var(--muted)}
 /* Tiroir d'action : la consigne, l'historique, et de quoi répondre. */
 .draw{border-top:1px dashed var(--line);padding:12px 4px 16px;cursor:default}
 .drawhd{display:flex;align-items:baseline;gap:10px;margin:6px 0 8px;font-size:12px}
@@ -710,10 +807,15 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
   overflow-x:auto;font-size:12px;line-height:1.5;margin:10px 0}
 pre code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
-.tool{display:flex;align-items:baseline;gap:9px;margin:0 0 4px}
+.tool{display:flex;align-items:center;gap:9px;margin:0 0 6px;flex-wrap:wrap}
 .tool b{font-size:12px;letter-spacing:.08em;text-transform:uppercase}
-.tool span{color:var(--muted);font-size:11.5px}
-.hot{color:var(--p1);font-weight:600}
+/* Le :not(.w) est nécessaire : les badges de poids portent leurs propres couleurs, et
+   la règle du muted les effacerait. Elle ne vaut que pour la légende du groupe. */
+.tool>span:not(.w){color:var(--muted);font-size:11.5px}
+.tool .w .frees,.tool .w .prio{font-size:11px}
+/* L'en-tête d'un groupe porte son poids : sans lui, l'ordre des groupes ressemble à
+   un hasard, et un ordre qu'on ne peut pas vérifier ne se lit plus. */
+.tool .w{margin-left:auto;display:flex;align-items:center;gap:7px}
 .rrow{display:grid;grid-template-columns:44px 1fr minmax(120px,220px) 52px;gap:12px;align-items:center;
   padding:9px 4px 3px;border-top:1px solid var(--line)}
 .rrow:first-of-type{border-top:0}
@@ -1151,6 +1253,37 @@ function renderRecipes(root) {
   }
 }
 
+/**
+ * Ce que pèse un groupe d'actions : sa priorité la plus haute, et les tickets DISTINCTS
+ * qu'il libère. Miroir exact de toolWeight() côté générateur — la page regroupe
+ * elle-même (elle filtre les cochées), elle doit donc savoir compter pareil.
+ */
+function weigh(acts) {
+  const frees = new Set();
+  for (const a of acts) for (const id of (a.frees || [])) frees.add(id);
+  return {
+    top: acts.reduce((m, a) => (a.priority < m ? a.priority : m), 'P3'),
+    frees: frees.size,
+    max: acts.reduce((m, a) => (a.unblocks > m ? a.unblocks : m), 0),
+  };
+}
+
+/**
+ * Le chiffre que tu veux voir en premier, gradué en trois paliers — voir le CSS.
+ *
+ * Zéro n'écrit RIEN. « ne débloque rien d'autre » se lisait comme une réponse
+ * rassurante sur deux ou trois lignes ; sur un vrai backlog il s'empile dix fois de
+ * suite dans le même groupe et devient du papier peint, qui affaiblit les deux vrais
+ * leviers juste au-dessus. Les actions étant triées levier en tête, l'ABSENCE de
+ * pastille se lit sans ambiguïté — et elle laisse la place à ce qui, lui, dit quelque chose.
+ */
+function freesChip(n, total) {
+  if (!n) return '';
+  return '<span class="frees' + (n >= 3 ? ' big' : '') + '" title="Tickets encore ouverts '
+    + (total ? 'que ce groupe libère' : 'que cette action libère') + '">'
+    + '🔓 débloque ' + n + ' ticket' + (n > 1 ? 's' : '') + (total ? ' en tout' : '') + '</span>';
+}
+
 function renderActions(root) {
   const acts = hiddenA.has('todo') ? [] : D.actions.filter(a => !DONE.has(a.id));
   if (!hiddenA.has('done')) doneList(root);
@@ -1158,27 +1291,42 @@ function renderActions(root) {
   if (!acts.length) { root.appendChild(el('div','empty','Rien ne t\\'attend. Le goulot, ce n\\'est pas toi.')); return; }
   const groups = {};
   for (const a of acts) (groups[a.tool] ||= []).push(a);
-  const keys = Object.keys(groups).sort((x, y) => groups[y].length - groups[x].length || x.localeCompare(y));
+  // Même règle qu'à l'intérieur d'un groupe (voir byUrgency côté générateur) : P0
+  // d'abord, puis ce qui débloque le plus. Trier par NOMBRE d'actions, comme avant,
+  // enterrait le gros levier sous un groupe de broutilles.
+  const W = {};
+  for (const k of Object.keys(groups)) W[k] = weigh(groups[k]);
+  const keys = Object.keys(groups).sort((x, y) =>
+    (W[x].top === 'P0' ? 0 : 1) - (W[y].top === 'P0' ? 0 : 1) || W[y].frees - W[x].frees
+    || W[x].top.localeCompare(W[y].top) || groups[y].length - groups[x].length || x.localeCompare(y));
 
   if (!D.live) root.appendChild(el('div', 'empty',
     'Page statique : les cases ne peuvent pas s\\'enregistrer. Lance « node scripts/backlog.mjs --serve » pour cocher.'));
 
   for (const k of keys) {
     const box = el('div', 'thread');
-    const t = el('div', 'tool');
+    const t = el('div', 'tool ' + W[k].top);
+    // Rien n'est répété ici. Les lignes étant triées par la même règle, la première
+    // d'entre elles — à quelques pixels sous cet en-tête — porte déjà la priorité la
+    // plus haute du groupe et, presque toujours, son plus gros levier. Le total ne
+    // s'affiche donc que s'il dépasse cette ligne, c'est-à-dire quand plusieurs
+    // actions du groupe libèrent des tickets DIFFÉRENTS. Le reste du temps, l'en-tête
+    // se tait : deux fois la même information, c'est une information qu'on cesse de lire.
     t.innerHTML = '<b>' + escape(k) + '</b><span>' + groups[k].length + ' action' +
-      (groups[k].length > 1 ? 's' : '') + ' — à faire d\\'un seul tenant</span>';
+      (groups[k].length > 1 ? 's' : '') + ' — à faire d\\'un seul tenant</span>' +
+      (W[k].frees > W[k].max ? '<span class="w">' + freesChip(W[k].frees, true) + '</span>' : '');
     box.appendChild(t);
     for (const a of groups[k]) {
       const pend = (D.journals[a.id] || []).filter(e => e.pending).length;
-      const row = el('div', 'act');
+      const row = el('div', 'act ' + a.priority);
+      // Ordre de lecture = ordre de décision : ce qui la classe d'abord (priorité,
+      // ampleur, remarques qui attendent), son identité seulement ensuite.
       row.innerHTML = '<input type="checkbox"' + (D.live ? '' : ' disabled') + '>' +
         '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
-        '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.priority + '</span>' +
-        (a.epic ? '<span>' + a.epic + '</span>' : '') +
-        (a.unblocks ? '<span class="hot">débloque ' + a.unblocks + ' ticket' + (a.unblocks > 1 ? 's' : '') + '</span>'
-                    : '<span>ne débloque rien d\\'autre</span>') +
-        (pend ? '<span class="wait">' + pend + ' remarque' + (pend > 1 ? 's' : '') + ' en attente</span>' : '') +
+        '<span class="prio">' + a.priority + '</span>' + freesChip(a.unblocks) +
+        (pend ? '<span class="wait">💬 ' + pend + ' remarque' + (pend > 1 ? 's' : '') + ' en attente</span>' : '') +
+        '<span class="who">' + (a.epic ? '<span>' + a.epic + '</span>' : '') +
+        '<span class="id">' + a.icon + ' ' + a.id + '</span></span>' +
         '</span></span><span class="chev">▾</span>';
       // Cocher emporte le texte en cours de saisie : sinon on perd la remarque
       // de celui qui écrit d'abord et coche ensuite — l'ordre le plus naturel.
@@ -1211,7 +1359,7 @@ function drawer(id, actionText) {
   d.onclick = ev => ev.stopPropagation();          // cliquer dedans ne referme pas
 
   // L'identifiant du ticket EST le code de l'action : le format n'autorise qu'une
-  // action en attente par ticket, donc « CIN-117 » la désigne sans ambiguïté. Pas de
+  // action en attente par ticket, donc « EX-117 » la désigne sans ambiguïté. Pas de
   // numérotation parallèle — ce serait une seconde identité à tenir synchronisée.
   const head = el('div', 'drawhd');
   head.innerHTML = '<b>Action <span class="code" title="Cliquer pour copier">' + id + '</span></b>' +
@@ -1417,11 +1565,11 @@ function doneList(root) {
   box.appendChild(el('div', 'tool', '<b>Fait</b><span>' + list.length + ' action' +
     (list.length > 1 ? 's' : '') + ' cochées — journalisées dans leur ticket</span>'));
   for (const a of list) {
-    const row = el('div', 'act');
+    const row = el('div', 'act past');
     row.innerHTML = '<input type="checkbox" checked' + (D.live ? '' : ' disabled') + '>' +
       '<span><span class="at">' + fmt(a.text) + '</span><span class="am">' +
-      '<span class="id">' + a.icon + ' ' + a.id + '</span><span>' + a.date + '</span>' +
-      '<span>' + escape(a.tool) + '</span></span></span>';
+      '<span>' + a.date + '</span><span>' + escape(a.tool) + '</span>' +
+      '<span class="who"><span class="id">' + a.icon + ' ' + a.id + '</span></span></span></span>';
     row.style.opacity = '.6';
     row.querySelector('input').onchange = () => send(a, row, true);
     row.onclick = ev => { if (ev.target.tagName !== 'INPUT') openTicket(a.id); };
