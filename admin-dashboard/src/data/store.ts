@@ -821,8 +821,21 @@ export class FleetStore {
       return { ok: true };
     }
     if (!supabase) return { ok: false, error: "hors ligne" };
-    const { error } = await supabase.from("org_styles").upsert(row, { onConflict: "organization_id" });
+    // `.select()` OBLIGATOIRE — même règle qu'en BUG-018 : un `upsert` dont l'UPDATE ne touche
+    // aucune ligne (policy RLS non permissive) répond 200 avec un corps vide. Sans lui, on
+    // projetterait le style en local et l'écran annoncerait « enregistré ✓ » alors que les
+    // cabines continueraient d'afficher l'ancien.
+    const { data, error } = await supabase
+      .from("org_styles")
+      .upsert(row, { onConflict: "organization_id" })
+      .select("organization_id");
     if (error) return { ok: false, error: error.message };
+    if ((data ?? []).length === 0) {
+      return {
+        ok: false,
+        error: "La base a accepté la requête sans rien écrire — droits insuffisants sur le style de cette organisation. Rien n'a changé sur vos cabines.",
+      };
+    }
     this.setOrgStyleLocal(orgId, row);
     return { ok: true };
   }
@@ -834,8 +847,19 @@ export class FleetStore {
       return { ok: true };
     }
     if (!supabase) return { ok: false, error: "hors ligne" };
-    const { error } = await supabase.from("org_styles").delete().eq("organization_id", orgId);
+    // Une suppression est IRRÉVERSIBLE et l'écran l'annonce comme faite : elle doit donc être
+    // constatée, pas supposée. Un DELETE refusé par la RLS ne renvoie pas d'erreur — il renvoie
+    // zéro ligne. On sait distinguer les deux cas : si l'organisation AVAIT un style et que rien
+    // n'est revenu, c'est un refus, pas un « il n'y avait rien à faire ».
+    const existed = this.orgStyles.has(orgId);
+    const { data, error } = await supabase.from("org_styles").delete().eq("organization_id", orgId).select("organization_id");
     if (error) return { ok: false, error: error.message };
+    if (existed && (data ?? []).length === 0) {
+      return {
+        ok: false,
+        error: "La base a accepté la requête sans rien supprimer — droits insuffisants sur le style de cette organisation. Le style précédent reste actif sur vos cabines.",
+      };
+    }
     this.setOrgStyleLocal(orgId, null);
     return { ok: true };
   }
@@ -878,8 +902,23 @@ export class FleetStore {
       return { ok: true };
     }
     if (!supabase) return { ok: false, error: "hors ligne" };
-    const { error } = await supabase.from("org_styles").delete().in("organization_id", [...orgIds]);
+    // Même garde qu'à l'unité, mais un lot peut être PARTIELLEMENT refusé : on compare le nombre
+    // de lignes rendues à celui des organisations qui avaient réellement un style. Annoncer
+    // « 12 styles réinitialisés » quand la base en a supprimé 3 serait le pire des deux mondes.
+    const hadStyle = orgIds.filter((id) => this.orgStyles.has(id));
+    const { data, error } = await supabase.from("org_styles").delete().in("organization_id", [...orgIds]).select("organization_id");
     if (error) return { ok: false, error: error.message };
+    const deleted = (data ?? []).length;
+    if (deleted < hadStyle.length) {
+      // Le cache local ne décrit plus la base : une partie des lignes est partie, l'autre non, et
+      // on ne sait pas laquelle. C'est LE cas où un rechargement complet est justifié — l'écran
+      // doit montrer la réalité, pas une projection devenue fausse.
+      await this.loadFromSupabase();
+      return {
+        ok: false,
+        error: `Réinitialisation partielle : ${deleted} style(s) supprimé(s) sur ${hadStyle.length} attendus — droits insuffisants sur le reste. Vérifiez la liste avant de vous y fier.`,
+      };
+    }
     this.forgetOrgStylesLocal(orgIds);
     return { ok: true };
   }
