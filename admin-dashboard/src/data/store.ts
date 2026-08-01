@@ -701,8 +701,14 @@ export class FleetStore {
     if (this.mode === "mock") {
       this.persistMock();
     } else {
-      void supabase!.from("booths").upsert(boothToRow(booth)).then(({ error }) => {
+      // Écriture OPTIMISTE : l'écran a déjà bougé. Si la base refuse — erreur, ou zéro ligne
+      // écrite parce que la RLS ne rend pas la ligne modifiable — l'affichage devient un
+      // mensonge durable. On le ramène à la vérité plutôt que de laisser une borne fantôme.
+      void supabase!.from("booths").upsert(boothToRow(booth)).select("id").then(({ data, error }) => {
         if (error) console.error("upsertBooth:", error.message);
+        else if ((data ?? []).length > 0) return;
+        else console.error("upsertBooth: la base n'a rien écrit (droits insuffisants) — état rechargé.");
+        void this.loadFromSupabase();
       });
     }
   }
@@ -712,8 +718,13 @@ export class FleetStore {
     if (this.mode === "mock") {
       this.persistMock();
     } else {
-      void supabase!.from("booths").delete().eq("id", id).then(({ error }) => {
+      // Idem : une borne retirée de l'écran mais toujours en base réapparaîtrait au prochain
+      // chargement, sans que personne comprenne pourquoi. Le refus doit se voir tout de suite.
+      void supabase!.from("booths").delete().eq("id", id).select("id").then(({ data, error }) => {
         if (error) console.error("deleteBooth:", error.message);
+        else if ((data ?? []).length > 0) return;
+        else console.error("deleteBooth: la base n'a rien supprimé (droits insuffisants) — état rechargé.");
+        void this.loadFromSupabase();
       });
     }
   }
@@ -1065,16 +1076,42 @@ export class FleetStore {
     }));
   }
 
+  /**
+   * Écriture ciblée qui EXIGE d'avoir touché une ligne (classe BUG-018 / BUG-016).
+   *
+   * ⚠️ LE PIÈGE, ET IL EST STRUCTUREL. PostgREST répond **200 avec un corps vide** quand un
+   * UPDATE ou un DELETE ne touche aucune ligne — ce qui est exactement ce qui arrive quand la
+   * policy RLS ne rend pas la ligne modifiable. `error` reste `null`. Un appelant qui ne teste
+   * que `error` annonce donc un succès là où la base n'a rien fait, et l'utilisateur repart
+   * convaincu du contraire. Sur une révocation d'accès, cette croyance est le danger lui-même.
+   *
+   * Passer une requête TERMINÉE PAR `.select(...)` : c'est elle qui fait remonter les lignes
+   * réellement écrites. Zéro ligne rendue ⇒ refus, dit à l'écran.
+   */
+  private async writeOne(
+    query: PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>,
+    refusal: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const { data, error } = await query;
+    if (error) return { ok: false, error: error.message };
+    if ((data ?? []).length === 0) return { ok: false, error: refusal };
+    return { ok: true };
+  }
+
   async setMemberRole(membershipId: string, role: OrgRole): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("memberships").update({ role }).eq("id", membershipId);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("memberships").update({ role }).eq("id", membershipId).select("id"),
+      "Le rôle n'a PAS été changé : la base a refusé la modification (droits insuffisants). Cette personne conserve exactement les accès qu'elle avait.",
+    );
   }
 
   async removeMember(membershipId: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("memberships").delete().eq("id", membershipId);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("memberships").delete().eq("id", membershipId).select("id"),
+      "Le membre n'a PAS été retiré : la base a refusé la suppression (droits insuffisants). Il a toujours accès à l'organisation.",
+    );
   }
 
   // ── Invitations ──────────────────────────────────────────────────────────────
@@ -1113,8 +1150,10 @@ export class FleetStore {
 
   async revokeInvitation(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("invitations").update({ status: "revoked" }).eq("id", id);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("invitations").update({ status: "revoked" }).eq("id", id).select("id"),
+      "L'invitation n'a PAS été révoquée : la base a refusé la modification. Le lien reste utilisable — ne considérez pas cet accès comme fermé.",
+    );
   }
 
   /** Accepte une invitation via son token (fonction security-definer côté base). */
@@ -1173,20 +1212,28 @@ export class FleetStore {
 
   async setOperatorAccessRevoked(id: string, revoked: boolean): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("operator_access").update({ revoked }).eq("id", id);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("operator_access").update({ revoked }).eq("id", id).select("id"),
+      revoked
+        ? "L'accès opérateur n'a PAS été révoqué : la base a refusé la modification. Le PIN fonctionne toujours sur les cabines — traitez-le comme actif."
+        : "L'accès opérateur n'a PAS été réactivé : la base a refusé la modification.",
+    );
   }
 
   async setOperatorAccessExpiry(id: string, expiresAt: string | null): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("operator_access").update({ expires_at: expiresAt }).eq("id", id);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("operator_access").update({ expires_at: expiresAt }).eq("id", id).select("id"),
+      "L'échéance n'a PAS été modifiée : la base a refusé l'écriture. L'accès conserve sa date d'expiration précédente.",
+    );
   }
 
   async deleteOperatorAccess(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("operator_access").delete().eq("id", id);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("operator_access").delete().eq("id", id).select("id"),
+      "L'accès opérateur n'a PAS été supprimé : la base a refusé la suppression. Le PIN fonctionne toujours sur les cabines.",
+    );
   }
 
   async listOperatorAccessLog(orgId: string, limit = 100): Promise<OperatorLogRecord[]> {
