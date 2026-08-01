@@ -1283,8 +1283,10 @@ export class FleetStore {
 
   async deletePaymentIntegration(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("payment_integrations").delete().eq("id", id);
-    return error ? { ok: false, error: error.message } : { ok: true };
+    return this.writeOne(
+      supabase!.from("payment_integrations").delete().eq("id", id).select("id"),
+      "L'intégration de paiement n'a PAS été supprimée : la base a refusé. Elle reste active sur vos cabines.",
+    );
   }
 
   /**
@@ -1341,9 +1343,12 @@ export class FleetStore {
       this.emit();
       return;
     }
-    const { error } = await supabase!.from("media").delete().eq("id", id);
+    const { data, error } = await supabase!.from("media").delete().eq("id", id).select("id");
+    // Suppression refusée par la RLS : 200, corps vide, aucune erreur. Sans ce contrôle, le média
+    // disparaissait de l'écran au rechargement suivant… puis revenait, sans explication.
     if (error) console.error("deleteMedia:", error.message);
-    else await this.loadFromSupabase();
+    else if ((data ?? []).length === 0) console.error("deleteMedia: la base n'a rien supprimé (droits insuffisants) — le média est toujours là.");
+    await this.loadFromSupabase();
   }
 
   /**
@@ -1757,8 +1762,11 @@ export class FleetStore {
   }
   async deleteDistributor(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("distributors").delete().eq("id", id);
-    if (error) return { ok: false, error: error.message };
+    const res = await this.writeOne(
+      supabase!.from("distributors").delete().eq("id", id).select("id"),
+      "Le distributeur n'a PAS été supprimé : la base a refusé. Ses licences restent en place.",
+    );
+    if (!res.ok) return res;
     await this.loadFromSupabase();
     return { ok: true };
   }
@@ -1808,8 +1816,11 @@ export class FleetStore {
   }
   async deleteMediaLicense(id: string): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: true };
-    const { error } = await supabase!.from("media_licenses").delete().eq("id", id);
-    if (error) return { ok: false, error: error.message };
+    const res = await this.writeOne(
+      supabase!.from("media_licenses").delete().eq("id", id).select("id"),
+      "La licence n'a PAS été supprimée : la base a refusé. Les droits et plafonds précédents s'appliquent toujours.",
+    );
+    if (!res.ok) return res;
     await this.loadFromSupabase();
     return { ok: true };
   }
@@ -1990,9 +2001,18 @@ export class FleetStore {
     if (video.isPrimary) {
       return { ok: false, error: "Version servie aux cabines : désignez-en une autre avant de la supprimer." };
     }
-    await supabase!.storage.from("media").remove([video.storageUrl]);
-    const { error } = await supabase!.from("media_videos").delete().eq("id", video.id);
-    if (error) return { ok: false, error: error.message };
+    // ⚠️ ORDRE : la LIGNE d'abord, le FICHIER ensuite. L'inverse — celui d'avant — perdait le
+    // fichier puis découvrait que la base refusait la suppression de la ligne : il restait une
+    // version déclarée pointant vers un objet inexistant, qu'aucun écran ne signale et que la
+    // cabine ne peut pas jouer. Si la base refuse, rien n'est perdu ; si c'est le storage qui
+    // échoue après, il ne reste qu'un fichier orphelin — coûteux en octets, jamais en séance.
+    const res = await this.writeOne(
+      supabase!.from("media_videos").delete().eq("id", video.id).select("id"),
+      "La version vidéo n'a PAS été supprimée : la base a refusé. Le fichier est intact.",
+    );
+    if (!res.ok) return res;
+    const { error: storageError } = await supabase!.storage.from("media").remove([video.storageUrl]);
+    if (storageError) console.warn("deleteMediaVideo: fichier orphelin laissé sur le storage —", storageError.message);
     await this.loadFromSupabase();
     return { ok: true };
   }
@@ -2063,10 +2083,16 @@ export class FleetStore {
       this.emit();
       return { ok: true };
     }
-    // L'objet peut déjà être absent (piste orpheline) → on ignore l'erreur storage.
-    await supabase!.storage.from("media").remove([sub.url]);
-    const { error } = await supabase!.from("subtitles").delete().eq("id", sub.id);
-    if (error) return { ok: false, error: error.message };
+    // ⚠️ La LIGNE d'abord, le FICHIER ensuite (même raison qu'en `deleteMediaVideo`) : une piste
+    // déclarée dont le `.vtt` a disparu, c'est une cabine qui demande un fichier absent en pleine
+    // séance. L'objet peut déjà être absent (piste orpheline) → l'erreur storage reste ignorée.
+    const res = await this.writeOne(
+      supabase!.from("subtitles").delete().eq("id", sub.id).select("id"),
+      "La piste de sous-titres n'a PAS été supprimée : la base a refusé. Le fichier est intact.",
+    );
+    if (!res.ok) return res;
+    const { error: storageError } = await supabase!.storage.from("media").remove([sub.url]);
+    if (storageError) console.warn("deleteSubtitle: fichier orphelin laissé sur le storage —", storageError.message);
     await this.loadFromSupabase();
     return { ok: true };
   }
