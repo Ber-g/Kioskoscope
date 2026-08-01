@@ -1978,14 +1978,57 @@ export class FleetStore {
   /** Désigne la version servie aux cabines (et aligne `media.storage_url`). */
   async setPrimaryMediaVideo(video: MediaVideoRecord): Promise<{ ok: boolean; error?: string }> {
     if (this.mode !== "supabase") return { ok: false, error: "hors ligne" };
-    // L'index unique partiel n'autorise qu'une primaire : on retire l'ancienne AVANT de poser la
-    // nouvelle, sinon l'update est rejeté.
-    const { error: clearErr } = await supabase!.from("media_videos").update({ is_primary: false }).eq("media_id", video.mediaId).eq("is_primary", true);
-    if (clearErr) return { ok: false, error: clearErr.message };
-    const { error } = await supabase!.from("media_videos").update({ is_primary: true }).eq("id", video.id);
-    if (error) return { ok: false, error: error.message };
-    const { error: me } = await supabase!.from("media").update({ storage_url: video.storageUrl }).eq("id", video.mediaId);
-    if (me) return { ok: false, error: me.message };
+    // ⚠️ TROIS ÉCRITURES, AUCUNE TRANSACTION. C'est la bascule qui décide de ce que le PUBLIC
+    // voit : l'index unique partiel n'autorise qu'une primaire, il faut donc retirer l'ancienne
+    // AVANT de poser la nouvelle. Or si la seconde écriture est refusée en silence (RLS : 200,
+    // corps vide, `error` à null), on vient de retirer l'ancienne primaire sans en poser d'autre
+    // — le média n'a PLUS AUCUNE version désignée, et personne n'en est averti. D'où le
+    // rattrapage explicite ci-dessous : à défaut de transaction, on répare ce qu'on a défait.
+    //
+    // 🔧 CONCEPTION JUSTE, NON FAITE : une RPC `security definer` qui fait les trois écritures
+    // dans UNE transaction. Elle demande une migration ; tant qu'elle n'existe pas, le rattrapage
+    // client est ce qui protège l'état — pas une élégance, un pansement assumé.
+    const cleared = await supabase!
+      .from("media_videos")
+      .update({ is_primary: false })
+      .eq("media_id", video.mediaId)
+      .eq("is_primary", true)
+      .select("id");
+    if (cleared.error) return { ok: false, error: cleared.error.message };
+    const clearedIds = ((cleared.data ?? []) as Array<{ id: string }>).map((r) => r.id);
+
+    const promoted = await supabase!.from("media_videos").update({ is_primary: true }).eq("id", video.id).select("id");
+    if (promoted.error || (promoted.data ?? []).length === 0) {
+      // RATTRAPAGE : on remet l'ancienne primaire là où elle était. Sans ça, un refus laisserait
+      // le média orphelin de version — un état que rien n'affiche et que personne ne soupçonne.
+      if (clearedIds.length > 0) {
+        const { error: undoErr } = await supabase!.from("media_videos").update({ is_primary: true }).in("id", clearedIds);
+        if (undoErr) {
+          return {
+            ok: false,
+            error: "La version n'a pas pu être changée ET l'ancienne n'a pas pu être rétablie : ce média n'a plus de version désignée. Rechargez la page et redésignez-en une avant de le diffuser.",
+          };
+        }
+      }
+      return {
+        ok: false,
+        error: promoted.error?.message ?? "La base a refusé de changer la version servie aux cabines. L'ancienne version reste en place — rien n'a changé pour le public.",
+      };
+    }
+
+    // `media.storage_url` est ce que LIT la cabine : s'il n'est pas aligné, le back-office
+    // affiche une version et les bornes en jouent une autre. Un désaccord silencieux entre les
+    // deux est pire que l'échec, parce qu'il ne se voit que sur place, pendant une séance.
+    const aligned = await supabase!.from("media").update({ storage_url: video.storageUrl }).eq("id", video.mediaId).select("id");
+    if (aligned.error || (aligned.data ?? []).length === 0) {
+      await this.loadFromSupabase();
+      return {
+        ok: false,
+        error:
+          aligned.error?.message ??
+          "La version a bien été désignée, mais le fichier servi aux cabines n'a PAS été mis à jour : les bornes joueront encore l'ancienne version. Réessayez avant de diffuser.",
+      };
+    }
     await this.loadFromSupabase();
     return { ok: true };
   }
