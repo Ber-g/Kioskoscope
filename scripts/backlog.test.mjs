@@ -94,6 +94,73 @@ test('une note --ack peut commencer par des tirets sans être prise pour un drap
   rmSync(root, { recursive: true, force: true });
 });
 
+// ─────────────────────────────────────────────── TKS-015 — cocher sans navigateur
+
+const ticket = (root, id) => readFileSync(join(root, 'backlog', `${id}.md`), 'utf8');
+const ACTION = 'navigateur — Vérifier que le compteur se remplit';
+
+test('--done coche l\'action, --undo la remet — à l\'octet près', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001', `owner: cto\naction: ${ACTION}\n`, 'Le corps.') });
+  const before = ticket(root, 'EX-001');
+
+  const d = run(root, ['--done', 'EX-001']);
+  assert.equal(d.code, 0, d.err);
+  assert.match(ticket(root, 'EX-001'), new RegExp(`- ✅ \\d{4}-\\d{2}-\\d{2} — ${ACTION}`));
+  assert.doesNotMatch(ticket(root, 'EX-001'), /^action: /m);
+
+  const u = run(root, ['--undo', 'EX-001']);
+  assert.equal(u.code, 0, u.err);
+  assert.equal(ticket(root, 'EX-001'), before, 'l\'aller-retour doit être neutre');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('--undo consomme le commentaire de l\'entrée, pas seulement sa première ligne', () => {
+  // Le piège documenté sur `undoAction` : ne retirer que la ligne « ✅ » laisserait le
+  // « > » orphelin, rattaché à l'entrée précédente — c'est-à-dire une FAUSSE trace.
+  const root = fixture({ 'EX-001': TICKET('EX-001', `owner: cto\naction: ${ACTION}\n`, 'Le corps.') });
+  const before = ticket(root, 'EX-001');
+
+  run(root, ['--done', 'EX-001', 'pas trouvé l\'écran, à revoir']);
+  assert.match(ticket(root, 'EX-001'), /\n {2}> pas trouvé l'écran, à revoir/);
+
+  run(root, ['--undo', 'EX-001']);
+  assert.equal(ticket(root, 'EX-001'), before, 'aucun commentaire orphelin ne doit rester');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('la note de --done est facultative, celle de --ack ne l\'est pas', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001', `owner: cto\naction: ${ACTION}\n`) });
+  // Cocher sans commenter est permis sur la page : la ligne de commande dit la même règle.
+  assert.equal(run(root, ['--done', 'EX-001']).code, 0);
+  assert.equal(run(root, ['--ack', 'EX-001']).code, 1, 'une note d\'accusé vide reste refusée');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('--comment écrit une remarque en attente, et refuse un texte vide', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001') });
+
+  const vide = run(root, ['--comment', 'EX-001', '   ']);
+  assert.equal(vide.code, 1);
+  assert.match(vide.err, /vide/);
+
+  const ok = run(root, ['--comment', 'EX-001', 'le compteur reste à zéro']);
+  assert.equal(ok.code, 0, ok.err);
+  assert.match(ticket(root, 'EX-001'), /- 💬 \d{4}-\d{2}-\d{2} — le compteur reste à zéro/);
+  assert.match(index(root), /Remarques en attente \(1\)/, 'elle naît en attente, comme au clic');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('un commentaire qui PARLE d\'un drapeau ne le déclenche pas', () => {
+  // `ARGV.includes('--undo')` suffisait tant que les charges utiles étaient des notes.
+  // Sur un outil dont le backlog parle de ses propres drapeaux, ça ne suffit plus.
+  const root = fixture({ 'EX-001': TICKET('EX-001', `owner: cto\naction: ${ACTION}\n`) });
+  const r = run(root, ['--comment', 'EX-001', 'il faudrait un --undo en ligne de commande']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(ticket(root, 'EX-001'), /- 💬 .* — il faudrait un --undo en ligne de commande/);
+  assert.match(ticket(root, 'EX-001'), /^action: /m, 'l\'action ne doit pas avoir bougé');
+  rmSync(root, { recursive: true, force: true });
+});
+
 // ─────────────────────────────────────────────── TKS-011 — remarques en attente
 
 test('une remarque en attente remonte VERBATIM en tête d\'index', () => {
@@ -319,5 +386,118 @@ test('--init n\'écrase pas un PROTOCOLE.md amendé', () => {
   writeFileSync(file, '# amendé par le projet', 'utf8');
   run(root, ['--init']);
   assert.equal(readFileSync(file, 'utf8'), '# amendé par le projet');
+  rmSync(root, { recursive: true, force: true });
+});
+
+// ─────────────────────────────────────────────── Séances de test
+
+/** Une séance dans le backlog jetable. `fixture()` ne connaît que les tickets. */
+function seance(root, id, content) {
+  const dir = join(root, 'backlog', 'seances');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${id}.md`), content, 'utf8');
+}
+
+const SEANCE = (id, body) => `---
+id: ${id}
+title: Devant la borne
+when: ~1 h · sur place
+---
+
+${body}
+`;
+
+test('une séance compte ses étapes ouvertes, sans compter ce qui n\'en est pas une', () => {
+  const root = fixture({
+    // une action ouverte : reste à cocher
+    'EX-001': TICKET('EX-001', 'action: borne — Vérifier le démarrage\n'),
+    // action déjà cochée (elle est passée dans le journal) : faite
+    'EX-002': TICKET('EX-002', '', '## Journal\n\n- ✅ 2026-07-28 — borne — Brancher l\'écran'),
+    // ni action en attente ni action passée : c'est une MENTION, pas une étape
+    'EX-003': TICKET('EX-003'),
+  });
+  seance(root, 'S1', SEANCE('S1', '1. [[EX-001]]\n2. [[EX-002]]\n\nHors séance : [[EX-003]].'));
+  run(root);
+
+  const line = index(root).split('\n').find((l) => l.startsWith('- [S1]'));
+  assert.ok(line, 'la séance doit apparaître dans l\'index');
+  // 2 étapes réelles (EX-003 n'en est pas une), dont 1 encore à cocher
+  assert.match(line, /1 étape sur 2 à cocher/);
+  assert.match(line, /backlog\/seances\/S1\.md/, 'l\'index dit où lire le plan');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('une séance entièrement cochée quitte l\'index — rien de terminé n\'y reste', () => {
+  const root = fixture({
+    'EX-001': TICKET('EX-001', '', '## Journal\n\n- ✅ 2026-07-28 — borne — Brancher l\'écran'),
+  });
+  seance(root, 'S1', SEANCE('S1', '1. [[EX-001]]'));
+  run(root);
+  assert.doesNotMatch(index(root), /Séances de test/);
+  // Elle reste lisible sur la page : c'est là qu'on relit ce qu'on a fait.
+  assert.match(html(root), /"seances":\[\{"id":"S1"/);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('une séance qui cite un ticket inconnu le signale, comme un ticket le ferait', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001', 'action: borne — Vérifier\n') });
+  seance(root, 'S1', SEANCE('S1', '1. [[EX-001]]\n2. [[EX-404]]'));
+  const r = run(root);
+  assert.match(r.err, /seances\/S1 : référence inconnue « EX-404 »/);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('une séance sans aucune action citée est signalée plutôt que de disparaître', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001') });
+  seance(root, 'S1', SEANCE('S1', 'Du texte, et rien qui cite une action.'));
+  const r = run(root);
+  assert.match(r.err, /seances\/S1 : aucune action citée/);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('un identifiant cité dans un bloc de code n\'est pas une étape', () => {
+  const root = fixture({
+    'EX-001': TICKET('EX-001', 'action: borne — Vérifier\n'),
+    'EX-002': TICKET('EX-002', 'action: borne — Autre chose\n'),
+  });
+  seance(root, 'S1', SEANCE('S1', '1. [[EX-001]]\n\n```sh\nnode backlog.mjs --done EX-002\n```'));
+  run(root);
+  const line = index(root).split('\n').find((l) => l.startsWith('- [S1]'));
+  assert.match(line, /1 étape sur 1 à cocher/, 'EX-002 n\'est cité que dans un exemple de commande');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('la page porte l\'état de chaque étape, pour barrer ce qui est fait', () => {
+  const root = fixture({
+    'EX-001': TICKET('EX-001', 'action: borne — Vérifier\n'),
+    'EX-002': TICKET('EX-002', '', '## Journal\n\n- ✅ 2026-07-28 — borne — Brancher'),
+  });
+  seance(root, 'S1', SEANCE('S1', '1. [[EX-001]]\n2. [[EX-002]]'));
+  run(root);
+  const h = html(root);
+  assert.match(h, /\{"id":"EX-001","state":"open"\}/);
+  assert.match(h, /\{"id":"EX-002","state":"checked"\}/);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('l\'ordre d\'une séance survit au rendu : une liste numérotée reste numérotée', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001', 'action: borne — Vérifier\n') });
+  // Une séance qui reprend la numérotation d'une autre ne doit pas se renuméroter à 1.
+  seance(root, 'S1', SEANCE('S1', '10. Première étape de cette séance\n11. [[EX-001]]'));
+  run(root);
+  // `<` est réécrit en < dans le JSON embarqué : on cherche donc la forme échappée.
+  const h = html(root);
+  assert.match(h, /\\u003col start=\\"10\\">/, 'le numéro de départ vient du source');
+  assert.doesNotMatch(h, /10\. Première étape/, 'et non d\'un paragraphe où l\'ordre se perd');
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('« Mes actions » peut se filtrer par priorité, avec le même état que le kanban', () => {
+  const root = fixture({ 'EX-001': TICKET('EX-001', 'action: borne — Vérifier\n') });
+  run(root);
+  const bar = html(root).match(/<div class="filters" id="afilters"[\s\S]*?<\/div>/)[0];
+  for (const p of ['P0', 'P1', 'P2', 'P3']) assert.match(bar, new RegExp(`data-prio="${p}"`));
+  // MÊME attribut que la barre du kanban : c'est ce qui garantit un seul état partagé.
+  assert.match(bar, /id="foldall"/, 'et de quoi replier les groupes d\'un coup');
   rmSync(root, { recursive: true, force: true });
 });

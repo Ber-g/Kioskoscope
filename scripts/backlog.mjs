@@ -116,27 +116,9 @@ function read() {
     });
   }
 
-  const epics = [];
-  const epicDir = join(DIR, 'epics');
-  if (existsSync(epicDir)) {
-    for (const f of readdirSync(epicDir).filter((f) => f.endsWith('.md')).sort()) {
-      const [meta, body, w] = parseFrontmatter(readFileSync(join(epicDir, f), 'utf8'), `epics/${f}`);
-      warnings.push(...w);
-      epics.push({ id: meta.id || basename(f, '.md'), title: meta.title || basename(f, '.md'),
-        phase: meta.phase || '', body: body.trim() });
-    }
-  }
-
-  const recipes = [];
-  const recipeDir = join(DIR, 'recipes');
-  if (existsSync(recipeDir)) {
-    for (const f of readdirSync(recipeDir).filter((f) => f.endsWith('.md')).sort()) {
-      const [meta, body, w] = parseFrontmatter(readFileSync(join(recipeDir, f), 'utf8'), `recipes/${f}`);
-      warnings.push(...w);
-      recipes.push({ id: meta.id || basename(f, '.md'), title: meta.title || basename(f, '.md'),
-        when: meta.when || '', body: body.trim() });
-    }
-  }
+  const epics = readSub('epics', ['phase'], warnings);
+  const recipes = readSub('recipes', ['when'], warnings);
+  const seances = readSub('seances', ['when'], warnings).map((s) => ({ ...s, ...seanceSteps(s.body, tickets) }));
 
   // Intégrité référentielle : une référence pendante est une erreur de saisie, pas un détail.
   const known = new Set(tickets.map((t) => t.id));
@@ -147,7 +129,31 @@ function read() {
     }
     if (t.epic && !knownEpics.has(t.epic)) warnings.push(`${t.id} : épique « ${t.epic} » sans fichier epics/${t.epic}.md`);
   }
-  return { tickets, epics, recipes, warnings };
+  // Une séance qui cite un ticket disparu envoie faire une vérification qui n'existe plus.
+  for (const s of seances) {
+    for (const ref of s.dangling) warnings.push(`seances/${s.id} : référence inconnue « ${ref} »`);
+    // Sans étape, une séance n'est pas un plan : c'est un texte. Elle n'apparaîtrait ni
+    // dans l'index ni dans le compteur — autant le dire plutôt que la laisser disparaître.
+    if (!realSteps(s)) warnings.push(`seances/${s.id} : aucune action citée — une séance ORDONNE des actions existantes`);
+  }
+  return { tickets, epics, recipes, seances, warnings };
+}
+
+/**
+ * Épiques, recettes, séances : trois collections de la même forme — un sous-dossier,
+ * `id` + `title` en frontmatter, un corps libre. Une seule boucle, sinon la troisième
+ * copie diverge de la première le jour où le parseur bouge.
+ */
+function readSub(sub, fields, warnings) {
+  const d = join(DIR, sub);
+  if (!existsSync(d)) return [];
+  return readdirSync(d).filter((f) => f.endsWith('.md')).sort().map((f) => {
+    const [meta, body, w] = parseFrontmatter(readFileSync(join(d, f), 'utf8'), `${sub}/${f}`);
+    warnings.push(...w);
+    const rec = { id: meta.id || basename(f, '.md'), title: meta.title || basename(f, '.md'), body: body.trim() };
+    for (const k of fields) rec[k] = meta[k] || '';
+    return rec;
+  });
 }
 
 // ─────────────────────────────────────────────────────────── historique git
@@ -382,9 +388,80 @@ function pendingRemarks(tickets) {
   return groups.sort((a, b) => b.last.localeCompare(a.last) || a.id.localeCompare(b.id));
 }
 
+// ─────────────────────────────────────────────────────────── séances de test
+
+/**
+ * Une SÉANCE : l'ordre dans lequel on vide sa liste d'actions, écrit à la main.
+ *
+ * Ce n'est pas une recette. Une recette est une procédure REJOUABLE — « publier une
+ * modification », « démarrer sur un nouveau projet » — qu'on ouvre le jour où on en a
+ * besoin et qui ne parle d'aucun ticket en particulier. Une séance est datée par nature :
+ * elle cite les actions ouvertes du moment, elle se périme en les faisant, et sa valeur
+ * tient dans un fait que rien ne calcule — l'unité de travail réelle n'est pas le ticket,
+ * c'est le DÉPLACEMENT. « Onze actions devant la borne » se font en une fois ou pas du tout.
+ * Ranger ça dans les recettes, c'est faire d'un plan de la semaine une procédure permanente.
+ *
+ * Le corps est libre : c'est de la prose, avec un ordre et des raisons. Ce qui n'est PAS
+ * libre, c'est l'état d'avancement — il n'est jamais saisi. Chaque ticket cité devient une
+ * étape dont l'état se lit dans le ticket lui-même :
+ *
+ *   `open`    — le ticket porte encore une ligne `action:` : reste à cocher
+ *   `checked` — plus d'action en attente, et le journal en garde une cochée : c'est fait
+ *   `none`    — ni l'un ni l'autre : simple mention, ce n'est pas une étape
+ *
+ * Le troisième cas est ce qui empêche le compteur de mentir : une séance qui renvoie à un
+ * ticket de contexte ne doit pas afficher « 1 étape jamais faite » jusqu'à la fin des temps.
+ *
+ * ⚠️ `checked` veut dire « quelqu'un a coché », pas « le ticket est clos ». Cocher, c'est
+ * déclarer avoir fait le geste demandé — l'analyse de ce qu'il a produit reste entière, et
+ * c'est le `status:` du ticket, lui seul, qui dit si l'affaire est close.
+ */
+function seanceSteps(body, tickets) {
+  const byId = Object.fromEntries(tickets.map((t) => [t.id, t]));
+  const steps = [];
+  const dangling = [];
+  const seen = new Set();
+  // Un bloc de code cite des commandes, pas des étapes : « CIN-101 » dans un exemple de
+  // ligne de commande ne doit pas s'ajouter au décompte de la séance.
+  for (const [, wiki, bare] of stripFences(body).matchAll(REF_PATTERN)) {
+    const id = wiki || bare;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const t = byId[id];
+    if (!t) { dangling.push(id); continue; }
+    const done = parseJournal(t.body).some((e) => e.kind === 'action');
+    steps.push({ id, state: t.action ? 'open' : done ? 'checked' : 'none' });
+  }
+  return { steps, dangling };
+}
+
+/** Le texte hors blocs de code clôturés — ce qui est cité en `\`\`\`` ne référence rien. */
+const stripFences = (src) => {
+  const out = [];
+  let inFence = false;
+  for (const line of src.split('\n')) {
+    if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
+    if (!inFence) out.push(line);
+  }
+  return out.join('\n');
+};
+
+/** Étapes qui restent à cocher — le seul chiffre qu'une séance affiche. */
+const openSteps = (s) => s.steps.filter((x) => x.state === 'open').length;
+/** Étapes tout court : ce qui n'est qu'une mention (`none`) n'en est pas une. */
+const realSteps = (s) => s.steps.filter((x) => x.state !== 'none').length;
+
 // ─────────────────────────────────────────────────────────── markdown minimal
 
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * Un identifiant de ticket cité dans un corps : `[[EX-112]]` ou `EX-112` nu.
+ *
+ * Une seule définition : la page en fait des liens, les séances en font des étapes. Deux
+ * copies du motif, et une séance finirait par ne pas compter ce que la page rend cliquable.
+ */
+const REF_PATTERN = /\[\[([A-Z]{2,5}-[\w+]+)\]\]|\b([A-Z]{2,5}-\d+)\b/g;
 
 function inline(s) {
   return esc(s)
@@ -392,7 +469,7 @@ function inline(s) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     // un seul passage : sinon la 2ᵉ passe re-linkerait l'intérieur des ancres produites par la 1ʳᵉ
-    .replace(/\[\[([A-Z]{2,5}-[\w+]+)\]\]|\b([A-Z]{2,5}-\d+)\b/g,
+    .replace(REF_PATTERN,
       (_, wiki, bare) => { const id = wiki || bare; return `<a href="#" data-goto="${id}">${id}</a>`; });
 }
 
@@ -410,7 +487,16 @@ function md(src) {
     out.push(em ? `<p><em>${inline(em[1])}</em></p>` : `<p>${inline(txt)}</p>`);
     para = [];
   };
-  const flushList = () => { if (list) { out.push(`<ul>${list.join('')}</ul>`); list = null; } };
+  // Les listes NUMÉROTÉES ne sont pas un raffinement de rendu : une séance de test est
+  // un ordre, et « 1. puis 2. puis 3. » est ce qu'elle a de plus important à dire. Rendues
+  // en paragraphe, ses étapes se collaient les unes aux autres et l'ordre disparaissait.
+  // Le `start` est repris du source : une séance qui reprend à 10 n'a pas à se renuméroter.
+  const flushList = () => {
+    if (!list) return;
+    const start = list.tag === 'ol' && list.start !== 1 ? ` start="${list.start}"` : '';
+    out.push(`<${list.tag}${start}>${list.items.join('')}</${list.tag}>`);
+    list = null;
+  };
   const flush = () => { flushPara(); flushList(); };
 
   for (let i = 0; i < lines.length; i++) {
@@ -451,11 +537,22 @@ function md(src) {
       continue;
     }
 
-    const li = line.match(/^\s*[-*]\s+(.*)$/);
-    if (li) { flushPara(); (list ||= []).push(`<li>${inline(li[1])}</li>`); continue; }
+    const li = line.match(/^\s*(?:([-*])|(\d{1,3})[.)])\s+(.*)$/);
+    if (li) {
+      const tag = li[1] ? 'ul' : 'ol';
+      flushPara();
+      if (list && list.tag !== tag) flushList();   // une puce ne prolonge pas une numérotation
+      list ||= { tag, start: Number(li[2] || 1), items: [] };
+      list.items.push(`<li>${inline(li[3])}</li>`);
+      continue;
+    }
 
     // continuation d'un item de liste (le source enroule ses lignes)
-    if (list && /^\s{2,}\S/.test(line)) { list[list.length - 1] = list[list.length - 1].replace(/<\/li>$/, ` ${inline(line.trim())}</li>`); continue; }
+    if (list && /^\s{2,}\S/.test(line)) {
+      const n = list.items.length - 1;
+      list.items[n] = list.items[n].replace(/<\/li>$/, ` ${inline(line.trim())}</li>`);
+      continue;
+    }
 
     flushList();
     para.push(line.trim());
@@ -490,7 +587,7 @@ function quoteForIndex(text) {
   return `${(sp > INDEX_QUOTE_MAX * 0.6 ? cut.slice(0, sp) : cut).trimEnd()}…`;
 }
 
-function renderIndex({ tickets, epics, recipes }) {
+function renderIndex({ tickets, epics, recipes, seances }) {
   const titles = Object.fromEntries(epics.map((e) => [e.id, e.title]));
   const line = (t) => `- ${t.icon} [${t.id}] ${t.priority} · ${t.status} · ${t.hook}${t.epic ? ` — ${t.epic}` : ''}`;
   const active = tickets.filter((t) => t.status === 'todo' || t.status === 'doing').sort(byEpicPrioId);
@@ -550,6 +647,24 @@ function renderIndex({ tickets, epics, recipes }) {
     // hasard et se relit à chaque session.
     head.push('→ Ordre (groupes et lignes) : P0 d\'abord, puis ce qui débloque le plus, puis la priorité. '
       + 'Cocher : `node backlog.mjs --done <ID> ["…"]`', '');
+  }
+
+  // Juste après les actions, parce qu'une séance ne dit rien d'autre que : dans quel ORDRE
+  // faire celles-là. Une seule ligne par séance — le plan lui-même se lit dans son fichier,
+  // ou dans « Mes actions », où chaque étape est cliquable.
+  // Une séance entièrement cochée sort de l'index : « rien de terminé ne reste dans
+  // l'index » vaut pour elle comme pour un ticket. Elle reste lisible sur la page et
+  // dans son fichier — c'est là qu'on relit ce qu'on a fait, pas dans la surface de scan.
+  const plans = (seances || []).filter((s) => openSteps(s));
+  if (plans.length) {
+    head.push(`## 🧪 Séances de test (${plans.length})`, '');
+    for (const s of plans) {
+      const left = openSteps(s);
+      head.push(`- [${s.id}] ${s.title} — ${left} étape${left > 1 ? 's' : ''} sur ${realSteps(s)} à cocher`
+        + `${s.when ? ` · ${s.when}` : ''} · \`${basename(DIR)}/seances/${s.id}.md\``);
+    }
+    head.push('', '→ Une séance groupe des actions qui se font **d\'un seul tenant** (même écran, même '
+      + 'déplacement). Cocher une étape dit « je l\'ai faite » — pas « le ticket est clos ».', '');
   }
 
   return [
@@ -658,7 +773,7 @@ input[type=search]{font:inherit;padding:7px 11px;border:1px solid var(--line);bo
 .thread h2{margin:0 0 2px;font-size:14px;letter-spacing:.04em}
 .thread h2 .k{color:var(--muted);font-weight:400;margin-left:8px;font-size:12px}
 .prose{color:var(--muted);font-size:12.5px;max-width:74ch}
-.prose p{margin:.5em 0}.prose ul{margin:.5em 0;padding-left:1.1em}.prose h3,.prose h4{color:var(--ink);font-size:12.5px;margin:1em 0 .3em}
+.prose p{margin:.5em 0}.prose ul,.prose ol{margin:.5em 0;padding-left:1.3em}.prose h3,.prose h4{color:var(--ink);font-size:12.5px;margin:1em 0 .3em}
 .prose table{border-collapse:collapse;margin:.6em 0;font-size:12px}
 .prose th,.prose td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}
 .prose code{background:color-mix(in srgb,var(--ink) 7%,transparent);padding:.5px 4px;border-radius:4px;font-size:11.5px}
@@ -807,7 +922,13 @@ dialog::backdrop{background:rgba(10,11,13,.42);backdrop-filter:blur(2px)}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
   overflow-x:auto;font-size:12px;line-height:1.5;margin:10px 0}
 pre code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
-.tool{display:flex;align-items:center;gap:9px;margin:0 0 6px;flex-wrap:wrap}
+/* L'en-tête de groupe est un BOUTON : il replie son outil. Une liste de huit outils
+   ne se lit pas — on vient y chercher un outil, pas les huit. Replier est donc l'état
+   utile, et il doit se voir comme un geste possible, pas se deviner. */
+.tool{display:flex;align-items:center;gap:9px;margin:0 0 6px;flex-wrap:wrap;width:100%;
+  text-align:left;padding:2px 0;border-radius:6px}
+.tool:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
+.tool:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .tool b{font-size:12px;letter-spacing:.08em;text-transform:uppercase}
 /* Le :not(.w) est nécessaire : les badges de poids portent leurs propres couleurs, et
    la règle du muted les effacerait. Elle ne vaut que pour la légende du groupe. */
@@ -816,6 +937,67 @@ pre code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre
 /* L'en-tête d'un groupe porte son poids : sans lui, l'ordre des groupes ressemble à
    un hasard, et un ordre qu'on ne peut pas vérifier ne se lit plus. */
 .tool .w{margin-left:auto;display:flex;align-items:center;gap:7px}
+/* Le chevron reste à gauche du libellé : c'est lui qui annonce que le titre s'ouvre.
+   À droite il se lirait comme une décoration de fin de ligne, comme sur les actions. */
+.tool .fold{color:var(--muted);font-size:11px;width:9px;flex:none;transition:transform .12s}
+.tool[aria-expanded=false] .fold{transform:rotate(-90deg)}
+/* Replié, le groupe ne doit RIEN cacher de ce qui déciderait de l'ouvrir : sa priorité
+   la plus haute reste écrite, à côté du compte. */
+.tool[aria-expanded=false]{margin-bottom:0}
+
+/* ── Séances de test ──────────────────────────────────────────────────────────
+   Une séance n'est pas une vue de plus : c'est l'en-tête de « Mes actions ». Elle
+   répond à la question posée AVANT la liste — « dans quel ordre, et en combien de
+   fois ? » — et elle n'a de sens qu'à côté des actions qu'elle ordonne. La reléguer
+   dans un onglet, c'est demander de tenir deux écrans en tête au lieu d'un.
+   Le corps est plafonné en hauteur (comme un tiroir d'action) : un plan de 100 lignes
+   ne doit pas repousser la liste hors de l'écran à chaque ouverture. */
+.seance{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+  box-shadow:var(--shadow);padding:12px 16px 14px;margin-bottom:12px}
+.seance.over{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+.schd{display:flex;align-items:center;gap:10px;width:100%;text-align:left;flex-wrap:wrap;
+  border-radius:6px;padding:2px 0}
+.schd:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.schd .fold{color:var(--muted);font-size:11px;width:9px;flex:none;transition:transform .12s}
+.seance[data-open=no] .schd .fold{transform:rotate(-90deg)}
+.schd b{font-size:13px}
+.schd .k{font:600 11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.schd .when{color:var(--muted);font-size:11.5px}
+.scprog{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:11.5px;
+  color:var(--muted);font-variant-numeric:tabular-nums}
+.scbar{width:74px;height:6px;border-radius:3px;background:var(--line);overflow:hidden;flex:none}
+.scbar i{display:block;height:100%;background:var(--accent)}
+/* Pas de .prose ici, et c'est délibéré : .prose peint son texte en --muted, ce qui
+   convient à un contexte qu'on survole. Une séance ne se survole pas — on la suit une
+   étape à la fois, la main sur la borne. Elle se lit donc à l'encre pleine. */
+.scbody{font-size:13px;line-height:1.55;max-height:44vh;overflow:auto;margin-top:11px;
+  padding:12px 16px;background:var(--bg);border:1px solid var(--line);border-radius:8px}
+.scbody :first-child{margin-top:0}.scbody :last-child{margin-bottom:0}
+.scbody p{margin:.5em 0;max-width:78ch}
+.scbody h2{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:18px 0 8px}
+.scbody h3{font-size:12.5px;margin:14px 0 6px}
+/* L'ordre est le contenu : les numéros doivent rester lisibles à côté du texte, pas
+   collés dessous. Un peu d'air entre les étapes, parce qu'on en lit une à la fois. */
+.scbody ol,.scbody ul{margin:.6em 0;padding-left:1.6em}
+.scbody li{margin:.5em 0;max-width:78ch}
+.scbody li::marker{color:var(--muted);font-variant-numeric:tabular-nums}
+.scbody code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:.5px 5px;border-radius:4px;font-size:12px}
+.scbody table{border-collapse:collapse;margin:.6em 0;font-size:12.5px}
+.scbody th,.scbody td{border:1px solid var(--line);padding:5px 9px;text-align:left;vertical-align:top}
+.scnote{font-size:11.5px;color:var(--muted);margin-top:9px}
+/* Une étape citée dans la prose est un LIEN VERS L'ACTION, pas vers le ticket : on lit
+   le plan, on clique, on est devant la case à cocher. Son état vient de la donnée —
+   jamais d'une saisie — pour que le plan ne puisse pas contredire la liste juste
+   dessous. Barrer ce qui est coché suffit : c'est la convention de la liste de courses,
+   personne ne l'apprend. */
+.scbody a[data-step]{text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 45%,transparent)}
+.scbody a[data-step]:hover{border-bottom-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.scbody a[data-step=checked]{color:var(--muted);text-decoration:line-through;border-bottom-color:transparent}
+.scbody a[data-step=none]{color:var(--muted);border-bottom-style:dotted}
+/* L'action qu'on vient d'atteindre depuis le plan : une lueur qui s'éteint. Sans elle,
+   le saut dépose au milieu d'une liste homogène et on cherche ce qu'on venait faire. */
+@keyframes land{from{background:color-mix(in srgb,var(--accent) 22%,transparent)}to{background:transparent}}
+.act.land{animation:land 1.6s ease-out}
 .rrow{display:grid;grid-template-columns:44px 1fr minmax(120px,220px) 52px;gap:12px;align-items:center;
   padding:9px 4px 3px;border-top:1px solid var(--line)}
 .rrow:first-of-type{border-top:0}
@@ -881,6 +1063,12 @@ const hidden = new Set(JSON.parse(localStorage.getItem('tks.hidden') || '["done"
 const hiddenP = new Set(JSON.parse(localStorage.getItem('tks.hiddenP') || '[]'));
 const hiddenL = new Set(JSON.parse(localStorage.getItem('tks.hiddenL') || '[]'));
 const hiddenA = new Set(JSON.parse(localStorage.getItem('tks.hiddenA') || '["done"]'));
+// Les outils repliés. Un ensemble — donc « déplié » est l'état par défaut : un groupe
+// nouveau (un outil qui apparaît dans le backlog) s'ouvre, il ne se cache pas.
+const foldT = new Set(JSON.parse(localStorage.getItem('tks.foldT') || '[]'));
+// Les séances, elles, ont un défaut CALCULÉ (ouverte tant qu'il reste à cocher) : il
+// faut donc distinguer « pas encore touchée » de « fermée exprès ». D'où l'objet.
+const openS = JSON.parse(localStorage.getItem('tks.openS') || '{}');
 
 const el = (tag, cls, html) => { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; };
 const escape = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -1285,10 +1473,21 @@ function freesChip(n, total) {
 }
 
 function renderActions(root) {
-  const acts = hiddenA.has('todo') ? [] : D.actions.filter(a => !DONE.has(a.id));
+  renderSeances(root);
+  const all = D.actions.filter(a => !DONE.has(a.id));
+  const acts = hiddenA.has('todo') ? [] : all.filter(a => !hiddenP.has(a.priority));
   if (!hiddenA.has('done')) doneList(root);
   if (hiddenA.has('todo')) return;
-  if (!acts.length) { root.appendChild(el('div','empty','Rien ne t\\'attend. Le goulot, ce n\\'est pas toi.')); return; }
+  // « Rien ne t'attend » et « tu as tout masqué » sont deux nouvelles opposées. Les dire
+  // avec la même phrase, c'est laisser croire la liste vide un jour où elle est pleine —
+  // et c'est ce que fait n'importe quel filtre qui s'applique en silence.
+  if (!acts.length) {
+    const n = all.length;
+    root.appendChild(el('div', 'empty', n
+      ? n + ' action' + (n > 1 ? 's sont masquées' : ' est masquée') + ' par le filtre de priorité.'
+      : 'Rien ne t\\'attend. Le goulot, ce n\\'est pas toi.'));
+    return;
+  }
   const groups = {};
   for (const a of acts) (groups[a.tool] ||= []).push(a);
   // Même règle qu'à l'intérieur d'un groupe (voir byUrgency côté générateur) : P0
@@ -1305,17 +1504,30 @@ function renderActions(root) {
 
   for (const k of keys) {
     const box = el('div', 'thread');
-    const t = el('div', 'tool ' + W[k].top);
+    const t = el('button', 'tool ' + W[k].top);
+    t.type = 'button';
+    const folded = foldT.has(k);
+    t.setAttribute('aria-expanded', String(!folded));
     // Rien n'est répété ici. Les lignes étant triées par la même règle, la première
     // d'entre elles — à quelques pixels sous cet en-tête — porte déjà la priorité la
     // plus haute du groupe et, presque toujours, son plus gros levier. Le total ne
     // s'affiche donc que s'il dépasse cette ligne, c'est-à-dire quand plusieurs
     // actions du groupe libèrent des tickets DIFFÉRENTS. Le reste du temps, l'en-tête
     // se tait : deux fois la même information, c'est une information qu'on cesse de lire.
-    t.innerHTML = '<b>' + escape(k) + '</b><span>' + groups[k].length + ' action' +
+    //
+    // Sauf REPLIÉ : la ligne qui portait la priorité n'est plus là. L'en-tête reprend
+    // alors ce qu'elle disait, sinon replier reviendrait à cacher ce qui décide d'ouvrir.
+    t.innerHTML = '<span class="fold">▾</span><b>' + escape(k) + '</b><span>' + groups[k].length + ' action' +
       (groups[k].length > 1 ? 's' : '') + ' — à faire d\\'un seul tenant</span>' +
-      (W[k].frees > W[k].max ? '<span class="w">' + freesChip(W[k].frees, true) + '</span>' : '');
+      '<span class="w">' + (W[k].frees > W[k].max ? freesChip(W[k].frees, true) : '') +
+      '<span class="prio" data-when="folded">' + W[k].top + '</span></span>';
+    t.title = 'Replier ou déplier « ' + k + ' »';
+    const rows = el('div', 'toolrows');
+    rows.hidden = folded;
+    t.querySelector('[data-when=folded]').hidden = !folded;
+    t.onclick = () => setFold(t, rows, k, rows.hidden);
     box.appendChild(t);
+    box.appendChild(rows);
     for (const a of groups[k]) {
       const pend = (D.journals[a.id] || []).filter(e => e.pending).length;
       const row = el('div', 'act ' + a.priority);
@@ -1339,11 +1551,144 @@ function renderActions(root) {
         row.querySelector('.chev').textContent = open ? '▴' : '▾';
       };
       row.title = 'Cliquer pour dérouler · cocher la case pour marquer fait';
-      box.appendChild(row);
-      box.appendChild(dr);
+      row.dataset.id = a.id;               // cible des sauts depuis une séance
+      rows.appendChild(row);
+      rows.appendChild(dr);
     }
     root.appendChild(box);
   }
+}
+
+/**
+ * Replie ou déplie un groupe d'outil — SANS re-rendre la vue.
+ *
+ * Un render() complet remettrait la page en haut (il le fait exprès, pour un changement
+ * de vue) : replier le sixième groupe renverrait alors regarder le premier. Le repli est
+ * un geste de lecture, pas un changement de vue ; il ne doit rien déplacer d'autre.
+ */
+function setFold(head, rows, key, open) {
+  rows.hidden = !open;
+  head.setAttribute('aria-expanded', String(open));
+  head.querySelector('[data-when=folded]').hidden = open;
+  open ? foldT.delete(key) : foldT.add(key);
+  localStorage.setItem('tks.foldT', JSON.stringify([...foldT]));
+}
+
+/**
+ * L'en-tête de « Mes actions » : les séances de test.
+ *
+ * Une séance dit dans quel ORDRE et en combien de FOIS vider la liste — un savoir que
+ * rien ne calcule, parce qu'il tient à des faits physiques : onze vérifications devant la
+ * même borne se font en une fois ou pas du tout, et la neuvième met la machine hors
+ * service, donc elle passe en dernier. La liste, elle, ne sait trier que par urgence.
+ *
+ * D'où la place : en TÊTE de la liste qu'elle ordonne, jamais dans un onglet séparé. Un
+ * plan qu'il faut aller chercher ailleurs se lit une fois, puis plus jamais.
+ *
+ * Ce qui est écrit à la main : la prose, l'ordre, les raisons. Ce qui ne l'est jamais :
+ * l'avancement. Chaque ticket cité devient un lien vers SA case à cocher, quelques
+ * centimètres plus bas — et se barre tout seul quand elle est cochée. Le plan ne peut
+ * donc pas se mettre à mentir sur ce qui reste, ce qui est le sort de tout plan tenu
+ * en double.
+ */
+function renderSeances(root) {
+  for (const s of (D.seances || [])) {
+    // « left » compte ce qui reste à cocher — en tenant compte de ce qu'on vient de cocher
+    // dans cette page (DONE), sans attendre la régénération.
+    const st = s.steps.map(x => ({ ...x, state: x.state === 'open' && DONE.has(x.id) ? 'checked' : x.state }));
+    const real = st.filter(x => x.state !== 'none');
+    const left = real.filter(x => x.state === 'open').length;
+    // Repliée par défaut une fois tout coché : une séance finie n'a plus à occuper le
+    // haut de l'écran. Le choix explicite de l'utilisateur, lui, l'emporte toujours.
+    const isOpen = s.id in openS ? openS[s.id] : left > 0;
+    const box = el('div', 'seance' + (left ? '' : ' over'));
+    box.dataset.open = isOpen ? 'yes' : 'no';
+
+    const hd = el('button', 'schd');
+    hd.type = 'button';
+    hd.setAttribute('aria-expanded', String(isOpen));
+    const pct = real.length ? Math.round(100 * (real.length - left) / real.length) : 0;
+    hd.innerHTML = '<span class="fold">▾</span><b>🧪 ' + escape(s.title) + '</b>' +
+      '<span class="k">' + s.id + '</span>' +
+      (s.when ? '<span class="when">' + escape(s.when) + '</span>' : '') +
+      '<span class="scprog">' + (real.length
+        ? '<span>' + (left ? left + ' sur ' + real.length + ' à cocher' : 'les ' + real.length + ' étapes sont cochées') +
+          '</span><span class="scbar"><i style="width:' + pct + '%"></i></span>'
+        : '<span>aucune action citée</span>') + '</span>';
+    hd.onclick = () => {
+      const now = box.dataset.open === 'no';
+      box.dataset.open = now ? 'yes' : 'no';
+      body.hidden = !now;
+      if (note) note.hidden = !now;
+      hd.setAttribute('aria-expanded', String(now));
+      openS[s.id] = now;
+      localStorage.setItem('tks.openS', JSON.stringify(openS));
+    };
+    box.appendChild(hd);
+
+    const body = el('div', 'scbody', D.seanceBodies[s.id] || '');
+    body.hidden = !isOpen;
+    // Les identifiants du corps sont déjà des liens — vers le TICKET. Dans une séance,
+    // le geste attendu n'est pas de lire le ticket : c'est d'aller cocher. On les
+    // détourne donc ici, et on leur donne l'état de leur étape (barré = fait).
+    const state = Object.fromEntries(st.map(x => [x.id, x.state]));
+    for (const a of body.querySelectorAll('[data-goto]')) {
+      const id = a.dataset.goto;
+      if (!(id in state)) continue;                       // cité dans un bloc de code
+      a.dataset.step = state[id];
+      a.title = state[id] === 'open' ? 'Aller à l\\'action ' + id + ', plus bas'
+        : state[id] === 'checked' ? id + ' — action déjà cochée' : id + ' — pas d\\'action en attente';
+      a.onclick = ev => { ev.preventDefault(); ev.stopPropagation(); jumpToAction(id); };
+    }
+    box.appendChild(body);
+    // Écrit une fois par séance, et pas dans l'index : c'est ici qu'on coche, donc ici
+    // que la confusion coûte. Cocher est une DÉCLARATION de geste, pas un verdict.
+    // Repliée avec le plan : une consigne de lecture n'a rien à dire sur un plan fermé.
+    const note = real.length ? el('div', 'scnote',
+      'Cocher une étape dit « je l\\'ai faite » — pas « le ticket est clos ». Ce qu\\'on y a constaté s\\'écrit dans le tiroir de l\\'action.') : null;
+    if (note) { note.hidden = !isOpen; box.appendChild(note); }
+    root.appendChild(box);
+  }
+}
+
+/**
+ * Depuis le plan, atteindre la case à cocher. Déplier ce qu'il faut, ouvrir le tiroir
+ * (une séance de test a besoin de la consigne du ticket, pas seulement de son titre),
+ * et faire clignoter la ligne — sans quoi le saut dépose au milieu d'une liste homogène.
+ *
+ * Si un FILTRE masque l'étape, c'est le filtre qui cède : cliquer une étape précise est
+ * une demande plus récente et plus précise qu'un P3 écarté dix minutes plus tôt. Le
+ * changement n'est pas silencieux — la pastille se rallume dans la barre, à l'écran.
+ *
+ * Repli de secours : le ticket. L'étape peut être déjà cochée et repartie dans « Fait » ;
+ * ce qu'on cherchait à lire reste alors accessible plutôt que de laisser le clic sans effet.
+ */
+function jumpToAction(id) {
+  let row = document.querySelector('.act[data-id="' + id + '"]');
+  if (!row) {
+    const a = D.actions.find(x => x.id === id && !DONE.has(x.id));
+    if (a && (hiddenP.has(a.priority) || hiddenA.has('todo'))) {
+      hiddenP.delete(a.priority);
+      hiddenA.delete('todo');
+      render();
+      row = document.querySelector('.act[data-id="' + id + '"]');
+    }
+  }
+  if (!row) return openTicket(id);
+  const rows = row.parentElement;
+  if (rows.hidden) {
+    const head = rows.previousElementSibling;
+    setFold(head, rows, head.querySelector('b').textContent, true);
+  }
+  const dr = row.nextElementSibling;
+  if (dr && dr.classList.contains('draw') && dr.hidden) {
+    dr.hidden = false;
+    row.querySelector('.chev').textContent = '▴';
+  }
+  row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  row.classList.remove('land');
+  void row.offsetWidth;                       // redémarre l'animation si on reclique
+  row.classList.add('land');
 }
 
 /**
@@ -1559,7 +1904,10 @@ function renderPending() {
 }
 
 function doneList(root) {
-  const list = D.doneActions || [];
+  // Une action cochée ne porte plus de priorité : elle a quitté le frontmatter pour le
+  // journal. On lit donc celle de son TICKET — la seule qui existe encore, et celle que
+  // le filtre désigne. Sans ça, filtrer sur P1 laisserait passer les P3 déjà faites.
+  const list = (D.doneActions || []).filter(a => !hiddenP.has((byId[a.id] || {}).priority));
   if (!list.length) { root.appendChild(el('div', 'empty', 'Rien de coché pour le moment.')); return; }
   const box = el('div', 'thread');
   box.appendChild(el('div', 'tool', '<b>Fait</b><span>' + list.length + ' action' +
@@ -1661,6 +2009,7 @@ function render() {
   else if (view === 'roadmap') renderRoadmap(root);
   else if (view === 'history') renderHistory(root);
   else renderGraph(root);
+  if (view === 'actions') foldLabel();
 }
 
 for (const b of document.querySelectorAll('.tab')) b.onclick = () => { view = b.dataset.view; render(); };
@@ -1672,6 +2021,25 @@ for (const c of document.querySelectorAll('.chip[data-layer]'))
   c.onclick = () => { const l = c.dataset.layer; hiddenL.has(l) ? hiddenL.delete(l) : hiddenL.add(l); render(); };
 for (const c of document.querySelectorAll('.chip[data-act]'))
   c.onclick = () => { const a = c.dataset.act; hiddenA.has(a) ? hiddenA.delete(a) : hiddenA.add(a); render(); };
+
+/**
+ * Un seul bouton, deux sens : il replie tant qu'il reste un groupe ouvert, il déplie
+ * ensuite. Deux boutons côte à côte obligeraient à lire lequel est actif ; celui-ci dit
+ * toujours ce qu'il va faire, et c'est la seule chose qu'on ait besoin de savoir.
+ */
+const foldAll = document.querySelector('#foldall');
+const heads = () => [...document.querySelectorAll('.tool[aria-expanded]')];
+const foldLabel = () => {
+  const h = heads();
+  foldAll.hidden = h.length < 2;   // un seul groupe : replier ne range rien
+  foldAll.textContent = h.some(x => x.getAttribute('aria-expanded') === 'true') ? '⌃ Tout replier' : '⌄ Tout déplier';
+};
+foldAll.onclick = () => {
+  const h = heads();
+  const open = !h.some(x => x.getAttribute('aria-expanded') === 'true');
+  for (const x of h) setFold(x, x.nextElementSibling, x.querySelector('b').textContent, open);
+  foldLabel();
+};
 document.querySelector('#q').oninput = ev => { q = ev.target.value.trim().toLowerCase(); render(); };
 document.querySelector('#theme').onclick = () => {
   const cur = document.documentElement.dataset.theme ||
@@ -1701,12 +2069,17 @@ setInterval(async () => {
 }, 900);
 `;
 
-function renderHtml({ tickets, epics, recipes }, { live }) {
+function renderHtml({ tickets, epics, recipes, seances }, { live }) {
   const data = {
     tickets: tickets.map(({ body, ...rest }) => rest),
     epics: epics.map(({ body, ...rest }) => rest),
     recipes: recipes.map(({ body, ...rest }) => rest),
     recipeBodies: Object.fromEntries(recipes.map((r) => [r.id, md(r.body)])),
+    // Les séances vivent en tête de « Mes actions » : elles ne valent que là, au moment
+    // où l'on regarde ce qu'il reste à faire. Le corps est rendu ici — les liens de
+    // ticket qu'il contient deviennent, côté page, des sauts vers l'action elle-même.
+    seances: seances.map(({ body, ...rest }) => rest),
+    seanceBodies: Object.fromEntries(seances.map((s) => [s.id, md(s.body)])),
     edges: edges(tickets),
     git: gitHistory(),
     labels: STATUS_LABEL,
@@ -1778,6 +2151,13 @@ function renderHtml({ tickets, epics, recipes }, { live }) {
   <div class="filters" id="afilters" hidden>
     <button class="chip" data-act="todo">À faire</button>
     <button class="chip" data-act="done">Fait</button>
+    <span style="width:10px"></span>
+    ${/* MÊME attribut data-prio que la barre du kanban, donc MÊME état : une priorité
+          écartée l'est partout. Deux filtres de priorité indépendants, c'est un P3 masqué
+          ici et visible là-bas — et plus personne ne sait ce que la liste ne montre pas. */
+      PRIORITIES.map((p) => `<button class="chip ${p}" data-prio="${p}"><span class="dot" style="background:var(--${p.toLowerCase()})"></span>${p}</button>`).join('\n    ')}
+    <span class="spacer"></span>
+    <button class="ghost" id="foldall" title="Replier ou déplier tous les outils">⌃ Tout replier</button>
   </div>
   <div id="root"></div>
 </main>
@@ -1796,7 +2176,8 @@ function generate({ quiet } = {}) {
   writeFileSync(join(OUT, 'BACKLOG.md'), renderIndex(data), 'utf8');
   writeFileSync(join(OUT, 'backlog.html'), renderHtml(data, { live: false }), 'utf8');
   if (!quiet) {
-    console.log(`${data.tickets.length} tickets · ${data.epics.length} épiques · ${data.recipes.length} recettes → BACKLOG.md + backlog.html`);
+    console.log(`${data.tickets.length} tickets · ${data.epics.length} épiques · ${data.recipes.length} recettes`
+      + `${data.seances.length ? ` · ${data.seances.length} séances` : ''} → BACKLOG.md + backlog.html`);
     for (const w of data.warnings) console.warn(`  ⚠ ${w}`);
   }
   return data;
@@ -2246,7 +2627,8 @@ _À lire une fois, au démarrage du projet. Ce fichier n'est pas régénéré : 
 \`BACKLOG.md\` et \`backlog.html\` sont **produits** par le générateur. **Ne jamais les éditer
 à la main** : ils sont écrasés à chaque génération. La source, c'est \`${basename(DIR)}/<ID>.md\` —
 un ticket, un fichier. Les épiques vivent dans \`${basename(DIR)}/epics/<ID>.md\`, les recettes
-dans \`${basename(DIR)}/recipes/<ID>.md\`. Après toute modification : relancer le générateur.
+dans \`${basename(DIR)}/recipes/<ID>.md\`, les séances dans \`${basename(DIR)}/seances/<ID>.md\`.
+Après toute modification : relancer le générateur.
 
 ## Frontmatter
 
@@ -2296,6 +2678,38 @@ facultative : l'action porte déjà son libellé, rien ne se perd si on coche sa
 
 Instruire une remarque, c'est **trancher** : soit elle clôt son ticket, soit elle en ouvre un
 nouveau. Une remarque sans accusé reste affichée en attente, et l'indicateur perd son sens.
+
+## Séances de test — l'ordre, quand la liste ne suffit plus
+
+La liste d'actions trie par urgence. Elle ignore la seule contrainte qui décide vraiment de
+l'ordre : **l'unité de travail n'est pas le ticket, c'est le déplacement.** Onze vérifications
+devant la même machine se font en une fois ou pas du tout ; celle qui la met hors service passe
+en dernier ; celle qui produit l'information dont une autre a besoin passe avant. Rien de tout
+cela ne se calcule — ça s'écrit.
+
+Une séance est un fichier \`${basename(DIR)}/seances/<ID>.md\` : \`id\`, \`title\`, \`when\`
+(durée et lieu), puis de la prose libre. **Chaque ticket qu'elle cite devient une étape** —
+cliquable dans « Mes actions », elle mène droit à la case à cocher, et se barre toute seule
+une fois cochée. L'avancement n'est donc jamais saisi : un plan tenu en double se met à mentir.
+
+\`\`\`markdown
+---
+id: S1
+title: Devant la borne
+when: ~1 h · sur place, dans CET ordre
+---
+
+1. **[[EX-001]] — déployer d'abord.** Tout le reste s'exécute sur ce qui est déployé.
+2. **[[EX-002]] — en dernier : ça met la machine hors service.**
+\`\`\`
+
+⚠️ **Une séance n'est pas une recette.** Une recette est une procédure REJOUABLE, qui ne cite
+aucun ticket et ne se périme pas. Une séance est datée par nature : elle nomme les actions
+ouvertes du moment et disparaît de l'index en les faisant. Loger un plan de la semaine dans les
+recettes, c'est le transformer en procédure permanente — et cesser de le suivre.
+
+⚠️ **Cocher une étape dit « j'ai fait le geste »**, pas « le ticket est clos ». Le \`status:\`
+du ticket, lui seul, dit si l'affaire est close — et il ne se change qu'en éditant le fichier.
 
 ## À trancher — le sas
 
