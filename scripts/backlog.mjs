@@ -2023,21 +2023,31 @@ for (const c of document.querySelectorAll('.chip[data-act]'))
   c.onclick = () => { const a = c.dataset.act; hiddenA.has(a) ? hiddenA.delete(a) : hiddenA.add(a); render(); };
 
 /**
- * Un seul bouton, deux sens : il replie tant qu'il reste un groupe ouvert, il déplie
+ * Un seul bouton, deux sens : il replie tant qu'il reste quelque chose d'ouvert, il déplie
  * ensuite. Deux boutons côte à côte obligeraient à lire lequel est actif ; celui-ci dit
  * toujours ce qu'il va faire, et c'est la seule chose qu'on ait besoin de savoir.
+ *
+ * « Tout », c'est les séances ET les groupes d'outil. Premier jet : les groupes seuls. Or
+ * ils sont SOUS les séances, souvent hors de l'écran — cliquer ne produisait donc aucun
+ * mouvement visible, et le bouton passait pour cassé alors qu'il travaillait. Un bouton qui
+ * dit « tout » en laissant les trois plus gros blocs en place ne dit pas la vérité.
+ *
+ * Le geste passe par le click() de chaque en-tête plutôt que par sa mécanique interne :
+ * ils savent déjà se replier, enregistrer leur état et tourner leur chevron. Refaire ce
+ * travail ici, c'est deux chemins à tenir d'accord — et un jour où ils divergent.
  */
 const foldAll = document.querySelector('#foldall');
-const heads = () => [...document.querySelectorAll('.tool[aria-expanded]')];
+const heads = () => [...document.querySelectorAll('.seance .schd, .tool[aria-expanded]')];
+const isOpenHead = (x) => x.getAttribute('aria-expanded') === 'true';
 const foldLabel = () => {
   const h = heads();
-  foldAll.hidden = h.length < 2;   // un seul groupe : replier ne range rien
-  foldAll.textContent = h.some(x => x.getAttribute('aria-expanded') === 'true') ? '⌃ Tout replier' : '⌄ Tout déplier';
+  foldAll.hidden = h.length < 2;   // un seul bloc : replier ne range rien
+  foldAll.textContent = h.some(isOpenHead) ? '⌃ Tout replier' : '⌄ Tout déplier';
 };
 foldAll.onclick = () => {
   const h = heads();
-  const open = !h.some(x => x.getAttribute('aria-expanded') === 'true');
-  for (const x of h) setFold(x, x.nextElementSibling, x.querySelector('b').textContent, open);
+  const open = !h.some(isOpenHead);
+  for (const x of h) if (isOpenHead(x) !== open) x.click();
   foldLabel();
 };
 document.querySelector('#q').oninput = ev => { q = ev.target.value.trim().toLowerCase(); render(); };
