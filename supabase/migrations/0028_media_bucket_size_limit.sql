@@ -26,6 +26,13 @@
 -- Une liste blanche trop courte casserait les sous-titres en silence, à l'envoi, sans que rien
 -- à l'écran n'explique pourquoi. Le durcissement mérite son propre ticket et ses propres tests.
 
+-- ⚠️ LE CAST `::bigint` N'EST PAS DÉCORATIF. Sans lui, `6 * 1024 * 1024 * 1024` est évalué
+-- entièrement en `integer` (plafond 2 147 483 647) et déborde AVANT d'être stocké :
+-- « ERROR: integer out of range (SQLSTATE 22003) ». La colonne cible est bien un `bigint`,
+-- mais c'est le calcul qui échoue, pas l'affectation. Le premier facteur casté suffit :
+-- il force les suivants en arithmétique 64 bits.
+-- Constaté en vrai le 2026-10-20 par `supabase db push` — cette migration n'avait donc
+-- JAMAIS pu s'appliquer, ni par le CLI ni dans le SQL Editor.
 update storage.buckets
-   set file_size_limit = 6 * 1024 * 1024 * 1024   -- 6 Gio, la cible annoncée de CIN-101
+   set file_size_limit = 6::bigint * 1024 * 1024 * 1024   -- 6 Gio, la cible annoncée de CIN-101
  where id = 'media';
